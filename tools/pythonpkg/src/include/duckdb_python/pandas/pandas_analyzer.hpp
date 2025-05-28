@@ -30,6 +30,7 @@ public:
 
 public:
 	LogicalType GetListType(py::object &ele, bool &can_convert);
+	LogicalType RegularDictionaryToMap(const PyDictionary &dict);
 	LogicalType DictToMap(const PyDictionary &dict, bool &can_convert);
 	LogicalType DictToStruct(const PyDictionary &dict, bool &can_convert);
 	LogicalType GetItemType(py::object ele, bool &can_convert);
@@ -37,10 +38,12 @@ public:
 	LogicalType AnalyzedType() {
 		return analyzed_type;
 	}
+	void SetTargetType(const LogicalType &type);
 
 private:
 	LogicalType InnerAnalyze(py::object column, bool &can_convert, idx_t increment);
 	uint64_t GetSampleIncrement(idx_t rows);
+	static bool CanUpgradeType(LogicalType &target, const LogicalType &source);
 
 private:
 	uint64_t sample_size;
@@ -48,6 +51,8 @@ private:
 	PythonGILWrapper gil;
 	//! The resulting analyzed type
 	LogicalType analyzed_type;
+	//! The target type
+	LogicalType target_type = LogicalType::INVALID;
 };
 
 } // namespace duckdb

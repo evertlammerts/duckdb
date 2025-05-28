@@ -57,4 +57,31 @@ public:
 	                            const TableFunction &function);
 };
 
+struct PandasScanFunctionData : public TableFunctionData {
+public:
+	// Target type pushdown
+	py::handle df;
+	idx_t row_count;
+	atomic<idx_t> lines_read;
+	vector<PandasColumnBindData> pandas_bind_data;
+	vector<LogicalType> sql_types;
+	unordered_map<idx_t, LogicalType> target_types;
+	bool has_target_types = false;
+	shared_ptr<DependencyItem> copied_df;
+	unordered_map<string, idx_t> column_name_to_index;
+
+public:
+	PandasScanFunctionData(py::handle df, idx_t row_count, vector<PandasColumnBindData> pandas_bind_data,
+	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> dependency)
+	    : df(df), row_count(row_count), lines_read(0), pandas_bind_data(std::move(pandas_bind_data)),
+	      sql_types(std::move(sql_types)), copied_df(std::move(dependency)) {
+	}
+	~PandasScanFunctionData() override {
+		try {
+			py::gil_scoped_acquire acquire;
+			pandas_bind_data.clear();
+		} catch (...) { // NOLINT
+		}
+	}
+};
 } // namespace duckdb

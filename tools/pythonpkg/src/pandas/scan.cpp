@@ -13,28 +13,6 @@
 
 namespace duckdb {
 
-struct PandasScanFunctionData : public TableFunctionData {
-	PandasScanFunctionData(py::handle df, idx_t row_count, vector<PandasColumnBindData> pandas_bind_data,
-	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> dependency)
-	    : df(df), row_count(row_count), lines_read(0), pandas_bind_data(std::move(pandas_bind_data)),
-	      sql_types(std::move(sql_types)), copied_df(std::move(dependency)) {
-	}
-	py::handle df;
-	idx_t row_count;
-	atomic<idx_t> lines_read;
-	vector<PandasColumnBindData> pandas_bind_data;
-	vector<LogicalType> sql_types;
-	shared_ptr<DependencyItem> copied_df;
-
-	~PandasScanFunctionData() override {
-		try {
-			py::gil_scoped_acquire acquire;
-			pandas_bind_data.clear();
-		} catch (...) { // NOLINT
-		}
-	}
-};
-
 struct PandasScanLocalState : public LocalTableFunctionState {
 	PandasScanLocalState(idx_t start, idx_t end) : start(start), end(end), batch_index(0) {
 	}
@@ -59,6 +37,17 @@ struct PandasScanGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+static void PandasTypePushdown(ClientContext &context, optional_ptr<FunctionData> bind_data_p,
+                               const unordered_map<idx_t, LogicalType> &new_column_types) {
+	auto &bind_data = bind_data_p->Cast<PandasScanFunctionData>();
+
+	// Store target types for use during binding
+	bind_data.target_types = new_column_types;
+
+	// Mark that we have target type information
+	bind_data.has_target_types = true;
+}
+
 PandasScanFunction::PandasScanFunction()
     : TableFunction("pandas_scan", {LogicalType::POINTER}, PandasScanFunc, PandasScanBind, PandasScanInitGlobal,
                     PandasScanInitLocal) {
@@ -67,6 +56,7 @@ PandasScanFunction::PandasScanFunction()
 	table_scan_progress = PandasProgress;
 	serialize = PandasSerialize;
 	projection_pushdown = true;
+	type_pushdown = PandasTypePushdown;
 }
 
 OperatorPartitionData PandasScanFunction::PandasScanGetPartitionData(ClientContext &context,

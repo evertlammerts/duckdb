@@ -7,6 +7,7 @@
 #include "duckdb_python/pandas/pandas_column.hpp"
 
 namespace duckdb {
+struct PandasScanFunctionData;
 
 class ClientContext;
 
@@ -28,7 +29,8 @@ struct PandasColumnBindData {
 
 struct Pandas {
 	static void Bind(const ClientContext &config, py::handle df, vector<PandasColumnBindData> &out,
-	                 vector<LogicalType> &return_types, vector<string> &names);
+	                 vector<LogicalType> &return_types, vector<string> &names,
+	                 const PandasScanFunctionData *scan_data = nullptr);
 };
 
 } // namespace duckdb

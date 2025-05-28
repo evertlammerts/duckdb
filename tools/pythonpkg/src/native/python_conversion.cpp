@@ -3,7 +3,6 @@
 
 #include "duckdb_python/pyrelation.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
-#include "duckdb_python/pyresult.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
 

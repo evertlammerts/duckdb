@@ -1,4 +1,5 @@
 #include "duckdb_python/pandas/pandas_bind.hpp"
+#include "duckdb_python/pandas/pandas_scan.hpp"
 #include "duckdb_python/pandas/pandas_analyzer.hpp"
 #include "duckdb_python/pandas/column/pandas_numpy_column.hpp"
 
@@ -44,7 +45,7 @@ private:
 }; // namespace
 
 static LogicalType BindColumn(PandasBindColumn &column_p, PandasColumnBindData &bind_data,
-                              const ClientContext &context) {
+							  const ClientContext &context, const LogicalType &target_type = LogicalType()) {
 	LogicalType column_type;
 	auto &column = column_p.handle;
 
@@ -107,6 +108,10 @@ static LogicalType BindColumn(PandasBindColumn &column_p, PandasColumnBindData &
 	// Analyze the inner data type of the 'object' column
 	if (bind_data.numpy_type.type == NumpyNullableType::OBJECT) {
 		PandasAnalyzer analyzer(context);
+		// Pass target type hint to analyzer
+		if (target_type.id() != LogicalTypeId::INVALID) {
+			analyzer.SetTargetType(target_type);
+		}
 		if (analyzer.Analyze(column)) {
 			column_type = analyzer.AnalyzedType();
 		}
@@ -115,7 +120,7 @@ static LogicalType BindColumn(PandasBindColumn &column_p, PandasColumnBindData &
 }
 
 void Pandas::Bind(const ClientContext &context, py::handle df_p, vector<PandasColumnBindData> &bind_columns,
-                  vector<LogicalType> &return_types, vector<string> &names) {
+                  vector<LogicalType> &return_types, vector<string> &names, const PandasScanFunctionData *scan_data) {
 
 	PandasDataFrameBind df(df_p);
 	idx_t column_count = py::len(df.names);
@@ -129,10 +134,21 @@ void Pandas::Bind(const ClientContext &context, py::handle df_p, vector<PandasCo
 	for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
 		PandasColumnBindData bind_data;
 
-		names.emplace_back(py::str(df.names[col_idx]));
+		auto column_name = py::str(df.names[col_idx]);
 		auto column = df[col_idx];
-		auto column_type = BindColumn(column, bind_data, context);
 
+		// Get target type if available
+		LogicalType target_type = LogicalType::INVALID;
+		if (scan_data && scan_data->has_target_types) {
+			auto it = scan_data->target_types.find(col_idx);
+			if (it != scan_data->target_types.end()) {
+				target_type = it->second;
+			}
+		}
+
+		auto column_type = BindColumn(column, bind_data, context, target_type);
+
+		names.emplace_back(column_name);
 		return_types.push_back(column_type);
 		bind_columns.push_back(std::move(bind_data));
 	}

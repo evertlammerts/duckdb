@@ -313,6 +313,83 @@ static bool VerifyStructValidity(vector<LogicalType> &structs) {
 	return true;
 }
 
+bool PandasAnalyzer::CanUpgradeType(LogicalType &target, const LogicalType &source) {
+	// This is similar to the logic in UpgradeType but simplified for MAP key/value checking
+
+	if (target.id() == source.id()) {
+		return true;
+	}
+
+	// Allow numeric type upgrades
+	if (target.IsNumeric() && source.IsNumeric()) {
+		LogicalType upgraded = LogicalType::ForceMaxLogicalType(target, source);
+		target = upgraded;
+		return true;
+	}
+
+	// Allow string-like type upgrades
+	if ((target.id() == LogicalTypeId::VARCHAR || target.id() == LogicalTypeId::BLOB) &&
+	    (source.id() == LogicalTypeId::VARCHAR || source.id() == LogicalTypeId::BLOB)) {
+		target = LogicalType::VARCHAR; // Promote to VARCHAR
+		return true;
+	}
+
+	// For other types, require exact match
+	return false;
+}
+
+LogicalType PandasAnalyzer::RegularDictionaryToMap(const PyDictionary &dict) {
+	// Empty dictionaries could be MAPs
+	if (dict.len == 0) {
+		return EmptyMap();
+	}
+
+	// Track key and value types
+	LogicalType key_type = LogicalType::INVALID;
+	LogicalType value_type = LogicalType::INVALID;
+	unordered_set<string> key_strings;
+
+	for (idx_t i = 0; i < dict.len; i++) {
+		bool can_convert = false;
+		const auto key = dict.keys.attr("__getitem__")(i);
+		const auto value = dict.values.attr("__getitem__")(i);
+
+		// 1. Keys cannot be NULL (Python None)
+		if (key.is_none()) {
+			return LogicalType::INVALID;
+		}
+
+		// 2. Key type consistency - all keys must have the same type
+		LogicalType current_key_type = GetItemType(key, can_convert);
+		if (!can_convert) {
+			return LogicalType::INVALID;
+		}
+		if (key_type.id() == LogicalTypeId::INVALID) {
+			key_type = current_key_type;
+		} else {
+			// Check if current key type is compatible with established key type
+			if (!CanUpgradeType(key_type, current_key_type)) {
+				return LogicalType::INVALID;
+			}
+		}
+
+		// 3. Value type consistency - all values must have the same type
+		LogicalType current_value_type = GetItemType(value, can_convert);
+		if (!can_convert) {
+			return LogicalType::INVALID;
+		}
+		if (value_type.id() == LogicalTypeId::INVALID) {
+			value_type = current_value_type;
+		} else {
+			// Check if current value type is compatible with established value type
+			if (!CanUpgradeType(value_type, current_value_type)) {
+				return LogicalType::INVALID;
+			}
+		}
+	}
+	return LogicalType::MAP(key_type.id(), value_type.id());
+}
+
 LogicalType PandasAnalyzer::DictToMap(const PyDictionary &dict, bool &can_convert) {
 	auto keys = dict.values.attr("__getitem__")(0);
 	auto values = dict.values.attr("__getitem__")(1);
@@ -420,7 +497,15 @@ LogicalType PandasAnalyzer::GetItemType(py::object ele, bool &can_convert) {
 			return EmptyMap();
 		}
 		if (DictionaryHasMapFormat(dict)) {
+			// This handles the map-to-dict convention of {'keys': [...], 'values': [...]}
 			return DictToMap(dict, can_convert);
+		}
+		if (target_type.id() == LogicalTypeId::MAP) {
+			// If target is MAP then we try to infer the actual type from the dict
+			LogicalType map_type = RegularDictionaryToMap(dict);
+			if (map_type != LogicalType::INVALID) {
+				return map_type;
+			}
 		}
 		return DictToStruct(dict, can_convert);
 	}
@@ -528,6 +613,10 @@ bool PandasAnalyzer::Analyze(py::object column) {
 		analyzed_type = type;
 	}
 	return can_convert;
+}
+
+void PandasAnalyzer::SetTargetType(const LogicalType &type) {
+	target_type = type;
 }
 
 } // namespace duckdb
