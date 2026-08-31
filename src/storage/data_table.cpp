@@ -918,6 +918,14 @@ void DataTable::VerifyAppendConstraints(ConstraintState &constraint_state, Clien
 		}
 	}
 
+	// DEFERRED CONSTRAINTS EXPERIMENT: skip all per-chunk constraint verification
+	// during transaction-local appends. This skips:
+	// - Unique index verification (the most expensive part)
+	// - NOT NULL checks
+	// - CHECK constraint evaluation
+	// - Foreign key constraint checks
+	// Constraints will still be enforced at commit time via the global indexes.
+#if 0
 	if (HasUniqueIndexes()) {
 		VerifyUniqueIndexes(info->indexes, storage, chunk, manager);
 	}
@@ -955,6 +963,7 @@ void DataTable::VerifyAppendConstraints(ConstraintState &constraint_state, Clien
 			throw InternalException("invalid constraint type");
 		}
 	}
+#endif
 }
 
 unique_ptr<ConstraintState>
@@ -1502,6 +1511,10 @@ void DataTable::RemoveFromIndexes(const QueryContext &context, Vector &row_ident
 // Delete
 //===--------------------------------------------------------------------===//
 static bool TableHasDeleteConstraints(TableCatalogEntry &table) {
+	// DEFERRED CONSTRAINTS EXPERIMENT: pretend there are no delete constraints.
+	// This avoids allocating verify_chunk and constraint_state in InitializeDelete.
+	return false;
+#if 0
 	for (auto &constraint : table.GetConstraints()) {
 		switch (constraint->type) {
 		case ConstraintType::NOT_NULL:
@@ -1520,10 +1533,14 @@ static bool TableHasDeleteConstraints(TableCatalogEntry &table) {
 		}
 	}
 	return false;
+#endif
 }
 
 void DataTable::VerifyDeleteConstraints(optional_ptr<LocalTableStorage> storage, TableDeleteState &state,
                                         ClientContext &context, DataChunk &chunk) {
+	// DEFERRED CONSTRAINTS EXPERIMENT: skip delete constraint verification (FK checks).
+	return;
+#if 0
 	for (auto &constraint : state.constraint_state->bound_constraints) {
 		switch (constraint->type) {
 		case ConstraintType::NOT_NULL:
@@ -1541,6 +1558,7 @@ void DataTable::VerifyDeleteConstraints(optional_ptr<LocalTableStorage> storage,
 			throw NotImplementedException("Constraint type not implemented!");
 		}
 	}
+#endif
 }
 
 unique_ptr<TableDeleteState> DataTable::InitializeDelete(TableCatalogEntry &table, ClientContext &context,

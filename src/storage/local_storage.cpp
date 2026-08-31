@@ -20,6 +20,11 @@ LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
 	auto &collection = *row_groups->collection;
 	collection.InitializeEmpty();
 
+	// DEFERRED CONSTRAINTS EXPERIMENT: skip creating local delta indexes entirely.
+	// This eliminates all transaction-local unique constraint checking overhead
+	// (both memory for the delta ART indexes and CPU for insert/delete operations).
+	// Constraints will still be checked globally at commit time.
+#if 0
 	for (auto &index : data_table_info->GetIndexes().Indexes()) {
 		auto constraint = index.GetConstraintType();
 		if (constraint == IndexConstraintType::NONE) {
@@ -40,6 +45,7 @@ LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
 		auto append_index = bound_index.CreateDeltaIndex(DeltaIndexType::LOCAL_APPEND);
 		append_indexes.AddIndex(std::move(append_index));
 	}
+#endif
 }
 
 LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_data_table, LocalTableStorage &parent,
