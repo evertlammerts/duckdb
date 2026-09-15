@@ -102,8 +102,8 @@ void ChunkFormat::Append(ResultFormatGlobalState &gstate, ResultFormatLocalState
 	lstate.unit = make_uniq<ChunkUnit>(BufferedData::CopyForBuffering(chunk));
 }
 
-bool ChunkFormat::IsFull(ResultFormatLocalState &lstate) {
-	return true;
+bool ChunkFormat::IsFull(ResultFormatLocalState &lstate_p) {
+	return lstate_p.Cast<ChunkFormatLocalState>().unit != nullptr;
 }
 
 unique_ptr<ResultUnit> ChunkFormat::Finish(ResultFormatGlobalState &gstate, ResultFormatLocalState &lstate_p) {

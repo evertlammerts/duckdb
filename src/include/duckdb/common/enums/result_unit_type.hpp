@@ -16,6 +16,8 @@ namespace duckdb {
 enum class ResultUnitType : uint8_t {
 	//! A DataChunk
 	CHUNK,
+	//! An Arrow record batch
+	ARROW,
 	//! What a format defined outside the engine produces. Every extension format shares this tag
 	EXTENSION
 };
