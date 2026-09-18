@@ -322,7 +322,8 @@ private:
 
 	void BeginQueryInternal(ClientContextLock &lock, const SQLStatement &statement);
 	ErrorData EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
-	                           optional_ptr<ErrorData> previous_error);
+	                           optional_ptr<ErrorData> previous_error,
+	                           const char *invalidation_reason = "Failed to commit");
 
 	//! Wait until a task is available to execute
 	void WaitForTask(ClientContextLock &lock, BaseQueryResult &result);

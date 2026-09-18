@@ -2,9 +2,14 @@
 #include "test_helpers.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/main/buffered_data/buffered_data.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_result_stream.hpp"
 #include "result_wait_helpers.hpp"
+
+#include <chrono>
+#include <thread>
 
 using namespace duckdb;
 
@@ -209,6 +214,48 @@ TEST_CASE("A mid-stream fetch failure invalidates the open transaction", "[api][
 	REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
 	auto after = con.Query("SELECT 42");
 	REQUIRE(CHECK_COLUMN(after, 0, {42}));
+}
+
+TEST_CASE("Closing a partly drained stream leaves the connection usable", "[api][query_result_stream]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET max_streaming_buffer_size='16KB'"));
+
+	auto stream = OpenStream(con, "SELECT i FROM range(1000000) t(i)");
+	DrainWatchdog watchdog(con);
+	REQUIRE(stream->Fetch());
+	stream->Close();
+	REQUIRE(!stream->HasError());
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("Closing a finished stream with units still buffered does not invalidate the transaction",
+          "[api][query_result_stream]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("SET max_streaming_buffer_size='1MB'"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t VALUES (42)"));
+
+	auto stream = OpenStream(con, "SELECT i FROM range(2000) t(i)");
+	auto &executor = Executor::Get(*con.context);
+	Deadline deadline;
+	while (!executor.ExecutionIsFinished()) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	// The whole result fits in the buffer: execution is done with every unit still unpopped
+	REQUIRE(stream->GetBufferedData().HasObservableUnit());
+	stream->Close();
+
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+	auto rows = observer.Query("SELECT i FROM t");
+	REQUIRE(CHECK_COLUMN(rows, 0, {42}));
 }
 
 #endif

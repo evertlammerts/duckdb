@@ -5,6 +5,7 @@
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/buffered_data/buffered_data.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -35,6 +36,13 @@ idx_t DrainCursor(QueryResult &result) {
 		rows += chunk->size();
 	}
 	return rows;
+}
+
+//! Step a handle a few times, so its execution has started but has not finished
+void StepUnfinished(QueryResult &handle) {
+	for (idx_t step = 0; step < 5; step++) {
+		REQUIRE(!IsTerminal(handle.ExecuteTask()));
+	}
 }
 
 //! Stands in for an out-of-tree streaming collector: it builds its own result object and keeps the
@@ -394,6 +402,86 @@ TEST_CASE("A handle destroyed without collecting releases the query", "[api][que
 	}
 	auto next = con.Query("SELECT 42");
 	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("Closing an unfinished query discards its writes", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	// Without worker threads the insert only advances when this thread steps it
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+
+	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(1000000) t(i)");
+	StepUnfinished(*handle);
+	handle->Close();
+
+	auto count = observer.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}
+
+TEST_CASE("Closing a query that a worker failed discards its writes", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+
+	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(20000000) t(i)");
+	// Let the worker append rows before the interrupt reaches it
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	con.Interrupt();
+
+	auto &executor = Executor::Get(*con.context);
+	Deadline deadline;
+	while (!executor.HasError()) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	// Nothing observed the failure, so it is on the executor alone
+	REQUIRE(!handle->HasError());
+	handle->Close();
+
+	auto count = observer.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}
+
+TEST_CASE("Closing an unfinished query invalidates the open transaction", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+
+	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(1000000) t(i)");
+	StepUnfinished(*handle);
+	handle->Close();
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(next->HasError());
+	REQUIRE(StringUtil::Contains(next->GetError(), "aborted"));
+	REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
+	auto after = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(after, 0, {42}));
+}
+
+TEST_CASE("Closing a finished query without reading it commits", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+
+	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(1000) t(i)");
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	handle->Close();
+
+	auto count = observer.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
 }
 
 #endif

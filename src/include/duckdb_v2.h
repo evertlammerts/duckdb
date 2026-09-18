@@ -11964,9 +11964,9 @@ DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_statement_execute(duckdb_v2_connection_ha
  * Destroys a result handle.
  *
  * Null-safe: passing nullptr or a slot already set to nullptr is a no-op. Frees the memory the result owns and releases
- * the connection for its next query. Safe at any point in the stream's life, though destroying a partially consumed
- * result abandons the remaining execution, including side effects not yet applied. Chunks already fetched are
- * caller-owned and stay valid. On success the slot is set to nullptr.
+ * the connection for its next query. Safe at any point in the stream's life: destroying a partially consumed result
+ * abandons the remaining execution and discards its side effects, while destroying a finished result commits it. Chunks
+ * already fetched are caller-owned and stay valid. On success the slot is set to nullptr.
  *
  * history:
  * - stable: v2.0.0

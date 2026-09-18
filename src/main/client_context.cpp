@@ -342,7 +342,7 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const SQLStateme
 }
 
 ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
-                                          optional_ptr<ErrorData> previous_error) {
+                                          optional_ptr<ErrorData> previous_error, const char *invalidation_reason) {
 	if (active_query->executor) {
 		active_query->executor->CancelTasks();
 	}
@@ -363,7 +363,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 				}
 			} else if (invalidate_transaction) {
 				D_ASSERT(!success);
-				ValidChecker::Invalidate(ActiveTransaction(), "Failed to commit");
+				ValidChecker::Invalidate(ActiveTransaction(), invalidation_reason);
 			}
 		}
 	} catch (std::exception &ex) {
@@ -400,13 +400,17 @@ void ClientContext::CleanupInternal(ClientContextLock &lock, BaseQueryResult *re
 		// no query currently active
 		return;
 	}
+	bool execution_finished = true;
 	if (active_query->executor) {
+		auto &executor = *active_query->executor;
+		// ExecutionIsFinished also reports true for a failed execution
+		execution_finished = executor.ExecutionIsFinished() && !executor.HasError();
 		// Read before CancelTasks clears the slot, and while the profiler is still running
-		auto buffer = active_query->executor->GetResultBuffer();
+		auto buffer = executor.GetResultBuffer();
 		if (buffer) {
 			QueryProfiler::Get(*this).SetStreamingPeakBufferSize(buffer->PeakBufferedBytes());
 		}
-		active_query->executor->CancelTasks();
+		executor.CancelTasks();
 	}
 	active_query->progress_bar.reset();
 
@@ -418,7 +422,17 @@ void ClientContext::CleanupInternal(ClientContextLock &lock, BaseQueryResult *re
 	if (result && result->HasError()) {
 		passed_error = result->GetErrorObject();
 	}
-	auto error = EndQueryInternal(lock, result ? !result->HasError() : false, invalidate_transaction, passed_error);
+	bool success = false;
+	const char *invalidation_reason = "Failed to commit";
+	if (result && !result->HasError()) {
+		success = execution_finished;
+		if (!success) {
+			// Committing would keep only the part of the statement the workers happened to run
+			invalidate_transaction = true;
+			invalidation_reason = "Query was closed before it finished";
+		}
+	}
+	auto error = EndQueryInternal(lock, success, invalidate_transaction, passed_error, invalidation_reason);
 	if (result && !result->HasError()) {
 		// if an error occurred while committing report it in the result
 		result->SetError(error);
