@@ -1104,7 +1104,6 @@ BoundStatement Binder::Bind(CreateStatement &stmt) {
 	}
 
 	properties.return_type = return_type;
-	properties.result_eagerness = ResultEagerness::FORCED;
 
 	return result;
 }

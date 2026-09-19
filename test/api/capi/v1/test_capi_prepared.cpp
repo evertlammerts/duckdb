@@ -608,7 +608,7 @@ TEST_CASE("Prepared streaming result", "[capi]") {
 	// open the database in in-memory mode
 	REQUIRE(tester.OpenDatabase(nullptr));
 
-	SECTION("non streaming result") {
+	SECTION("a row-returning modification streams") {
 		REQUIRE(tester.Query("CREATE TABLE t2 (i INTEGER, j INTEGER);"));
 
 		duckdb_prepared_statement stmt;
@@ -617,9 +617,42 @@ TEST_CASE("Prepared streaming result", "[capi]") {
 		                       &stmt) == DuckDBSuccess);
 		duckdb_result res;
 		REQUIRE(duckdb_execute_prepared_streaming(stmt, &res) == DuckDBSuccess);
-		REQUIRE(!duckdb_result_is_streaming(res));
+		REQUIRE(duckdb_result_is_streaming(res));
+
+		auto chunk = duckdb_stream_fetch_chunk(res);
+		REQUIRE(chunk != nullptr);
+		REQUIRE(duckdb_data_chunk_get_size(chunk) == 1);
+		const int32_t expected[3] = {2, 3, 6};
+		for (idx_t col = 0; col < 3; col++) {
+			auto vec = duckdb_data_chunk_get_vector(chunk, col);
+			auto data = reinterpret_cast<int32_t *>(duckdb_vector_get_data(vec));
+			REQUIRE(data[0] == expected[col]);
+		}
+		duckdb_destroy_data_chunk(&chunk);
+		REQUIRE(duckdb_stream_fetch_chunk(res) == nullptr);
 		duckdb_destroy_result(&res);
 		duckdb_destroy_prepare(&stmt);
+
+		// draining the stream applied the insert
+		auto inserted = tester.Query("SELECT i, j FROM t2");
+		REQUIRE(inserted->Fetch<int32_t>(0, 0) == 2);
+		REQUIRE(inserted->Fetch<int32_t>(1, 0) == 3);
+	}
+
+	SECTION("a modification without RETURNING does not stream") {
+		REQUIRE(tester.Query("CREATE TABLE t3 (i INTEGER);"));
+
+		duckdb_prepared_statement stmt;
+		REQUIRE(duckdb_prepare(tester.connection, "INSERT INTO t3 VALUES (1), (2)", &stmt) == DuckDBSuccess);
+		duckdb_result res;
+		REQUIRE(duckdb_execute_prepared_streaming(stmt, &res) == DuckDBSuccess);
+		REQUIRE(!duckdb_result_is_streaming(res));
+		REQUIRE(duckdb_rows_changed(&res) == 2);
+		duckdb_destroy_result(&res);
+		duckdb_destroy_prepare(&stmt);
+
+		auto inserted = tester.Query("SELECT count(*) FROM t3");
+		REQUIRE(inserted->Fetch<int64_t>(0, 0) == 2);
 	}
 
 	SECTION("streaming result") {

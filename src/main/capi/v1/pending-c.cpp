@@ -156,9 +156,10 @@ duckdb_state duckdb_execute_pending(duckdb_pending_result pending_result, duckdb
 	}
 
 	auto result = std::move(wrapper->statement);
-	// A streaming request drains the result through a stream; every other one collects it
-	const bool stream_result = wrapper->allow_streaming && !result->HasError() &&
-	                           result->GetStatementProperties().result_eagerness != duckdb::ResultEagerness::FORCED;
+	// A streaming request drains a row-returning result through a stream; every other one collects it
+	const bool stream_result =
+	    wrapper->allow_streaming && !result->HasError() &&
+	    result->GetStatementProperties().return_type == duckdb::StatementReturnType::QUERY_RESULT;
 	try {
 		if (stream_result) {
 			return DuckDBTranslateStreamResult(duckdb::make_uniq<duckdb::QueryResultStream>(std::move(result)),

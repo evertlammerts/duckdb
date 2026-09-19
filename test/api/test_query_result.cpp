@@ -291,21 +291,26 @@ TEST_CASE("Poll observes an interrupt on a materializing handle", "[api][query_r
 	REQUIRE(CHECK_COLUMN(next, 0, {42}));
 }
 
-TEST_CASE("A statement that completes on return is retained and refuses a stream", "[api][query_result]") {
+TEST_CASE("A side-effecting statement can be streamed and applies its effect on drain", "[api][query_result]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i INTEGER)"));
 
 	for (auto query : {"INSERT INTO t VALUES (1), (2) RETURNING i", "CREATE TABLE ctas AS SELECT 42 AS i"}) {
 		auto handle = Submit(con, query);
-		REQUIRE(handle->GetStatementProperties().result_eagerness == ResultEagerness::FORCED);
-		// The store is settled before execution starts, so no producer parks for a decision
-		REQUIRE(handle->GetBufferedData().Lifetime() == ResultLifetime::RETAINED);
-		REQUIRE_THROWS_AS(QueryResultStream(std::move(handle)), InvalidInputException);
+		// Nothing settles the retention at submission: the consumer's first call does
+		REQUIRE(handle->GetBufferedData().Lifetime() == ResultLifetime::UNDECIDED);
+		QueryResultStream stream(std::move(handle));
+		DrainWatchdog watchdog(con);
+		REQUIRE(stream.GetBufferedData().Lifetime() == ResultLifetime::DRAINING);
+		while (auto chunk = stream.Fetch()) {
+		}
+		REQUIRE(!stream.HasError());
 	}
-	// The refused streams released their queries, so the connection is free again
-	auto inserted = con.Query("INSERT INTO t VALUES (1), (2) RETURNING i");
-	REQUIRE(inserted->RowCount() == 2);
+	auto rows = con.Query("SELECT i FROM t");
+	REQUIRE(CHECK_COLUMN(rows, 0, {1, 2}));
+	auto created = con.Query("SELECT i FROM ctas");
+	REQUIRE(CHECK_COLUMN(created, 0, {42}));
 }
 
 TEST_CASE("Multi-statement text chains completed results", "[api][query_result]") {
@@ -473,6 +478,7 @@ TEST_CASE("Closing a finished query without reading it commits", "[api][query_re
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
 
 	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(1000) t(i)");
+	handle->Materialize();
 	Deadline deadline;
 	while (handle->Poll() != QueryResultState::FINISHED) {
 		REQUIRE(!deadline.Passed());
@@ -482,6 +488,54 @@ TEST_CASE("Closing a finished query without reading it commits", "[api][query_re
 
 	auto count = observer.Query("SELECT count(*) FROM t");
 	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("A DDL submission finishes without a consumer call", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+
+	auto handle = Submit(con, "CREATE TABLE t(i BIGINT)");
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	handle->Close();
+
+	auto count = observer.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}
+
+TEST_CASE("A submitted insert parks until the consumer chooses", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+
+	auto handle = Submit(con, "INSERT INTO t VALUES (1)");
+	Deadline deadline;
+	auto state = handle->Poll();
+	while (state != QueryResultState::READY && !IsTerminal(state)) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+		state = handle->Poll();
+	}
+	// The row count parks for the consumer's choice, so the workers cannot finish the query
+	REQUIRE(state == QueryResultState::READY);
+	REQUIRE(handle->GetBufferedData().Lifetime() == ResultLifetime::UNDECIDED);
+
+	handle->Materialize();
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	handle->Close();
+
+	auto rows = observer.Query("SELECT i FROM t");
+	REQUIRE(CHECK_COLUMN(rows, 0, {1}));
 }
 
 #endif

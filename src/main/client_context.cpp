@@ -624,8 +624,10 @@ void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &
 	}
 }
 
-unique_ptr<QueryResult> ClientContext::SubmitPreparedStatementInternal(
-    ClientContextLock &lock, shared_ptr<PreparedStatementData> statement_data_p, const QueryParameters &parameters) {
+unique_ptr<QueryResult>
+ClientContext::SubmitPreparedStatementInternal(ClientContextLock &lock,
+                                               shared_ptr<PreparedStatementData> statement_data_p,
+                                               const QueryParameters &parameters, bool retain_at_submission) {
 	D_ASSERT(active_query);
 	auto &statement_data = *statement_data_p;
 	BindPreparedStatementParameters(*this, statement_data, parameters);
@@ -671,8 +673,7 @@ unique_ptr<QueryResult> ClientContext::SubmitPreparedStatementInternal(
 		} else {
 			buffer = make_shared_ptr<SimpleBufferedData>(*this, sink.lifetime);
 		}
-		if (parameters.result_eagerness == ResultEagerness::FORCED ||
-		    statement_data.properties.result_eagerness == ResultEagerness::FORCED) {
+		if (retain_at_submission) {
 			// Settled before execution starts, so no producer ever parks for the decision
 			buffer->Decide(ResultLifetime::RETAINED);
 		}
@@ -918,7 +919,6 @@ unique_ptr<PreparedStatement> ClientContext::PrepareInternal(ClientContextLock &
 	prepare->statement = std::move(statement);
 
 	QueryParameters parameters;
-	parameters.result_eagerness = ResultEagerness::FORCED;
 	auto result = RunStatementInternal(lock, std::move(prepare), parameters, false);
 	if (result->HasError()) {
 		result->ThrowError();
@@ -1016,7 +1016,8 @@ unique_ptr<PreparedStatement> ClientContext::Prepare(const string &query) {
 
 unique_ptr<QueryResult> ClientContext::SubmitStatementInternal(ClientContextLock &lock,
                                                                unique_ptr<SQLStatement> statement,
-                                                               const QueryParameters &parameters) {
+                                                               const QueryParameters &parameters,
+                                                               bool retain_at_submission) {
 	// prepare the query for execution
 	if (!statement->named_param_map.empty() && parameters.statement_args) {
 		PreparedStatement::VerifyParameters(*parameters.statement_args, statement->named_param_map, this);
@@ -1032,12 +1033,12 @@ unique_ptr<QueryResult> ClientContext::SubmitStatementInternal(ClientContextLock
 	}
 	// execute the prepared statement
 	CheckIfPreparedStatementIsExecutable(*prepared);
-	return SubmitPreparedStatementInternal(lock, std::move(prepared), parameters);
+	return SubmitPreparedStatementInternal(lock, std::move(prepared), parameters, retain_at_submission);
 }
 
 unique_ptr<QueryResult> ClientContext::RunStatementInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
                                                             const QueryParameters &parameters, bool verify) {
-	auto result = SubmitInternal(lock, std::move(statement), parameters, verify);
+	auto result = SubmitInternal(lock, std::move(statement), parameters, verify, true);
 	if (result->HasError()) {
 		return result;
 	}
@@ -1065,7 +1066,7 @@ static bool HasBoundParameterValues(const SQLStatement &statement) {
 }
 
 unique_ptr<QueryResult> ClientContext::SubmitStatement(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-                                                       const QueryParameters &parameters) {
+                                                       const QueryParameters &parameters, bool retain_at_submission) {
 	// CONNECT chokepoint: when connected, non-control SQL is rewritten in place and falls through to
 	// the normal pipeline. No recursion — the rewrite goes through SubmitStatementInternal, not back here.
 	if (is_connected) {
@@ -1116,7 +1117,7 @@ unique_ptr<QueryResult> ClientContext::SubmitStatement(ClientContextLock &lock, 
 
 	bool invalidate_query = true;
 	try {
-		result = SubmitStatementInternal(lock, std::move(statement), parameters);
+		result = SubmitStatementInternal(lock, std::move(statement), parameters, retain_at_submission);
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		if (!ErrorInvalidatesTransaction(error.Type())) {
@@ -1164,13 +1165,12 @@ void ClientContext::LogQueryInternal(ClientContextLock &, const string &query) {
 
 unique_ptr<QueryResult> ClientContext::Query(unique_ptr<SQLStatement> statement, QueryParameters parameters) {
 	auto lock = LockContext();
-	parameters.result_eagerness = ResultEagerness::FORCED;
 	try {
 		InitialCleanup(*lock);
 	} catch (std::exception &ex) {
 		return ErrorResult<QueryResult>(ErrorData(ex), statement->query);
 	}
-	auto result = SubmitInternal(*lock, std::move(statement), parameters, true);
+	auto result = SubmitInternal(*lock, std::move(statement), parameters, true, true);
 	if (result->HasError()) {
 		if (transaction.HasActiveTransaction() && transaction.GetAutoRollback()) {
 			transaction.Rollback(result->GetErrorObject());
@@ -1247,11 +1247,9 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, QueryParameter
 			    ErrorData(InvalidInputException("Cannot prepare multiple statements at once!")), query);
 		}
 		if (statement) {
-			auto parameters = query_parameters;
 			// Every statement of an eager query completes before the call returns, so none of them
 			// leaves a producer parked for the consumer's choice
-			parameters.result_eagerness = ResultEagerness::FORCED;
-			auto current_result = SubmitInternal(*lock, std::move(statement), parameters);
+			auto current_result = SubmitInternal(*lock, std::move(statement), query_parameters, true, true);
 			auto has_result = current_result->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT;
 			if (!current_result->HasError()) {
 				current_result = CompleteInternal(*lock, std::move(current_result));
@@ -1337,9 +1335,7 @@ unique_ptr<QueryResult> ClientContext::RunInternalStatement(unique_ptr<SQLStatem
 	} catch (std::exception &ex) {
 		return ErrorResult<QueryResult>(ErrorData(ex), statement->query);
 	}
-	QueryParameters params = parameters;
-	params.result_eagerness = ResultEagerness::FORCED;
-	return RunStatementInternal(*lock, std::move(statement), params, false);
+	return RunStatementInternal(*lock, std::move(statement), parameters, false);
 }
 
 unique_ptr<QueryResult> ClientContext::SubmitInternalStatement(unique_ptr<SQLStatement> statement,
@@ -1354,7 +1350,8 @@ unique_ptr<QueryResult> ClientContext::SubmitInternalStatement(unique_ptr<SQLSta
 }
 
 unique_ptr<QueryResult> ClientContext::SubmitInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-                                                      const QueryParameters &parameters, bool verify) {
+                                                      const QueryParameters &parameters, bool verify,
+                                                      bool retain_at_submission) {
 	if (verify) {
 		try {
 			StatementVerification(lock, statement, parameters);
@@ -1363,7 +1360,7 @@ unique_ptr<QueryResult> ClientContext::SubmitInternal(ClientContextLock &lock, u
 			return ErrorResult<QueryResult>(ErrorData(ex), statement->query);
 		}
 	}
-	return SubmitStatement(lock, std::move(statement), parameters);
+	return SubmitStatement(lock, std::move(statement), parameters, retain_at_submission);
 }
 
 void ClientContext::Interrupt() {
@@ -1498,7 +1495,6 @@ void ClientContext::RunTransactionStatement(const TransactionInfo &info) {
 		auto statement = make_uniq<TransactionStatement>(info.Copy());
 		statement->query = info.ToString();
 		QueryParameters parameters;
-		parameters.result_eagerness = ResultEagerness::FORCED;
 		auto result = RunStatementInternal(*lock, std::move(statement), parameters);
 		if (result->HasError()) {
 			if (transaction.HasActiveTransaction() && transaction.GetAutoRollback()) {
@@ -1670,8 +1666,7 @@ unique_ptr<QueryResult> ClientContext::Execute(const shared_ptr<Relation> &relat
 
 	auto relation_stmt = make_uniq<RelationStatement>(relation);
 	QueryParameters parameters;
-	parameters.result_eagerness = ResultEagerness::FORCED;
-	auto result = SubmitInternal(*lock, std::move(relation_stmt), parameters);
+	auto result = SubmitInternal(*lock, std::move(relation_stmt), parameters, true, true);
 	if (result->HasError()) {
 		return result;
 	}

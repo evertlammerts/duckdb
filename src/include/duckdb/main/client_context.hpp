@@ -282,9 +282,12 @@ private:
 	//! Same as RunTransactionStatement, but does not obtain a lock or route CONNECT statements.
 	void RunTransactionStatementInternal(const TransactionInfo &info);
 
-	//! Submits a query to the database and returns its handle
+	//! Submits a query to the database and returns its handle. retain_at_submission settles the result on
+	//! retained before the first task is scheduled, so a query this context completes itself never parks a
+	//! producer for a decision it has already made
 	unique_ptr<QueryResult> SubmitInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                       const QueryParameters &parameters, bool verify = true);
+	                                       const QueryParameters &parameters, bool verify = true,
+	                                       bool retain_at_submission = false);
 	//! Drives a submitted query to completion and retains its result
 	unique_ptr<QueryResult> CompleteInternal(ClientContextLock &lock, unique_ptr<QueryResult> result);
 	//! Drives a query whose collector builds its own result object, and hands that object out. Null
@@ -301,10 +304,11 @@ private:
 	void CleanupInternal(ClientContextLock &lock, BaseQueryResult *result = nullptr,
 	                     bool invalidate_transaction = false);
 	unique_ptr<QueryResult> SubmitStatement(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                        const QueryParameters &parameters);
+	                                        const QueryParameters &parameters, bool retain_at_submission = false);
 	unique_ptr<QueryResult> SubmitPreparedStatementInternal(ClientContextLock &lock,
 	                                                        shared_ptr<PreparedStatementData> statement_data_p,
-	                                                        const QueryParameters &parameters);
+	                                                        const QueryParameters &parameters,
+	                                                        bool retain_at_submission = false);
 	void CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement);
 
 	//! Internally prepare a SQL statement. Caller must hold the context_lock.
@@ -312,7 +316,8 @@ private:
 	                                                          unique_ptr<SQLStatement> statement,
 	                                                          const QueryParameters &parameters);
 	unique_ptr<QueryResult> SubmitStatementInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                                const QueryParameters &parameters);
+	                                                const QueryParameters &parameters,
+	                                                bool retain_at_submission = false);
 	unique_ptr<QueryResult> RunStatementInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
 	                                             const QueryParameters &parameters, bool verify = true);
 	unique_ptr<PreparedStatement> PrepareInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement);

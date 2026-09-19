@@ -161,15 +161,15 @@ DUCKDB_V2_RESULT_STEP_STATUS ResultWrapperV2::Step(unique_ptr<DataChunk> &out_ch
 			// transition keeps the contract simple: one unit of work per
 			// step; the next step hits the stream.
 			try {
-				if (handle->GetStatementProperties().result_eagerness == ResultEagerness::FORCED) {
-					// The statement completes before its result is returned:
-					// its chunks come from the retained handle instead.
+				if (handle->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT) {
+					stream = make_uniq<QueryResultStream>(std::move(handle));
+				} else {
+					// No rows to stream: the count or status chunk comes from the
+					// retained handle instead.
 					handle->Complete();
 					if (handle->HasError()) {
 						return HandleExecutionError(handle->GetErrorObject());
 					}
-				} else {
-					stream = make_uniq<QueryResultStream>(std::move(handle));
 				}
 			} catch (std::exception &ex) {
 				return HandleExecutionError(ErrorData(ex));
@@ -207,9 +207,9 @@ DUCKDB_V2_RESULT_STEP_STATUS ResultWrapperV2::Step(unique_ptr<DataChunk> &out_ch
 				break;
 			}
 		}
-		// Fetch the next chunk. For a statement that completes before its
-		// result is returned the data is fully available and every step
-		// lands here directly.
+		// Fetch the next chunk. For a statement served from the retained
+		// handle the data is fully available and every step lands here
+		// directly.
 		unique_ptr<DataChunk> chunk;
 		try {
 			chunk = stream ? stream->Fetch() : handle->Fetch();

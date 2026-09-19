@@ -29,8 +29,9 @@ TEST_CASE("Test pending statements in C API", "[capi]") {
 }
 
 TEST_CASE("Test polling a pending statement that the workers already finished", "[capi]") {
-	// A statement whose store is retained at submission finishes without the consumer stepping it.
-	// Polling it then reports the result as ready, not as an error
+	// The workers advance a submitted statement without the consumer stepping it, up to completion
+	// or to a producer parked for the retention decision. Polling it then reports the result as
+	// ready, not as an error
 	CAPITester tester;
 	CAPIPrepared prepared;
 	CAPIPending pending;

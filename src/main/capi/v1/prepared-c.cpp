@@ -448,8 +448,8 @@ duckdb_state duckdb_execute_prepared_streaming(duckdb_prepared_statement prepare
 	try {
 		auto result = wrapper->statement->Submit(wrapper->values);
 		if (result->HasError() ||
-		    result->GetStatementProperties().result_eagerness == duckdb::ResultEagerness::FORCED) {
-			// The statement cannot be streamed: it completes before its result is returned
+		    result->GetStatementProperties().return_type != duckdb::StatementReturnType::QUERY_RESULT) {
+			// The statement returns no rows to stream: collect it instead
 			result->Complete();
 			return DuckDBTranslateResult(std::move(result), out_result);
 		}
