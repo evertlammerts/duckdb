@@ -45,6 +45,15 @@ void StepUnfinished(QueryResult &handle) {
 	}
 }
 
+//! A dynamic PIVOT preprocesses into one CREATE TYPE per pivot column followed by the select
+constexpr const char *PIVOT_QUERY = "PIVOT sales ON year USING sum(amount) ORDER BY city";
+
+void CreateSales(Connection &con) {
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sales (city VARCHAR, year INTEGER, amount INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO sales VALUES ('ams', 2023, 10), ('ams', 2024, 20), "
+	                          "('rtm', 2023, 30), ('rtm', 2024, 40)"));
+}
+
 //! Stands in for an out-of-tree streaming collector: it builds its own result object and keeps the
 //! query open, the combination no in-tree collector has
 class TestCollectorState : public GlobalSinkState {
@@ -536,6 +545,303 @@ TEST_CASE("A submitted insert parks until the consumer chooses", "[api][query_re
 
 	auto rows = observer.Query("SELECT i FROM t");
 	REQUIRE(CHECK_COLUMN(rows, 0, {1}));
+}
+
+TEST_CASE("A dynamic PIVOT is one submitted query", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	CreateSales(con);
+
+	auto handle = Submit(con, PIVOT_QUERY);
+	// The schema is the set of distinct pivot values, so it is unknown until the fragment that
+	// produces the rows has been prepared
+	REQUIRE(!handle->MetadataAvailable());
+	REQUIRE(!handle->TryGetTypes());
+	REQUIRE(!handle->TryGetNames());
+	REQUIRE(!handle->TryGetStatementType());
+	REQUIRE(!handle->TryGetStatementProperties());
+	REQUIRE(!handle->TryColumnCount().IsValid());
+	REQUIRE_THROWS_AS(handle->GetTypes(), InvalidInputException);
+	REQUIRE_THROWS_AS(handle->ColumnCount(), InvalidInputException);
+
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(!handle->HasError());
+	REQUIRE(handle->MetadataAvailable());
+	REQUIRE(handle->TryGetTypes());
+	REQUIRE(handle->TryColumnCount().GetIndex() == 3);
+	REQUIRE(handle->GetStatementType() == StatementType::SELECT_STATEMENT);
+	REQUIRE(handle->RowCount() == 2);
+
+	auto expected = con.Query(PIVOT_QUERY);
+	REQUIRE_NO_FAIL(*expected);
+	REQUIRE(handle->GetNames() == expected->GetNames());
+	REQUIRE(handle->GetTypes() == expected->GetTypes());
+	// The cursor walks the collection the handle holds
+	REQUIRE(handle->Equals(*expected));
+}
+
+TEST_CASE("A poll-only consumer reaches the principal fragment of a group", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	CreateSales(con);
+
+	auto handle = Submit(con, PIVOT_QUERY);
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::READY) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	// READY is the row-producing fragment parked for the retention decision, so its schema is known
+	REQUIRE(handle->MetadataAvailable());
+	REQUIRE(handle->ColumnCount() == 3);
+
+	handle->Materialize();
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	REQUIRE(handle->Collection().Count() == 2);
+}
+
+TEST_CASE("A single-threaded consumer drives a group itself", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	CreateSales(con);
+
+	auto handle = Submit(con, PIVOT_QUERY);
+	DrainWatchdog watchdog(con);
+	Deadline deadline;
+	QueryResultState state;
+	while ((state = handle->ExecuteTask()) != QueryResultState::READY) {
+		REQUIRE(!IsTerminal(state));
+		if (state == QueryResultState::BLOCKED) {
+			handle->WaitForTask();
+		}
+		REQUIRE(!deadline.Passed());
+	}
+	handle->Complete();
+	REQUIRE(!handle->HasError());
+	REQUIRE(handle->RowCount() == 2);
+}
+
+TEST_CASE("A group that produces no rows knows its metadata at submission", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	REQUIRE(handle->MetadataAvailable());
+	REQUIRE(handle->ColumnCount() == 0);
+	REQUIRE(handle->GetStatementProperties().return_type == StatementReturnType::NOTHING);
+
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	handle->Close();
+
+	auto count = observer.Query("SELECT count(*) FROM t WHERE c IS NOT NULL");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+	// The injected wrap left no transaction open
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+}
+
+TEST_CASE("An error inside a wrapped group rolls the group back", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT ((random()::VARCHAR || 'x')::INTEGER)");
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(handle->HasError());
+	REQUIRE(handle->GetErrorType() == ExceptionType::CONVERSION);
+	handle.reset();
+
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("Abandoning a wrapped group rolls it back", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	for (idx_t step = 0; step < 2; step++) {
+		REQUIRE(!IsTerminal(handle->ExecuteTask()));
+	}
+	handle->Close();
+
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000000}));
+}
+
+TEST_CASE("An interrupt during a group cancels it and rolls it back", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(2000000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	handle->Materialize();
+	con.Interrupt();
+
+	Deadline deadline;
+	QueryResultState state;
+	while (!IsTerminal(state = handle->Poll())) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	REQUIRE(state == QueryResultState::EXECUTION_ERROR);
+	REQUIRE(StringUtil::Contains(handle->GetError(), "INTERRUPT"));
+	handle.reset();
+
+	con.context->ClearInterrupt();
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("Parameters on a statement that expands into several are refused", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(10)"));
+
+	vector<Value> values {Value::INTEGER(100)};
+	auto handle = con.Submit("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT (random() * $1)::INTEGER", values);
+	REQUIRE(handle->HasError());
+	REQUIRE(StringUtil::Contains(handle->GetError(), "parameters are not supported"));
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("A submission still takes exactly one user statement", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto refused = con.Submit("SELECT 1; SELECT 2;");
+	REQUIRE(refused->HasError());
+	REQUIRE(StringUtil::Contains(refused->GetError(), "Cannot prepare multiple statements at once!"));
+
+	// A statement that does not expand is submitted exactly as before
+	auto handle = Submit(con, "SELECT i FROM range(1000) t(i)");
+	REQUIRE(handle->MetadataAvailable());
+	REQUIRE(handle->ColumnCount() == 1);
+	REQUIRE(handle->GetStatementType() == StatementType::SELECT_STATEMENT);
+	REQUIRE(handle->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT);
+	REQUIRE(handle->GetNames()[0] == "i");
+	// Nothing settles the retention at submission: the consumer's first call does
+	REQUIRE(handle->GetBufferedData().Lifetime() == ResultLifetime::UNDECIDED);
+	QueryResultStream stream(std::move(handle));
+	DrainWatchdog watchdog(con);
+	idx_t rows = 0;
+	while (auto chunk = stream.Fetch()) {
+		rows += chunk->size();
+	}
+	REQUIRE(!stream.HasError());
+	REQUIRE(rows == 1000);
+}
+
+TEST_CASE("Query on a statement that expands is unchanged", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	CreateSales(con);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+
+	auto pivot = con.Query(PIVOT_QUERY);
+	REQUIRE_NO_FAIL(*pivot);
+	REQUIRE(pivot->ColumnCount() == 3);
+	REQUIRE(pivot->RowCount() == 2);
+
+	auto altered = con.Query("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	REQUIRE_NO_FAIL(*altered);
+	REQUIRE(altered->GetStatementProperties().return_type == StatementReturnType::NOTHING);
+	auto count = con.Query("SELECT count(*) FROM t WHERE c IS NOT NULL");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("IMPORT DATABASE is one submitted query", "[api][query_result]") {
+	auto export_dir = TestCreatePath("submitted_import_export");
+	TestDeleteDirectory(export_dir);
+	{
+		DuckDB source(nullptr);
+		Connection writer(source);
+		REQUIRE_NO_FAIL(writer.Query("CREATE TABLE t AS SELECT range i FROM range(100)"));
+		REQUIRE_NO_FAIL(writer.Query("EXPORT DATABASE '" + export_dir + "'"));
+	}
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto handle = Submit(con, "IMPORT DATABASE '" + export_dir + "'");
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	handle->Close();
+
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {100}));
+	TestDeleteDirectory(export_dir);
+}
+
+TEST_CASE("A statement that expands runs inside a user transaction", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+
+	// Inside a transaction the preprocessor brackets the statements with SET instead of wrapping them
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	REQUIRE(handle->MetadataAvailable());
+	REQUIRE(handle->ColumnCount() == 0);
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(!handle->HasError());
+	handle.reset();
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+
+	auto count = observer.Query("SELECT count(*) FROM t WHERE c IS NOT NULL");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("A statement that expands leaves the user's transaction to the user", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT ((random()::VARCHAR || 'x')::INTEGER)");
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(handle->HasError());
+	handle.reset();
+
+	// The failure invalidated the transaction the user opened, and left ending it to them
+	auto next = con.Query("SELECT 42");
+	REQUIRE(next->HasError());
+	REQUIRE(StringUtil::Contains(next->GetError(), "aborted"));
+	REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
+
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
 }
 
 #endif

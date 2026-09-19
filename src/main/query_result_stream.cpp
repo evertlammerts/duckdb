@@ -15,10 +15,11 @@ QueryResultStream::QueryResultStream(unique_ptr<QueryResult> result) : handle(st
 		throw InvalidInputException("Attempting to open a stream on an unsuccessful query result\nError: %s",
 		                            handle->GetError());
 	}
-	if (!handle->HasBufferedData()) {
+	if (!handle->IsOpen()) {
 		throw InvalidInputException("Attempting to open a stream on a query result that has no streaming buffer");
 	}
-	if (handle->GetBufferedData().Decide(ResultLifetime::DRAINING) != ResultLifetime::DRAINING) {
+	auto lock = handle->LockContext();
+	if (handle->context->SettleRetention(*lock, ResultLifetime::DRAINING) != ResultLifetime::DRAINING) {
 		throw InvalidInputException("Attempting to open a stream on a query result that is being retained");
 	}
 }
@@ -44,6 +45,9 @@ QueryResultStream::GuardedInternal(const char *name,
 	}
 	auto lock = handle->LockContext();
 	try {
+		if (!handle->IsOpenInternal(*lock)) {
+			return handle->Cancelled();
+		}
 		return call(*lock);
 	} catch (std::exception &ex) {
 		// A pending interrupt reaches the consumer as an error on the stream, never as a throw
@@ -56,7 +60,12 @@ QueryResultStream::GuardedInternal(const char *name,
 }
 
 QueryResultState QueryResultStream::Poll() {
-	auto state = GuardedInternal("Poll", [&](ClientContextLock &lock) { return handle->buffer->Poll(lock, *handle); });
+	auto state = GuardedInternal("Poll", [&](ClientContextLock &lock) {
+		if (!handle->context->PrincipalHasStarted(lock)) {
+			return handle->context->PollInternal(lock, *handle);
+		}
+		return handle->buffer->Poll(lock, *handle);
+	});
 	if (state == QueryResultState::EXECUTION_ERROR) {
 		Close();
 	}
@@ -64,8 +73,12 @@ QueryResultState QueryResultStream::Poll() {
 }
 
 QueryResultState QueryResultStream::ExecuteTask() {
-	auto state = GuardedInternal("ExecuteTask",
-	                             [&](ClientContextLock &lock) { return handle->buffer->Participate(lock, *handle); });
+	auto state = GuardedInternal("ExecuteTask", [&](ClientContextLock &lock) {
+		if (!handle->context->PrincipalHasStarted(lock)) {
+			return handle->context->ExecuteTaskInternal(lock, *handle);
+		}
+		return handle->buffer->Participate(lock, *handle);
+	});
 	if (state == QueryResultState::EXECUTION_ERROR) {
 		// A finished execution can still hold trailing chunks, so only an error ends the stream here
 		Close();
@@ -77,13 +90,18 @@ void QueryResultStream::WaitForTask() {
 	if (!handle->context) {
 		return;
 	}
-	handle->buffer->UnblockSinks();
+	if (handle->buffer) {
+		handle->buffer->UnblockSinks();
+	}
 	handle->WaitForTask();
 }
 
 QueryResultState QueryResultStream::TryFetch(unique_ptr<DataChunk> &out_chunk) {
 	out_chunk.reset();
 	auto state = GuardedInternal("TryFetch", [&](ClientContextLock &lock) {
+		if (!handle->context->PrincipalHasStarted(lock)) {
+			return handle->context->PollInternal(lock, *handle);
+		}
 		auto &buffer = *handle->buffer;
 		auto state = buffer.Poll(lock, *handle);
 		if (state == QueryResultState::EXECUTION_ERROR) {
@@ -118,9 +136,19 @@ QueryResultState QueryResultStream::TryFetch(unique_ptr<DataChunk> &out_chunk) {
 }
 
 unique_ptr<DataChunk> QueryResultStream::FetchInternal(ClientContextLock &lock) {
-	auto &buffer = *handle->buffer;
 	unique_ptr<DataChunk> chunk;
 	try {
+		while (!handle->context->PrincipalHasStarted(lock)) {
+			// The statements before the one whose rows this stream drains run on the calling thread
+			auto state = handle->context->ExecuteTaskInternal(lock, *handle);
+			if (IsTerminal(state)) {
+				return nullptr;
+			}
+			if (state == QueryResultState::BLOCKED || state == QueryResultState::NO_TASKS_AVAILABLE) {
+				handle->context->WaitForTask(lock, *handle);
+			}
+		}
+		auto &buffer = *handle->buffer;
 		auto state = buffer.ReplenishBuffer(lock, *handle);
 		if (state == QueryResultState::EXECUTION_ERROR) {
 			return nullptr;
@@ -154,7 +182,7 @@ unique_ptr<DataChunk> QueryResultStream::Fetch() {
 		chunk = FetchInternal(*lock);
 	}
 	if (!chunk || chunk->ColumnCount() == 0 || chunk->size() == 0) {
-		if (!HasError()) {
+		if (!HasError() && handle->buffer) {
 			handle->buffer->AssertNoBlockedSinks();
 		}
 		Close();

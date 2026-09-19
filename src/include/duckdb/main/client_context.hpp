@@ -87,6 +87,7 @@ class ClientContext : public enable_shared_from_this<ClientContext> {
 	friend class BufferedData;        // ExecuteTaskInternal, PollInternal
 	friend class SimpleBufferedData;  // ExecuteTaskInternal, PollInternal
 	friend class BatchedBufferedData; // ExecuteTaskInternal, PollInternal
+	friend class QueryResultStream;   // ExecuteTaskInternal, PollInternal, WaitForTask
 	friend class ConnectionManager;
 	friend class Connection;
 	friend class PhysicalTransaction;
@@ -282,12 +283,6 @@ private:
 	//! Same as RunTransactionStatement, but does not obtain a lock or route CONNECT statements.
 	void RunTransactionStatementInternal(const TransactionInfo &info);
 
-	//! Submits a query to the database and returns its handle. retain_at_submission settles the result on
-	//! retained before the first task is scheduled, so a query this context completes itself never parks a
-	//! producer for a decision it has already made
-	unique_ptr<QueryResult> SubmitInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                       const QueryParameters &parameters, bool verify = true,
-	                                       bool retain_at_submission = false);
 	//! Drives a submitted query to completion and retains its result
 	unique_ptr<QueryResult> CompleteInternal(ClientContextLock &lock, unique_ptr<QueryResult> result);
 	//! Drives a query whose collector builds its own result object, and hands that object out. Null
@@ -303,21 +298,48 @@ private:
 	//! Internal clean up, does not lock. Caller must hold the context_lock.
 	void CleanupInternal(ClientContextLock &lock, BaseQueryResult *result = nullptr,
 	                     bool invalidate_transaction = false);
+	//! Routes a statement through an active CONNECT binding, rewriting it in place
+	void RouteConnectedStatement(unique_ptr<SQLStatement> &statement);
+	//! Preprocesses one user statement into the engine statements it expands to (PRAGMA reparse,
+	//! MULTI_STATEMENT unpack, transaction bracketing). Empty when it expands to nothing
+	vector<unique_ptr<SQLStatement>> PreprocessStatementInternal(ClientContextLock &lock,
+	                                                             unique_ptr<SQLStatement> statement);
+	//! Submits one user statement: preprocesses it, begins the active query over the statements it
+	//! expands to and starts the first of them. Null when the statement expands to nothing. retention
+	//! settles the result before the first task is scheduled, so a query this context completes
+	//! itself never parks a producer for a decision it has already made
 	unique_ptr<QueryResult> SubmitStatement(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                        const QueryParameters &parameters, bool retain_at_submission = false);
-	unique_ptr<QueryResult> SubmitPreparedStatementInternal(ClientContextLock &lock,
-	                                                        shared_ptr<PreparedStatementData> statement_data_p,
-	                                                        const QueryParameters &parameters,
-	                                                        bool retain_at_submission = false);
+	                                        const QueryParameters &parameters, ResultLifetime retention, bool verify);
+	//! Starts the next statement of the active query. Returns the result object a delegating collector
+	//! built, or null for the usual path where the consumer's handle serves the rows
+	unique_ptr<QueryResult> StartFragmentInternal(ClientContextLock &lock, const QueryParameters &parameters);
+	//! Moves to the next statement once the running one's executor has finished. Reports where the
+	//! query stands afterwards
+	QueryResultState AdvanceFragmentInternal(ClientContextLock &lock);
+	//! Records the consumer's retention decision and applies it to the buffer that serves the rows as
+	//! soon as that buffer exists. Returns the lifetime in force
+	ResultLifetime SettleRetention(ClientContextLock &lock, ResultLifetime lifetime);
+	//! Whether the statement whose rows and schema the consumer reads has started
+	bool PrincipalHasStarted(ClientContextLock &lock);
+
+	//! What initializing a statement's execution produced. The handle that serves the rows carries
+	//! the buffer; the types and client properties are read before the workers start
+	struct FragmentExecution {
+		shared_ptr<BufferedData> buffer;
+		vector<LogicalType> types;
+		ClientProperties client_properties;
+		bool delegating = false;
+	};
+	//! Binds the parameters of a prepared statement, creates its result buffer and initializes the
+	//! executor
+	FragmentExecution InitializeExecutionInternal(ClientContextLock &lock, PreparedStatementData &statement_data,
+	                                              const QueryParameters &parameters);
 	void CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement);
 
 	//! Internally prepare a SQL statement. Caller must hold the context_lock.
 	shared_ptr<PreparedStatementData> CreatePreparedStatement(ClientContextLock &lock,
 	                                                          unique_ptr<SQLStatement> statement,
 	                                                          const QueryParameters &parameters);
-	unique_ptr<QueryResult> SubmitStatementInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
-	                                                const QueryParameters &parameters,
-	                                                bool retain_at_submission = false);
 	unique_ptr<QueryResult> RunStatementInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement,
 	                                             const QueryParameters &parameters, bool verify = true);
 	unique_ptr<PreparedStatement> PrepareInternal(ClientContextLock &lock, unique_ptr<SQLStatement> statement);
@@ -325,7 +347,15 @@ private:
 
 	unique_ptr<ClientContextLock> LockContext();
 
-	void BeginQueryInternal(ClientContextLock &lock, const SQLStatement &statement);
+	//! Begins the active query for one user statement over the engine statements it expands to
+	void BeginQueryInternal(ClientContextLock &lock, vector<unique_ptr<SQLStatement>> fragments);
+	//! Ends the statement that is running: tears its executor down and settles the transaction step
+	//! that belongs to one statement
+	ErrorData EndFragmentInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
+	                              optional_ptr<ErrorData> previous_error,
+	                              const char *invalidation_reason = "Failed to commit");
+	//! Ends the running statement and the query, rolling back the transaction the query opened itself
+	//! when it did not finish cleanly
 	ErrorData EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
 	                           optional_ptr<ErrorData> previous_error,
 	                           const char *invalidation_reason = "Failed to commit");
@@ -355,7 +385,8 @@ private:
 private:
 	//! Lock on using the ClientContext in parallel
 	mutex context_lock;
-	//! The currently active query context
+	//! The user statement that is currently being executed, alive from its submission until the query
+	//! ends. It holds every engine statement that statement expanded into
 	unique_ptr<ActiveQueryContext> active_query;
 	//! The current query progress
 	QueryProgress query_progress;

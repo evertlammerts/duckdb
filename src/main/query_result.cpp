@@ -10,21 +10,24 @@
 #include "duckdb/main/buffered_data/buffered_data.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/prepared_statement_data.hpp"
 
 namespace duckdb {
 
 BaseQueryResult::BaseQueryResult(QueryResultType type, StatementType statement_type, StatementProperties properties_p,
                                  vector<LogicalType> types_p, vector<Identifier> names_p)
     : type(type), statement_type(statement_type), properties(std::move(properties_p)), types(std::move(types_p)),
-      names(std::move(names_p)), success(true) {
+      names(std::move(names_p)), metadata_available(true), success(true) {
 	D_ASSERT(types.size() == names.size());
 }
 
 BaseQueryResult::BaseQueryResult(QueryResultType type, ErrorData error)
-    : type(type), success(false), error(std::move(error)) {
+    : type(type), metadata_available(true), success(false), error(std::move(error)) {
 	// Assert that the error object is initialized
 	D_ASSERT(this->error.HasError());
+}
+
+BaseQueryResult::BaseQueryResult(QueryResultType type)
+    : type(type), statement_type(StatementType::INVALID_STATEMENT), metadata_available(false), success(true) {
 }
 
 BaseQueryResult::~BaseQueryResult() {
@@ -63,7 +66,47 @@ const ErrorData &BaseQueryResult::GetErrorObject() const {
 }
 
 idx_t BaseQueryResult::ColumnCount() const {
+	RequireMetadata();
 	return types.size();
+}
+
+bool BaseQueryResult::MetadataAvailable() const {
+	return metadata_available;
+}
+
+void BaseQueryResult::ThrowMetadataUnavailable() const {
+	throw InvalidInputException("The metadata of this query result is not available yet: the statement expands into "
+	                            "several, and the one the result takes its schema from has not been prepared");
+}
+
+optional_ptr<const StatementType> BaseQueryResult::TryGetStatementType() const {
+	return metadata_available ? optional_ptr<const StatementType>(statement_type) : nullptr;
+}
+
+optional_ptr<const StatementProperties> BaseQueryResult::TryGetStatementProperties() const {
+	return metadata_available ? optional_ptr<const StatementProperties>(properties) : nullptr;
+}
+
+optional_ptr<const vector<LogicalType>> BaseQueryResult::TryGetTypes() const {
+	return metadata_available ? optional_ptr<const vector<LogicalType>>(types) : nullptr;
+}
+
+optional_ptr<const vector<Identifier>> BaseQueryResult::TryGetNames() const {
+	return metadata_available ? optional_ptr<const vector<Identifier>>(names) : nullptr;
+}
+
+optional_idx BaseQueryResult::TryColumnCount() const {
+	return metadata_available ? optional_idx(types.size()) : optional_idx();
+}
+
+void BaseQueryResult::SetMetadata(StatementType statement_type_p, StatementProperties properties_p,
+                                  vector<LogicalType> types_p, vector<Identifier> names_p) {
+	D_ASSERT(types_p.size() == names_p.size());
+	statement_type = statement_type_p;
+	properties = std::move(properties_p);
+	types = std::move(types_p);
+	names = std::move(names_p);
+	metadata_available = true;
 }
 
 QueryResultType BaseQueryResult::GetResultType() const {
@@ -71,18 +114,22 @@ QueryResultType BaseQueryResult::GetResultType() const {
 }
 
 StatementType BaseQueryResult::GetStatementType() const {
+	RequireMetadata();
 	return statement_type;
 }
 
 const StatementProperties &BaseQueryResult::GetStatementProperties() const {
+	RequireMetadata();
 	return properties;
 }
 
 const vector<LogicalType> &BaseQueryResult::GetTypes() const {
+	RequireMetadata();
 	return types;
 }
 
 const vector<Identifier> &BaseQueryResult::GetNames() const {
+	RequireMetadata();
 	return names;
 }
 
@@ -100,12 +147,9 @@ QueryResult::QueryResult(QueryResultType type, ErrorData error)
       client_properties("UTC", ArrowOffsetSize::REGULAR, false, false, false, ArrowFormatVersion::V1_0, nullptr) {
 }
 
-QueryResult::QueryResult(shared_ptr<ClientContext> context_p, PreparedStatementData &statement,
-                         vector<LogicalType> types_p, ClientProperties client_properties_p,
-                         shared_ptr<BufferedData> buffer_p)
-    : BaseQueryResult(QueryResultType::MATERIALIZED_RESULT, statement.statement_type, statement.properties,
-                      std::move(types_p), statement.names),
-      client_properties(std::move(client_properties_p)), context(std::move(context_p)), buffer(std::move(buffer_p)) {
+QueryResult::QueryResult(shared_ptr<ClientContext> context_p, ClientProperties client_properties_p)
+    : BaseQueryResult(QueryResultType::MATERIALIZED_RESULT), client_properties(std::move(client_properties_p)),
+      context(std::move(context_p)) {
 }
 
 QueryResult::QueryResult(StatementType statement_type, StatementProperties properties, vector<Identifier> names_p,
@@ -249,6 +293,11 @@ void QueryResult::Close() {
 	context.reset();
 }
 
+void QueryResult::SetBuffer(shared_ptr<BufferedData> buffer_p) {
+	D_ASSERT(!buffer);
+	buffer = std::move(buffer_p);
+}
+
 //===--------------------------------------------------------------------===//
 // Retention
 //===--------------------------------------------------------------------===//
@@ -262,8 +311,7 @@ void QueryResult::Materialize() {
 		context.reset();
 		return;
 	}
-	D_ASSERT(buffer);
-	buffer->Decide(ResultLifetime::RETAINED);
+	context->SettleRetention(*lock, ResultLifetime::RETAINED);
 }
 
 void QueryResult::Complete() {
@@ -285,8 +333,7 @@ void QueryResult::CompleteInternal(ClientContextLock &lock) {
 		context.reset();
 		return;
 	}
-	D_ASSERT(buffer);
-	buffer->Decide(ResultLifetime::RETAINED);
+	context->SettleRetention(lock, ResultLifetime::RETAINED);
 	QueryResultState state;
 	while (!IsTerminal(state = context->ExecuteTaskInternal(lock, *this))) {
 		if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {

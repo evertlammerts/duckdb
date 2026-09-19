@@ -327,4 +327,30 @@ TEST_CASE("A CALL statement streams its rows", "[api][query_result_stream]") {
 	REQUIRE(rows == 5000);
 }
 
+TEST_CASE("A stream opened on a group drains the rows of its principal fragment", "[api][query_result_stream]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sales (city VARCHAR, year INTEGER, amount INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO sales VALUES ('ams', 2023, 10), ('ams', 2024, 20), "
+	                          "('rtm', 2023, 30), ('rtm', 2024, 40)"));
+
+	// The stream is opened right after the submission, before the row-producing fragment exists
+	auto handle = con.Submit("PIVOT sales ON year USING sum(amount)");
+	REQUIRE(!handle->HasError());
+	REQUIRE(!handle->MetadataAvailable());
+	QueryResultStream stream(std::move(handle));
+	DrainWatchdog watchdog(con);
+
+	idx_t rows = 0;
+	while (auto chunk = stream.Fetch()) {
+		rows += chunk->size();
+	}
+	REQUIRE(!stream.HasError());
+	REQUIRE(rows == 2);
+	REQUIRE(stream.ColumnCount() == 3);
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
 #endif

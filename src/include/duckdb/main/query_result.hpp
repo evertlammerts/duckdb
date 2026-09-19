@@ -9,8 +9,11 @@
 #pragma once
 
 #include "duckdb/common/enums/query_result_state.hpp"
+#include "duckdb/common/enums/result_lifetime.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/identifier.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -25,7 +28,6 @@ class BufferedData;
 class ClientContext;
 class ClientContextLock;
 class ColumnDataRowCollection;
-class PreparedStatementData;
 
 enum class QueryResultType : uint8_t { MATERIALIZED_RESULT, ARROW_RESULT };
 
@@ -37,6 +39,10 @@ public:
 	//! Creates an unsuccessful query result with error condition
 	DUCKDB_API BaseQueryResult(QueryResultType type, ErrorData error);
 	DUCKDB_API virtual ~BaseQueryResult();
+
+protected:
+	//! Creates a successful query result whose metadata is not known yet
+	DUCKDB_API explicit BaseQueryResult(QueryResultType type);
 
 public:
 	//! Returns the type of the result (MATERIALIZED or ARROW)
@@ -52,6 +58,16 @@ public:
 	//! Returns the number of columns in the result
 	DUCKDB_API idx_t ColumnCount() const;
 
+	//! Whether the metadata below is known. False only while a statement group has not yet prepared the
+	//! fragment the consumer's result takes its schema from
+	DUCKDB_API bool MetadataAvailable() const;
+	//! The metadata getters above, answering null while the metadata is not available. They run nothing
+	DUCKDB_API optional_ptr<const StatementType> TryGetStatementType() const;
+	DUCKDB_API optional_ptr<const StatementProperties> TryGetStatementProperties() const;
+	DUCKDB_API optional_ptr<const vector<LogicalType>> TryGetTypes() const;
+	DUCKDB_API optional_ptr<const vector<Identifier>> TryGetNames() const;
+	DUCKDB_API optional_idx TryColumnCount() const;
+
 	[[noreturn]] DUCKDB_API void ThrowError(const string &prepended_message = "") const;
 	DUCKDB_API void SetError(ErrorData error);
 	DUCKDB_API bool HasError() const;
@@ -59,6 +75,19 @@ public:
 	DUCKDB_API const std::string &GetError() const;
 	DUCKDB_API ErrorData &GetErrorObject();
 	DUCKDB_API const ErrorData &GetErrorObject() const;
+
+protected:
+	//! Fills in the metadata of a result created before its schema was known
+	void SetMetadata(StatementType statement_type, StatementProperties properties, vector<LogicalType> types,
+	                 vector<Identifier> names);
+
+private:
+	void RequireMetadata() const {
+		if (!metadata_available) {
+			ThrowMetadataUnavailable();
+		}
+	}
+	[[noreturn]] void ThrowMetadataUnavailable() const;
 
 private:
 	//! The type of the result (MATERIALIZED or ARROW). Will be removed.
@@ -71,6 +100,8 @@ private:
 	vector<LogicalType> types;
 	//! The names of the result
 	vector<Identifier> names;
+	//! Whether the fields above carry the result's metadata
+	bool metadata_available;
 	//! Whether or not execution was successful
 	bool success;
 	//! The error (in case execution was not successful)
@@ -86,10 +117,8 @@ class QueryResult : public BaseQueryResult {
 	friend class QueryResultStream;
 
 public:
-	//! Creates the handle of a freshly submitted query
-	DUCKDB_API QueryResult(shared_ptr<ClientContext> context, PreparedStatementData &statement,
-	                       vector<LogicalType> types, ClientProperties client_properties,
-	                       shared_ptr<BufferedData> buffer);
+	//! Creates the handle of a freshly submitted query, before anything of it has been bound
+	DUCKDB_API QueryResult(shared_ptr<ClientContext> context, ClientProperties client_properties);
 	//! Creates a detached result over an existing collection
 	DUCKDB_API QueryResult(StatementType statement_type, StatementProperties properties, vector<Identifier> names,
 	                       unique_ptr<ColumnDataCollection> collection, ClientProperties client_properties);
@@ -218,6 +247,8 @@ private:
 	//! Ends the query and records a commit failure on this result without throwing
 	void EndQuery(ClientContextLock &lock, bool invalidate_transaction = false);
 	[[noreturn]] void ThrowNoCollection() const;
+	//! Takes over the buffer of the statement whose rows this result serves. Set exactly once
+	void SetBuffer(shared_ptr<BufferedData> buffer_p);
 
 private:
 	//! The client context this result belongs to. Null once the query has ended
