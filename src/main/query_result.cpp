@@ -333,20 +333,30 @@ void QueryResult::CompleteInternal(ClientContextLock &lock) {
 		context.reset();
 		return;
 	}
-	context->SettleRetention(lock, ResultLifetime::RETAINED);
-	QueryResultState state;
-	while (!IsTerminal(state = context->ExecuteTaskInternal(lock, *this))) {
-		if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {
-			context->WaitForTask(lock, *this);
+	try {
+		context->SettleRetention(lock, ResultLifetime::RETAINED);
+		QueryResultState state;
+		while (!IsTerminal(state = context->ExecuteTaskInternal(lock, *this))) {
+			if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {
+				context->WaitForTask(lock, *this);
+			}
 		}
-	}
-	if (state == QueryResultState::FINISHED) {
-		auto produced = context->GetExecutor().GetResult();
-		// Cleanup can fail on an autocommit commit; it records the error on this result
-		context->CleanupInternal(lock, this, false);
-		if (!HasError()) {
-			collection = produced->TakeCollection();
+		if (state == QueryResultState::FINISHED) {
+			// A statement the consumer does not read keeps none of its rows, not even its shape
+			const bool reads_rows = context->PrincipalHasStarted(lock);
+			auto produced = context->GetExecutor().GetResult();
+			// Cleanup can fail on an autocommit commit; it records the error on this result
+			context->CleanupInternal(lock, this, false);
+			if (!HasError()) {
+				D_ASSERT(reads_rows || GetTypes().empty());
+				collection = reads_rows ? produced->TakeCollection()
+				                        : make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
+			}
 		}
+	} catch (...) {
+		// Destroying this result while the caller still holds the context lock would take it again
+		context.reset();
+		throw;
 	}
 	context.reset();
 }

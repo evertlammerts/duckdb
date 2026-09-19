@@ -3,6 +3,7 @@
 
 #include "duckdb/common/arrow/arrow_query_result.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/executor.hpp"
@@ -385,6 +386,10 @@ TEST_CASE("A custom collector hands out its own result object", "[api][query_res
 		auto result = con.Submit("SELECT i FROM range(3000) t(i)");
 		REQUIRE(!result->HasError());
 		REQUIRE(result->RowCount() == 3000);
+		// The collector's own result holds the query, so the connection takes nothing else until it ends
+		auto refused = con.Query("SELECT 42");
+		REQUIRE(refused->HasError());
+		REQUIRE(refused->GetErrorType() == ExceptionType::RESOURCE_IN_USE);
 	}
 	// The connection is usable once the collector is gone
 	auto next = con.Query("SELECT 42");
@@ -842,6 +847,190 @@ TEST_CASE("A statement that expands leaves the user's transaction to the user", 
 	REQUIRE(missing->HasError());
 	auto count = con.Query("SELECT count(*) FROM t");
 	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("A statement that fails to bind after the first one rolls the query back", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+
+	// The first ALTER binds, the UPDATE that materializes the default does not
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT nonexistent_function()");
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(handle->HasError());
+	handle.reset();
+
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("A single-threaded consumer sees a later statement's bind failure", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT nonexistent_function()");
+	DrainWatchdog watchdog(con);
+	Deadline deadline;
+	QueryResultState state;
+	while (!IsTerminal(state = handle->ExecuteTask())) {
+		if (state == QueryResultState::BLOCKED || state == QueryResultState::NO_TASKS_AVAILABLE) {
+			handle->WaitForTask();
+		}
+		REQUIRE(!deadline.Passed());
+	}
+	REQUIRE(state == QueryResultState::EXECUTION_ERROR);
+	REQUIRE(handle->HasError());
+	handle.reset();
+
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto count = con.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("An interrupt on a statement boundary cancels the query", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(2000000)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	// The first statement finishes while nothing steps the query on, so the interrupt lands between
+	auto &executor = Executor::Get(*con.context);
+	Deadline deadline;
+	while (!executor.ExecutionIsFinished()) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	con.Interrupt();
+
+	QueryResultState state;
+	while (!IsTerminal(state = handle->Poll())) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	REQUIRE(state == QueryResultState::EXECUTION_ERROR);
+	REQUIRE(StringUtil::Contains(handle->GetError(), "INTERRUPT"));
+	handle.reset();
+
+	con.context->ClearInterrupt();
+	auto missing = con.Query("SELECT c FROM t");
+	REQUIRE(missing->HasError());
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("A query that returns no rows hands out a collection of its own shape", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(100)"));
+
+	auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+	DrainWatchdog watchdog(con);
+	handle->Complete();
+	REQUIRE(!handle->HasError());
+	REQUIRE(handle->ColumnCount() == 0);
+	REQUIRE(handle->Collection().ColumnCount() == 0);
+	REQUIRE(handle->RowCount() == 0);
+	REQUIRE(!handle->Fetch());
+}
+
+TEST_CASE("Profiling a statement that expands writes one profile per statement", "[api][query_result]") {
+	auto profile = TestCreatePath("submitted_expansion_profile.json");
+	LocalFileSystem fs;
+	if (fs.FileExists(profile)) {
+		fs.RemoveFile(profile);
+	}
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET enable_profiling='json'"));
+	REQUIRE_NO_FAIL(con.Query("SET profiling_output='" + profile + "'"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range i FROM range(1000)"));
+	CreateSales(con);
+
+	SECTION("a statement that returns no rows") {
+		auto handle = Submit(con, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT random()");
+		DrainWatchdog watchdog(con);
+		handle->Complete();
+		REQUIRE(!handle->HasError());
+	}
+	SECTION("a statement that returns rows from its last statement") {
+		auto handle = Submit(con, PIVOT_QUERY);
+		DrainWatchdog watchdog(con);
+		handle->Complete();
+		REQUIRE(!handle->HasError());
+		REQUIRE(handle->RowCount() == 2);
+	}
+	REQUIRE(fs.FileExists(profile));
+	fs.RemoveFile(profile);
+}
+
+TEST_CASE("An open result holds the connection until it ends", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Connection observer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i BIGINT)"));
+
+	auto handle = Submit(con, "INSERT INTO t SELECT i FROM range(1000) t(i)");
+	handle->Materialize();
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+
+	// A result that finished still holds the connection until the consumer ends it
+	auto refused = con.Query("SELECT 42");
+	REQUIRE(refused->HasError());
+	REQUIRE(refused->GetErrorType() == ExceptionType::RESOURCE_IN_USE);
+	REQUIRE(StringUtil::Contains(refused->GetError(), "connection has an open result"));
+	// and it reads exactly as it would have
+	REQUIRE(handle->Collection().Count() == 1);
+	handle->Close();
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+	auto count = observer.Query("SELECT count(*) FROM t");
+	REQUIRE(CHECK_COLUMN(count, 0, {1000}));
+}
+
+TEST_CASE("Preparing a statement is refused while a result is open", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto handle = Submit(con, "SELECT i FROM range(1000) t(i)");
+	auto prepared = con.Prepare("SELECT 42");
+	REQUIRE(prepared->HasError());
+	REQUIRE(StringUtil::Contains(prepared->GetError(), "connection has an open result"));
+
+	handle->Close();
+	prepared = con.Prepare("SELECT 42");
+	REQUIRE(!prepared->HasError());
+}
+
+TEST_CASE("A result that failed does not hold the connection", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	SECTION("a failure found while binding") {
+		auto handle = con.Submit("SELECT * FROM no_such_table");
+		REQUIRE(handle->HasError());
+	}
+	SECTION("a failure found while running") {
+		auto handle =
+		    Submit(con, "SELECT (CASE WHEN i = 4000 THEN 'boom' ELSE i::VARCHAR END)::INT FROM range(5000) t(i)");
+		DrainWatchdog watchdog(con);
+		handle->Complete();
+		REQUIRE(handle->HasError());
+	}
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
 }
 
 #endif

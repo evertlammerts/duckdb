@@ -46,6 +46,9 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/prepare_statement.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
@@ -164,6 +167,13 @@ public:
 	bool OwnsTransaction() const {
 		return owns_transaction;
 	}
+	//! Whether the registered states have been told this query began
+	bool StatesNotified() const {
+		return states_notified;
+	}
+	void MarkStatesNotified() {
+		states_notified = true;
+	}
 	//! The retention the consumer settled, UNDECIDED until it does. The first decision stands
 	ResultLifetime Retention() const {
 		return retention;
@@ -185,6 +195,7 @@ private:
 	QueryResult *open_result = nullptr;
 	idx_t next_fragment = 0;
 	bool principal = false;
+	bool states_notified = false;
 	bool owns_transaction;
 	ResultLifetime retention = ResultLifetime::UNDECIDED;
 	QueryResultMemoryType memory_type = QueryResultMemoryType::IN_MEMORY;
@@ -372,20 +383,16 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, vector<unique_pt
 	} else {
 		query_deadline.SetInvalid();
 	}
-	// Notify any registered state of query begin
-	for (auto &state : registered_state->States()) {
-		state->QueryBegin(*this);
-	}
 }
 
 ErrorData ClientContext::EndFragmentInternal(ClientContextLock &, bool success, bool invalidate_transaction,
                                              optional_ptr<ErrorData> previous_error, const char *invalidation_reason) {
 	D_ASSERT(active_query);
-	if (auto fragment = std::move(active_query->fragment)) {
-		if (fragment->executor) {
-			fragment->executor->CancelTasks();
-		}
+	auto fragment = std::move(active_query->fragment);
+	if (fragment && fragment->executor) {
+		fragment->executor->CancelTasks();
 	}
+	fragment.reset();
 	ErrorData error;
 	try {
 		if (transaction.HasActiveTransaction()) {
@@ -410,6 +417,8 @@ ErrorData ClientContext::EndFragmentInternal(ClientContextLock &, bool success, 
 	} catch (...) { // LCOV_EXCL_START
 		error = ErrorData("Unhandled exception!");
 	} // LCOV_EXCL_STOP
+	// The profiler describes one statement, and its operator tree dies with the statement
+	client_data->profiler->EndQuery();
 	return error;
 }
 
@@ -418,6 +427,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	D_ASSERT(active_query);
 	// A query that opened a transaction of its own and did not finish leaves nothing behind
 	const bool rollback_own_transaction = !success && active_query->OwnsTransaction();
+	const bool states_notified = active_query->StatesNotified();
 	auto error = EndFragmentInternal(lock, success, invalidate_transaction, previous_error, invalidation_reason);
 	active_query.reset();
 	query_deadline.SetInvalid();
@@ -445,11 +455,13 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	logger = db->GetLogManager().CreateLogger(context, true);
 
 	// Notify any registered state of query end
-	for (auto const &s : registered_state->States()) {
-		if (error.HasError()) {
-			s->QueryEnd(*this, &error);
-		} else {
-			s->QueryEnd(*this, previous_error);
+	if (states_notified) {
+		for (auto const &s : registered_state->States()) {
+			if (error.HasError()) {
+				s->QueryEnd(*this, &error);
+			} else {
+				s->QueryEnd(*this, previous_error);
+			}
 		}
 	}
 	return error;
@@ -767,6 +779,8 @@ unique_ptr<QueryResult> ClientContext::CompleteDelegatedInternal(ClientContextLo
 	auto &executor = GetExecutor();
 	auto produced = executor.GetResult();
 	if (executor.HasStreamingResultCollector()) {
+		// The collector's own result is the open one, so it must be able to end the query it holds
+		produced->context = shared_from_this();
 		active_query->SetOpenResult(*produced);
 	} else {
 		CleanupInternal(lock, produced.get(), false);
@@ -777,11 +791,42 @@ unique_ptr<QueryResult> ClientContext::CompleteDelegatedInternal(ClientContextLo
 //===--------------------------------------------------------------------===//
 // The statements of one query
 //===--------------------------------------------------------------------===//
-//! Whether the last statement of a query cannot hand rows to the consumer, so the result's schema is
-//! settled before anything is bound. A transaction statement and a SET never return rows
-static bool LastStatementIsRowless(const vector<unique_ptr<SQLStatement>> &fragments) {
-	auto type = fragments.back()->type;
-	return type == StatementType::TRANSACTION_STATEMENT || type == StatementType::SET_STATEMENT;
+//! Whether a parsed statement can hand rows to the consumer. Only the types that never do answer
+//! false, so a statement this does not recognise takes its schema from binding
+static bool StatementCanReturnRows(const SQLStatement &statement) {
+	switch (statement.type) {
+	case StatementType::TRANSACTION_STATEMENT:
+	case StatementType::SET_STATEMENT:
+	case StatementType::ALTER_STATEMENT:
+	case StatementType::CREATE_STATEMENT:
+	case StatementType::DROP_STATEMENT:
+	case StatementType::COPY_STATEMENT:
+	case StatementType::LOAD_STATEMENT:
+	case StatementType::ATTACH_STATEMENT:
+	case StatementType::DETACH_STATEMENT:
+		return false;
+	case StatementType::INSERT_STATEMENT:
+		return !statement.Cast<InsertStatement>().node->returning_list.empty();
+	case StatementType::UPDATE_STATEMENT:
+		return !statement.Cast<UpdateStatement>().node->returning_list.empty();
+	case StatementType::DELETE_STATEMENT:
+		return !statement.Cast<DeleteStatement>().node->returning_list.empty();
+	case StatementType::MERGE_INTO_STATEMENT:
+		return !statement.Cast<MergeIntoStatement>().node->returning_list.empty();
+	default:
+		return true;
+	}
+}
+
+//! Whether no statement of the query can hand rows to the consumer, so the result's schema is
+//! settled before anything is bound
+static bool StatementsAreRowless(const vector<unique_ptr<SQLStatement>> &fragments) {
+	for (auto &fragment : fragments) {
+		if (StatementCanReturnRows(*fragment)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 unique_ptr<QueryResult> ClientContext::StartFragmentInternal(ClientContextLock &lock,
@@ -794,6 +839,13 @@ unique_ptr<QueryResult> ClientContext::StartFragmentInternal(ClientContextLock &
 		transaction.BeginTransaction();
 	}
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
+	if (!active_query->StatesNotified()) {
+		// Once per query, with the transaction the first statement runs in already open
+		for (auto &state : registered_state->States()) {
+			state->QueryBegin(*this);
+		}
+		active_query->MarkStatesNotified();
+	}
 
 	// Flush the old logger and refresh it to stay in sync with the global log settings
 	logger->Flush();
@@ -886,15 +938,11 @@ bool ClientContext::PrincipalHasStarted(ClientContextLock &) {
 
 void ClientContext::WaitForTask(ClientContextLock &lock, BaseQueryResult &result) {
 	D_ASSERT(active_query);
+	D_ASSERT(active_query->fragment);
 	D_ASSERT(active_query->IsOpenResult(result));
 	auto &executor = *active_query->fragment->executor;
 	if (executor.ExecutionIsFinished() && !executor.HasError()) {
-		// A finished statement has nothing to wait for: move the query on instead
-		try {
-			AdvanceFragmentInternal(lock);
-		} catch (std::exception &ex) {
-			FailQueryInternal(lock, result, ErrorData(ex));
-		}
+		// Nothing to wait for: the caller's next step moves the query on
 		return;
 	}
 	if (executor.HasTaskInProgress()) {
@@ -984,9 +1032,11 @@ QueryResultState ClientContext::FailQueryInternal(ClientContextLock &lock, BaseQ
 	return QueryResultState::EXECUTION_ERROR;
 }
 
-void ClientContext::InitialCleanup(ClientContextLock &lock) {
-	//! Cleanup any open results and reset the interrupted flag
-	CleanupInternal(lock);
+void ClientContext::InitialCleanup(ClientContextLock &) {
+	if (active_query) {
+		throw ResourceInUseException(
+		    "connection has an open result; drain, destroy, or interrupt it before starting a new query");
+	}
 	interrupt_state = ClientInterruptState::NOT_INTERRUPTED;
 }
 
@@ -1290,7 +1340,7 @@ unique_ptr<QueryResult> ClientContext::SubmitStatement(ClientContextLock &lock, 
 		return ErrorResult<QueryResult>(ErrorData(ex), query);
 	}
 
-	const bool rowless = fragments.size() > 1 && LastStatementIsRowless(fragments);
+	const bool rowless = fragments.size() > 1 && StatementsAreRowless(fragments);
 	auto handle = make_uniq<QueryResult>(shared_from_this(), GetClientProperties());
 	try {
 		BeginQueryInternal(lock, std::move(fragments));
@@ -1392,9 +1442,11 @@ unique_ptr<QueryResult> ClientContext::Query(unique_ptr<SQLStatement> statement,
 
 unique_ptr<QueryResult> ClientContext::Query(const string &query, QueryParameters query_parameters) {
 	auto lock = LockContext();
-	// The lazy path bypasses ParseStatementsInternal → InitialCleanup, so clear leftover query state
-	// (interrupt flag, etc.) ourselves.
-	InitialCleanup(*lock);
+	try {
+		InitialCleanup(*lock);
+	} catch (std::exception &ex) {
+		return ErrorResult<QueryResult>(ErrorData(ex), query);
+	}
 	auto &profiler = QueryProfiler::Get(*this);
 	profiler.StartQuery(query);
 	// ParseIterator's constructor runs UTF-8 validation / Unicode-space strip and can throw — route
@@ -1620,7 +1672,8 @@ void ClientContext::InterruptCheck() const {
 
 void ClientContext::CancelTransaction() {
 	auto lock = LockContext();
-	InitialCleanup(*lock);
+	CleanupInternal(*lock);
+	interrupt_state = ClientInterruptState::NOT_INTERRUPTED;
 }
 
 void ClientContext::EnableProfiling() {
@@ -1862,7 +1915,11 @@ unordered_set<string> ClientContext::GetTableNames(const string &query, const bo
 
 unique_ptr<QueryResult> ClientContext::SubmitInternal(ClientContextLock &lock, const shared_ptr<Relation> &relation,
                                                       const QueryParameters &query_parameters) {
-	InitialCleanup(lock);
+	try {
+		InitialCleanup(lock);
+	} catch (std::exception &ex) {
+		return ErrorResult<QueryResult>(ErrorData(ex), relation->ToString());
+	}
 
 #ifdef DEBUG
 	// run the ToString method of any relation we run, mostly to ensure it doesn't crash
@@ -1885,7 +1942,11 @@ unique_ptr<QueryResult> ClientContext::Submit(const shared_ptr<Relation> &relati
 unique_ptr<QueryResult> ClientContext::Execute(const shared_ptr<Relation> &relation) {
 	auto lock = LockContext();
 	auto &expected_columns = relation->Columns();
-	InitialCleanup(*lock);
+	try {
+		InitialCleanup(*lock);
+	} catch (std::exception &ex) {
+		return ErrorResult<QueryResult>(ErrorData(ex), relation->ToString());
+	}
 
 	auto relation_stmt = make_uniq<RelationStatement>(relation);
 	QueryParameters parameters;

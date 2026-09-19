@@ -64,6 +64,16 @@ public:
 	DUCKDB_API idx_t ColumnCount() const;
 	DUCKDB_API StatementType GetStatementType() const;
 	DUCKDB_API const StatementProperties &GetStatementProperties() const;
+
+	//! Whether the metadata above is known. False while the statement the stream drains has not been
+	//! bound, which is the case for a statement that expands and returns its rows from a later one
+	DUCKDB_API bool MetadataAvailable() const;
+	//! The metadata getters above, answering null while the metadata is not available
+	DUCKDB_API optional_ptr<const StatementType> TryGetStatementType() const;
+	DUCKDB_API optional_ptr<const StatementProperties> TryGetStatementProperties() const;
+	DUCKDB_API optional_ptr<const vector<LogicalType>> TryGetTypes() const;
+	DUCKDB_API optional_ptr<const vector<Identifier>> TryGetNames() const;
+	DUCKDB_API optional_idx TryColumnCount() const;
 	DUCKDB_API const ClientProperties &GetClientProperties() const;
 	DUCKDB_API ClientProperties &GetClientProperties();
 

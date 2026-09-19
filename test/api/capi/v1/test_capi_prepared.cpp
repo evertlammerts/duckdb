@@ -639,6 +639,58 @@ TEST_CASE("Prepared streaming result", "[capi]") {
 		REQUIRE(inserted->Fetch<int32_t>(1, 0) == 3);
 	}
 
+	SECTION("an open stream holds the connection") {
+		duckdb_prepared_statement stmt;
+		REQUIRE(duckdb_prepare(tester.connection, "SELECT 42", &stmt) == DuckDBSuccess);
+		duckdb_result res;
+		REQUIRE(duckdb_execute_prepared_streaming(stmt, &res) == DuckDBSuccess);
+		REQUIRE(duckdb_result_is_streaming(res));
+
+		duckdb_result blocked;
+		REQUIRE(duckdb_query(tester.connection, "SELECT 84", &blocked) == DuckDBError);
+		REQUIRE(string(duckdb_result_error(&blocked)).find("connection has an open result") != string::npos);
+		duckdb_destroy_result(&blocked);
+
+		// destroying the stream releases it
+		duckdb_destroy_result(&res);
+		REQUIRE(duckdb_query(tester.connection, "SELECT 84", &blocked) == DuckDBSuccess);
+		duckdb_destroy_result(&blocked);
+		duckdb_destroy_prepare(&stmt);
+	}
+
+	SECTION("EXPLAIN ANALYZE over a modification streams") {
+		// No worker threads, so the query only advances when this thread drains the stream
+		REQUIRE(tester.Query("SET threads=1"));
+		REQUIRE(tester.Query("CREATE TABLE t4 (i INTEGER);"));
+
+		duckdb_prepared_statement stmt;
+		REQUIRE(duckdb_prepare(tester.connection, "EXPLAIN ANALYZE INSERT INTO t4 VALUES (1)", &stmt) == DuckDBSuccess);
+
+		duckdb_result res;
+		REQUIRE(duckdb_execute_prepared_streaming(stmt, &res) == DuckDBSuccess);
+		REQUIRE(duckdb_result_is_streaming(res));
+		idx_t rows = 0;
+		while (auto chunk = duckdb_stream_fetch_chunk(res)) {
+			rows += duckdb_data_chunk_get_size(chunk);
+			duckdb_destroy_data_chunk(&chunk);
+		}
+		REQUIRE(rows > 0);
+		duckdb_destroy_result(&res);
+
+		// drained to the end, the insert is applied
+		auto inserted = tester.Query("SELECT count(*) FROM t4");
+		REQUIRE(inserted->Fetch<int64_t>(0, 0) == 1);
+
+		// abandoned before anything is drained, it is not
+		REQUIRE(duckdb_execute_prepared_streaming(stmt, &res) == DuckDBSuccess);
+		REQUIRE(duckdb_result_is_streaming(res));
+		duckdb_destroy_result(&res);
+		duckdb_destroy_prepare(&stmt);
+
+		auto unchanged = tester.Query("SELECT count(*) FROM t4");
+		REQUIRE(unchanged->Fetch<int64_t>(0, 0) == 1);
+	}
+
 	SECTION("a modification without RETURNING does not stream") {
 		REQUIRE(tester.Query("CREATE TABLE t3 (i INTEGER);"));
 

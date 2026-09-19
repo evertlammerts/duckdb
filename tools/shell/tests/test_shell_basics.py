@@ -345,6 +345,17 @@ def test_returning_insert(shell):
     result = test.run()
     result.check_stdout("1")
 
+def test_returning_insert_line_mode(shell):
+    test = (
+        ShellTest(shell)
+        .statement(".mode line")
+        .statement("CREATE TABLE table1 (a INTEGER DEFAULT -1, b INTEGER DEFAULT -2, c INTEGER DEFAULT -3);")
+        .statement("INSERT INTO table1 VALUES (1, 2, 3) RETURNING *;")
+        .statement("SELECT COUNT(*) FROM table1;")
+    )
+    result = test.run()
+    result.check_stdout("count_star() = 1")
+
 def test_pragma_display(shell):
     test = (
         ShellTest(shell)

@@ -15,10 +15,13 @@ QueryResultStream::QueryResultStream(unique_ptr<QueryResult> result) : handle(st
 		throw InvalidInputException("Attempting to open a stream on an unsuccessful query result\nError: %s",
 		                            handle->GetError());
 	}
-	if (!handle->IsOpen()) {
-		throw InvalidInputException("Attempting to open a stream on a query result that has no streaming buffer");
+	unique_ptr<ClientContextLock> lock;
+	if (handle->context) {
+		lock = handle->LockContext();
 	}
-	auto lock = handle->LockContext();
+	if (!lock || !handle->IsOpenInternal(*lock)) {
+		throw InvalidInputException("Attempting to open a stream on a query result that is not open");
+	}
 	if (handle->context->SettleRetention(*lock, ResultLifetime::DRAINING) != ResultLifetime::DRAINING) {
 		throw InvalidInputException("Attempting to open a stream on a query result that is being retained");
 	}
@@ -234,6 +237,30 @@ StatementType QueryResultStream::GetStatementType() const {
 
 const StatementProperties &QueryResultStream::GetStatementProperties() const {
 	return handle->GetStatementProperties();
+}
+
+bool QueryResultStream::MetadataAvailable() const {
+	return handle->MetadataAvailable();
+}
+
+optional_ptr<const StatementType> QueryResultStream::TryGetStatementType() const {
+	return handle->TryGetStatementType();
+}
+
+optional_ptr<const StatementProperties> QueryResultStream::TryGetStatementProperties() const {
+	return handle->TryGetStatementProperties();
+}
+
+optional_ptr<const vector<LogicalType>> QueryResultStream::TryGetTypes() const {
+	return handle->TryGetTypes();
+}
+
+optional_ptr<const vector<Identifier>> QueryResultStream::TryGetNames() const {
+	return handle->TryGetNames();
+}
+
+optional_idx QueryResultStream::TryColumnCount() const {
+	return handle->TryColumnCount();
 }
 
 const ClientProperties &QueryResultStream::GetClientProperties() const {

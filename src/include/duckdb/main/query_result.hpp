@@ -9,7 +9,6 @@
 #pragma once
 
 #include "duckdb/common/enums/query_result_state.hpp"
-#include "duckdb/common/enums/result_lifetime.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/identifier.hpp"
 #include "duckdb/common/optional_idx.hpp"
