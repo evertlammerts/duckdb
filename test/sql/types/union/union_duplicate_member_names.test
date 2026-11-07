@@ -1,0 +1,45 @@
+# name: test/sql/types/union/union_duplicate_member_names.test
+# description: A UNION type cannot have two members of the same name, compared case insensitively
+# group: [union]
+
+statement error
+SELECT 1::UNION(a INTEGER, a VARCHAR)
+----
+Duplicate named type parameter "a" for type "UNION"
+
+statement error
+SELECT 'x'::UNION(a INTEGER, A VARCHAR)
+----
+Duplicate named type parameter "A" for type "UNION"
+
+statement error
+SELECT NULL::UNION(a INTEGER, b VARCHAR, a INTEGER)
+----
+Duplicate named type parameter "a" for type "UNION"
+
+statement error
+SELECT [NULL]::STRUCT(s UNION(a INTEGER, a INTEGER))[]
+----
+Duplicate named type parameter "a" for type "UNION"
+
+statement error
+CREATE TYPE dup AS UNION(a INTEGER, a VARCHAR)
+----
+Duplicate named type parameter "a" for type "UNION"
+
+statement error
+CREATE TABLE t (u UNION(a INTEGER, A INTEGER))
+----
+Duplicate named type parameter "A" for type "UNION"
+
+# the common type of two unions matches members case insensitively, so it keeps one member
+query II
+SELECT typeof(u), union_tag(u) FROM (SELECT union_value(a := 1) u UNION ALL SELECT union_value(A := 2)) ORDER BY ALL
+----
+UNION(a INTEGER)	a
+UNION(a INTEGER)	a
+
+query III
+SELECT u::VARCHAR, union_tag(u), union_extract(u, 'A') FROM (SELECT 1::UNION(a INTEGER, b VARCHAR) u)
+----
+1	a	1

@@ -238,9 +238,7 @@ Value VectorStructBuffer::GetValue(const LogicalType &type, idx_t index) const {
 			throw DataCorruptionException("Union tag (%d) is out of bounds for a union with %d members", tag,
 			                              children.size() - 1);
 		}
-		auto value = children[tag + 1].GetValue(index);
-		auto members = UnionType::CopyMemberTypes(type);
-		return Value::UNION(members, tag, std::move(value));
+		return Value::UNION(type, tag, children[tag + 1].GetValue(index));
 	}
 	case LogicalTypeId::VARIANT: {
 		duckdb::vector<Value> child_values;

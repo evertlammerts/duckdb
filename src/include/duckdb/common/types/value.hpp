@@ -199,6 +199,8 @@ public:
 
 	//! Create a union value from a selected value and a tag from a set of alternatives.
 	DUCKDB_API static Value UNION(child_list_t<LogicalType> members, uint8_t tag, Value value);
+	//! Create a union value of an existing union type from its tag and a value of exactly that member's type
+	DUCKDB_API static Value UNION(const LogicalType &union_type, uint8_t tag, Value value);
 
 	//! Create a blob Value from a data pointer and a length: no bytes are interpreted
 	DUCKDB_API static Value BLOB(const_data_ptr_t data, idx_t len);

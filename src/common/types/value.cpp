@@ -900,27 +900,29 @@ Value Value::MAP(const InsertionOrderPreservingMap<string> &kv_pairs) {
 }
 
 Value Value::UNION(child_list_t<LogicalType> members, uint8_t tag, Value value) {
-	D_ASSERT(!members.empty());
-	D_ASSERT(members.size() <= UnionType::MAX_UNION_MEMBERS);
-	D_ASSERT(members.size() > tag);
+	return Value::UNION(LogicalType::UNION(std::move(members)), tag, std::move(value));
+}
 
-	D_ASSERT(value.type() == members[tag].second);
+Value Value::UNION(const LogicalType &union_type, uint8_t tag, Value value) {
+	D_ASSERT(union_type.id() == LogicalTypeId::UNION);
+	auto member_count = UnionType::GetMemberCount(union_type);
+	D_ASSERT(member_count > tag);
+	D_ASSERT(value.type() == UnionType::GetMemberType(union_type, tag));
 
 	Value result;
 	result.is_null = false;
 	// add the tag to the front of the struct
 	vector<Value> union_values;
 	union_values.emplace_back(Value::UTINYINT(tag));
-	for (idx_t i = 0; i < members.size(); i++) {
+	for (idx_t i = 0; i < member_count; i++) {
 		if (i != tag) {
-			union_values.emplace_back(members[i].second);
+			union_values.emplace_back(UnionType::GetMemberType(union_type, i));
 		} else {
-			union_values.emplace_back(nullptr);
+			union_values.emplace_back(std::move(value));
 		}
 	}
-	union_values[tag + 1] = std::move(value);
 	result.value_info_ = make_shared_ptr<NestedValueInfo>(std::move(union_values));
-	result.type_ = LogicalType::UNION(std::move(members));
+	result.type_ = union_type;
 	return result;
 }
 

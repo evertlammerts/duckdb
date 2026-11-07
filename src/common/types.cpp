@@ -1790,7 +1790,16 @@ LogicalType LogicalType::UNION(child_list_t<LogicalType> members) {
 	// union types always have a hidden "tag" field in front
 	members.insert(members.begin(), {"", LogicalType::UTINYINT});
 	auto info = make_uniq<StructTypeInfo>(std::move(members));
-	return LogicalType(LogicalTypeId::UNION, std::move(info));
+	LogicalType result(LogicalTypeId::UNION, std::move(info));
+	identifier_set_t member_names;
+	for (idx_t member_idx = 0; member_idx < UnionType::GetMemberCount(result); member_idx++) {
+		auto &member_name = UnionType::GetMemberName(result, member_idx);
+		if (!member_names.insert(member_name).second) {
+			throw InvalidInputException("Duplicate member name \"%s\" in %s", member_name.GetIdentifierName(),
+			                            result.ToString());
+		}
+	}
+	return result;
 }
 
 const LogicalType &UnionType::GetMemberType(const LogicalType &type, idx_t index) {

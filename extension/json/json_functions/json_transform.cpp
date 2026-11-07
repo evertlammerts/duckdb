@@ -1115,7 +1115,7 @@ static bool TransformValueIntoUnion(yyjson_val **vals, yyjson_alc *alc, Vector &
 			success = false;
 		}
 
-		result.SetValue(i, Value::UNION(fields, actual_tag, single.GetValue(0)));
+		result.SetValue(i, Value::UNION(type, NumericCast<uint8_t>(actual_tag), single.GetValue(0)));
 	}
 
 	return success;
