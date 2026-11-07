@@ -2,6 +2,8 @@
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/common/enums/trigger_type.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/query_location.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
@@ -95,10 +97,34 @@ unique_ptr<SQLStatement> PEGTransformerFactory::TransformTopLevelStatement(Token
 		}
 	}
 
+	auto &stmt_pr = stmt_opt.GetResult();
+	auto stmt_start = stmt_pr.GetOffset();
+	// the parser cuts the statement's text out of its input from here, see Parser::ParseQuery
+	idx_t statement_offset = stmt_start.IsValid() ? stmt_start.GetIndex() : 0;
 	ArenaAllocator transformer_allocator(Allocator::DefaultAllocator());
-	PEGTransformer transformer(transformer_allocator, token_iterator, options, grammar);
+	PEGTransformer transformer(transformer_allocator, token_iterator, options, grammar, statement_offset);
 
-	return ExtractAndTransformStatement(transformer, token_iterator, stmt_opt.GetResult(), terminator_offset);
+	try {
+		return ExtractAndTransformStatement(transformer, token_iterator, stmt_pr, terminator_offset);
+	} catch (ParserException &ex) {
+		// errors raised while parsing are reported against the parser's input, as syntax errors are
+		if (statement_offset == 0) {
+			throw;
+		}
+		ErrorData error(ex);
+		auto extra_info = error.ExtraInfo();
+		auto position = extra_info.find("position");
+		auto location = extra_info.find("location");
+		if (position == extra_info.end() || location == extra_info.end()) {
+			throw;
+		}
+		// "location" is written as "[start,length]" by Exception::SetQueryLocation
+		auto length = location->second.substr(location->second.find(',') + 1);
+		length.pop_back();
+		Exception::SetQueryLocation(
+		    QueryLocation(std::stoull(position->second) + statement_offset, std::stoull(length)), extra_info);
+		throw ParserException(extra_info, error.RawMessage());
+	}
 }
 
 PEGTransformerFactory::PEGTransformerFactory(ParsedGrammar &grammar_p) : grammar(grammar_p) {

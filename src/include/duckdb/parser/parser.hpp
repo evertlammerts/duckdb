@@ -64,8 +64,8 @@ public:
 	//! PEG grammar rejects is offered to the `parse_function` extensions first; only if none claims
 	//! it is a ParserException with the detailed syntax error thrown.
 	//!
-	//! Does NOT populate `stmt->query` — the caller owns the source string and can slice it
-	//! using `stmt->stmt_location` if needed.
+	//! Does NOT populate `stmt->query`: the caller owns the source string and slices the statement's text
+	//! from `stmt->stmt_location.offset`, the offset its node locations count from.
 	DUCKDB_API unique_ptr<SQLStatement> ParseTopLevelStatement(TokenIterator &token_iterator, const string &query);
 
 	//! Whether `query` is a complete, semicolon-terminated statement sequence under this parser's
