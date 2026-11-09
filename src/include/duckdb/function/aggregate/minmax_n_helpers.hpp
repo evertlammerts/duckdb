@@ -404,7 +404,7 @@ struct MinMaxSortKeyValue {
 	                        const bool nulls_last) {
 		auto order_by_null_type = nulls_last ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST;
 		const OrderModifiers modifiers(OrderType::ASCENDING, order_by_null_type);
-		if (KEEP_ZERO_SIGN) {
+		if constexpr (KEEP_ZERO_SIGN) {
 			CreateSortKeyHelpers::CreateSortKeyKeepZeroSignWithValidity(input, extra_state, modifiers);
 		} else {
 			CreateSortKeyHelpers::CreateSortKeyWithValidity(input, extra_state, modifiers);

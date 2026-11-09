@@ -1,5 +1,5 @@
 # name: test/sql/aggregate/aggregates/test_first_negative_zero_n.test
-# description: arg_min and arg_max with n, and mode over nested types, keep the sign of -0.0
+# description: arg_min and arg_max with n, and mode over nested types, keep the sign of -0.0, min and max with n fold it
 # group: [aggregates]
 
 # kept apart from test_first_negative_zero.test because these aggregates cannot export their state
@@ -8,11 +8,25 @@ statement ok
 SET threads=1;
 
 # the variants with n keep the value side too, and a top one or top two per group agree
-query III
-SELECT arg_min([v], k, 2)::VARCHAR, max_by([v], k, 1)::VARCHAR, arg_min_nulls_last([v], k, 1)::VARCHAR
+query IIII
+SELECT arg_min([v], k, 2)::VARCHAR, max_by([v], k, 1)::VARCHAR, max_by([v], -k, 1)::VARCHAR,
+	arg_min_nulls_last([v], k, 1)::VARCHAR
 FROM (VALUES (1, '-0.0'::DOUBLE), (2, 0.0)) t(k, v);
 ----
-[[-0.0], [0.0]]	[[0.0]]	[[-0.0]]
+[[-0.0], [0.0]]	[[0.0]]	[[-0.0]]	[[-0.0]]
+
+query II
+SELECT arg_min_nulls_last(l, k, 3)::VARCHAR, arg_min(l::FLOAT[], k, 3)::VARCHAR
+FROM (VALUES (1, NULL::DOUBLE[]), (2, ['-0.0'::DOUBLE]), (3, [0.0])) t(k, l);
+----
+[NULL, [-0.0], [0.0]]	[[-0.0], [0.0]]
+
+# the by side still compares the two zeros as equal, so the next field decides
+query II
+SELECT arg_min(k, [z, r], 1), arg_max(k, {'z': z, 'r': r}, 1)
+FROM (VALUES (1, '-0.0'::DOUBLE, 2), (2, 0.0, 1)) t(k, z, r);
+----
+[2]	[1]
 
 statement ok
 CREATE TABLE ranked AS SELECT * FROM (VALUES (1, 1, ['-0.0'::DOUBLE]), (1, 2, [0.0]), (2, 1, ['-0.0'::DOUBLE])) t(g, k, l);
@@ -31,6 +45,37 @@ ORDER BY g, l::VARCHAR;
 1	[-0.0]
 1	[0.0]
 2	[-0.0]
+
+# min and max with n return -0.0 as 0.0; a collation plans them as arg_min and arg_max, which keep it
+statement ok
+CREATE TABLE minmax_zeros AS SELECT * FROM (VALUES (1, '-0.0'::DOUBLE, 2), (1, 0.0, 1),
+	(2, '-0.0'::DOUBLE, 1), (2, 0.0, 2), (2, '-0.0'::DOUBLE, 3)) t(g, z, r);
+
+query III
+SELECT g, min([z, r], 1)::VARCHAR, max([z, r], 2)::VARCHAR FROM minmax_zeros GROUP BY g ORDER BY g;
+----
+1	[[0.0, 1.0]]	[[0.0, 2.0], [0.0, 1.0]]
+2	[[0.0, 1.0]]	[[0.0, 3.0], [0.0, 2.0]]
+
+query III
+SELECT g, min({'i': INTERVAL '1 day', 'z': z, 'r': r}, 1)::VARCHAR, max({'i': INTERVAL '1 day', 'z': z, 'r': r}, 1)::VARCHAR
+FROM minmax_zeros GROUP BY g ORDER BY g;
+----
+1	[{'i': 1 day, 'z': 0.0, 'r': 1}]	[{'i': 1 day, 'z': -0.0, 'r': 2}]
+2	[{'i': 1 day, 'z': -0.0, 'r': 1}]	[{'i': 1 day, 'z': -0.0, 'r': 3}]
+
+statement ok
+SET default_collation='nocase';
+
+query III
+SELECT g, min({'s': 'a', 'z': z, 'r': r}, 1)::VARCHAR, max({'s': 'a', 'z': z, 'r': r}, 1)::VARCHAR
+FROM minmax_zeros GROUP BY g ORDER BY g;
+----
+1	[{'s': a, 'z': 0.0, 'r': 1}]	[{'s': a, 'z': -0.0, 'r': 2}]
+2	[{'s': a, 'z': -0.0, 'r': 1}]	[{'s': a, 'z': -0.0, 'r': 3}]
+
+statement ok
+RESET default_collation;
 
 # mode over a nested type is planned as a GROUP BY and arg_max, and returns the zero the group kept as its key
 query II

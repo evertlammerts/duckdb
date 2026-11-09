@@ -1,5 +1,5 @@
 # name: test/sql/aggregate/aggregates/test_first_negative_zero.test
-# description: first, last, any_value and arbitrary over nested types keep the sign of -0.0
+# description: first, last, any_value, arbitrary, arg_min and arg_max over nested types keep the sign of -0.0, min and max fold it
 # group: [aggregates]
 
 # first and last are only deterministic single threaded
@@ -90,11 +90,44 @@ FROM (VALUES (1, '-0.0'::DOUBLE)) t(k, v);
 ----
 -0.0	-0.0	-0.0	-0.0	-0.0
 
-# min and max over a value that needs a collation are planned as arg_min and arg_max, and return the input
-query II
-SELECT min({'i': INTERVAL '1 day', 'z': d})::VARCHAR, max({'i': INTERVAL '1 day', 'z': d})::VARCHAR FROM zeros;
+# min and max over nested values compare the two zeros as equal and return the winning value with -0.0 as 0.0
+statement ok
+CREATE TABLE minmax_zeros AS SELECT * FROM (VALUES (1, '-0.0'::DOUBLE, 2), (1, 0.0, 1),
+	(2, '-0.0'::DOUBLE, 1), (2, 0.0, 2), (2, '-0.0'::DOUBLE, 3)) t(g, z, r);
+
+query III
+SELECT g, min([z, r])::VARCHAR, max([z, r])::VARCHAR FROM minmax_zeros GROUP BY g ORDER BY g;
 ----
-{'i': 1 day, 'z': -0.0}	{'i': 1 day, 'z': -0.0}
+1	[0.0, 1.0]	[0.0, 2.0]
+2	[0.0, 1.0]	[0.0, 3.0]
+
+# a collation plans them as arg_min and arg_max, which return the winning value as stored
+query III
+SELECT g, min({'i': INTERVAL '1 day', 'z': z, 'r': r})::VARCHAR, max({'i': INTERVAL '1 day', 'z': z, 'r': r})::VARCHAR
+FROM minmax_zeros GROUP BY g ORDER BY g;
+----
+1	{'i': 1 day, 'z': 0.0, 'r': 1}	{'i': 1 day, 'z': -0.0, 'r': 2}
+2	{'i': 1 day, 'z': -0.0, 'r': 1}	{'i': 1 day, 'z': -0.0, 'r': 3}
+
+query IIII
+SELECT min([d])::VARCHAR, max([d])::VARCHAR, min({'i': INTERVAL '1 day', 'z': d})::VARCHAR,
+	max({'i': INTERVAL '1 day', 'z': d})::VARCHAR
+FROM zeros;
+----
+[0.0]	[0.0]	{'i': 1 day, 'z': -0.0}	{'i': 1 day, 'z': -0.0}
+
+statement ok
+SET default_collation='nocase';
+
+query III
+SELECT g, min({'s': 'a', 'z': z, 'r': r})::VARCHAR, max({'s': 'a', 'z': z, 'r': r})::VARCHAR
+FROM minmax_zeros GROUP BY g ORDER BY g;
+----
+1	{'s': a, 'z': 0.0, 'r': 1}	{'s': a, 'z': -0.0, 'r': 2}
+2	{'s': a, 'z': -0.0, 'r': 1}	{'s': a, 'z': -0.0, 'r': 3}
+
+statement ok
+RESET default_collation;
 
 # window aggregates over a frame; first and last over a window are planned as first_value and last_value
 query IIII
@@ -125,12 +158,14 @@ FROM zeros;
 ----
 {'value': [-0.0]}	[-0.0]
 
-query III
+query IIIII
 SELECT finalize(to_aggregate_state({'value': ['-0.0'::DOUBLE]}, 'first', ['DOUBLE[]']))::VARCHAR,
 	finalize(to_aggregate_state({'value': ['-0.0'::FLOAT]}, 'last', ['FLOAT[]']))::VARCHAR,
-	finalize(to_aggregate_state({'arg': ['-0.0'::DOUBLE], 'by': 1}, 'arg_max', ['DOUBLE[]', 'INTEGER']))::VARCHAR;
+	finalize(to_aggregate_state({'arg': ['-0.0'::DOUBLE], 'by': 1}, 'arg_max', ['DOUBLE[]', 'INTEGER']))::VARCHAR,
+	finalize(to_aggregate_state({'arg': ['-0.0'::DOUBLE], 'by': [1]}, 'arg_min', ['DOUBLE[]', 'INTEGER[]']))::VARCHAR,
+	finalize(to_aggregate_state({'arg': ['-0.0'::DOUBLE], 'by': [1]}, 'arg_max', ['DOUBLE[]', 'INTEGER[]']))::VARCHAR;
 ----
-[-0.0]	[-0.0]	[-0.0]
+[-0.0]	[-0.0]	[-0.0]	[-0.0]	[-0.0]
 
 # ordering, DISTINCT and grouping still treat the two zeros as one value
 query II
@@ -149,11 +184,12 @@ SELECT count(*) FROM (SELECT [v] FROM (VALUES ('-0.0'::DOUBLE), (0.0)) t(v) GROU
 ----
 1
 
-# min and max over nested types compare the sort key and are unchanged
+# the by side of arg_min and arg_max still compares the two zeros as equal, so the next field decides
 query II
-SELECT min([d])::VARCHAR, max([d])::VARCHAR FROM zeros;
+SELECT arg_min(k, [z, r]), arg_max(k, {'z': z, 'r': r})
+FROM (VALUES (1, '-0.0'::DOUBLE, 2), (2, 0.0, 1)) t(k, z, r);
 ----
-[0.0]	[0.0]
+2	1
 
 # a persisted state
 load {TEST_DIR}/first_negative_zero.db readwrite v2.0.0
