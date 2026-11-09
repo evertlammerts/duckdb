@@ -834,6 +834,7 @@ QualifiedName:
     - CatalogReservedSchemaIndex
     - FunctionIdentifier
     - MacroName
+    - MacroFunctionName
     - FunctionNameAsQualifiedName
     - SchemaReservedFunctionName
     - CatalogReservedSchemaFunctionName

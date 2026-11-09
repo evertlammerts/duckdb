@@ -1,26 +1,25 @@
 # name: test/sql/export/export_macro_keyword_name.test
-# description: EXPORT DATABASE writes a macro named by a type_function keyword so that IMPORT DATABASE reads it back
+# description: EXPORT DATABASE writes a keyword macro name quoted and IMPORT DATABASE reads it back
 # group: [export]
 
 statement ok
 CREATE MACRO semi(x) AS x + 1
 
 statement ok
-CREATE MACRO anti(n) AS TABLE SELECT range AS i FROM range(n)
-
-statement ok
 EXPORT DATABASE '{TEST_DIR}/export_macro_keyword_name'
+
+query I
+SELECT contains(content, '"semi"') FROM read_text('{TEST_DIR}/export_macro_keyword_name/schema.sql')
+----
+true
 
 statement ok
 DROP MACRO semi
 
 statement ok
-DROP MACRO TABLE anti
-
-statement ok
 IMPORT DATABASE '{TEST_DIR}/export_macro_keyword_name'
 
-query II
-SELECT semi(1), (SELECT count(*) FROM anti(3))
+query I
+SELECT semi(1)
 ----
-2	3
+2

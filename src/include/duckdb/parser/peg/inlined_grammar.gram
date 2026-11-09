@@ -1283,7 +1283,9 @@ DefArgStringLiteral <- StringLiteral
 NoneLiteral <- 'NONE'
 
 CreateMacroStmt <- MacroOrFunction IfNotExists? MacroName List(MacroDefinition)
-MacroName <- QualifiedName / FunctionNameAsQualifiedName
+MacroName <- QualifiedName / MacroFunctionName
+# the bare names a call accepts, parsed but not suggested (matcher_factory.cpp)
+MacroFunctionName <- FunctionNameAsQualifiedName
 
 ReturnsType <- 'RETURNS' Type
 

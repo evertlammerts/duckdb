@@ -1,5 +1,5 @@
 # name: test/sql/catalog/function/test_macro_keyword_name.test
-# description: A macro name that is a keyword follows the keyword rules of a function call in CREATE, the call and DROP
+# description: CREATE MACRO accepts the keyword names a function call accepts, besides its qualified name forms
 # group: [function]
 
 query II
@@ -99,7 +99,7 @@ SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('anti', 'freeze'
 ----
 0
 
-# the keyword names of the reported case are used as bare join and set words elsewhere in the same statement
+# a keyword that names a macro is a join keyword in the same statement
 
 statement ok
 CREATE MACRO semi(x) AS x + 1
@@ -126,8 +126,7 @@ SELECT abort(1)
 statement ok
 DROP MACRO abort
 
-# a column_name keyword starts a type or a special form when followed by a parenthesis, so the macro is called with
-# its schema, as in PostgreSQL
+# a bare time( starts the TIME type, so a macro named time is called with its schema, as in PostgreSQL
 
 statement ok
 CREATE SCHEMA s
@@ -152,6 +151,38 @@ SELECT time '12:00:00', CAST('12:00:00' AS time)
 
 statement ok
 DROP MACRO s.time
+
+# a bare column_name keyword and a string literal name a macro in CREATE, although a call does not accept them bare
+
+statement ok
+CREATE MACRO time(x) AS x + 10
+
+statement ok
+CREATE MACRO 'lit name'(x) AS x + 20
+
+statement ok
+CREATE MACRO s.'lit name'(x) AS x + 30
+
+query III
+SELECT main.time(1), "lit name"(1), s."lit name"(1)
+----
+11	21	31
+
+query II
+SELECT schema_name, function_name FROM duckdb_functions() WHERE function_name IN ('lit name', 'time') ORDER BY ALL
+----
+main	lit name
+main	time
+s	lit name
+
+statement ok
+DROP MACRO main.time
+
+statement ok
+DROP MACRO "lit name"
+
+statement ok
+DROP MACRO s."lit name"
 
 # date is not a keyword
 
