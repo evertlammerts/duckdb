@@ -71,12 +71,21 @@ public:
 	idx_t GetActiveQuery();
 	void SetActiveQuery(transaction_t query_number);
 
+	//! No write may happen on the calling thread, in any database, while a scope is open. The scope is per thread
+	//! because the other threads of a statement share its transaction and may write
+	class NoWriteScope {
+	public:
+		NoWriteScope();
+		~NoWriteScope();
+		NoWriteScope(const NoWriteScope &) = delete;
+		NoWriteScope &operator=(const NoWriteScope &) = delete;
+	};
+	static bool RefusesWrites();
+
 	void SetReadOnly();
 	bool IsReadOnly() const;
 	void ModifyDatabase(AttachedDatabase &db, DatabaseModificationType modification);
-	optional_ptr<AttachedDatabase> ModifiedDatabase() {
-		return modified_database;
-	}
+	optional_ptr<AttachedDatabase> ModifiedDatabase();
 	const vector<reference<AttachedDatabase>> &OpenedTransactions() const {
 		return all_transactions;
 	}
@@ -90,6 +99,8 @@ private:
 
 	//! Lock to prevent all_transactions and transactions from getting out of sync.
 	mutex lock;
+	//! Serializes ModifyDatabase, which the threads of a statement call when a write declares itself
+	mutex modify_lock;
 	//! The set of active transactions for each database.
 	reference_map_t<AttachedDatabase, TransactionReference> transactions;
 	//! The set of referenced databases in invocation order.
