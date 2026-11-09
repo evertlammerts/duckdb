@@ -48,11 +48,11 @@ bool ColumnCountResult::AddRow(ColumnCountResult &result, idx_t buffer_pos) {
 		FullLinePosition current_line_position;
 		current_line_position.begin = result.last_position;
 		current_line_position.end = cur_position;
-		bool mock = false;
-		idx_t line_size = 0;
-		string csv_row = current_line_position.ReconstructCurrentLine(mock, result.buffer_handles, true, &line_size);
+		bool first_nl = false;
+		string csv_row = current_line_position.ReconstructCurrentLine(first_nl, result.buffer_handles, true);
+		// The reconstructed line leaves out a newline byte that starts the measured span.
 		auto error = CSVError::LineSizeError(
-		    result.state_machine.options, lines_per_batch, csv_row, line_size,
+		    result.state_machine.options, lines_per_batch, csv_row, cur_position - result.last_position - first_nl,
 		    result.last_position.GetGlobalPosition(result.state_machine.options.buffer_size_option.GetValue(), false),
 		    result.state_machine.options.file_path);
 		result.error_handler.Error(error);
@@ -200,12 +200,12 @@ void ColumnCountScanner::FinalizeChunkProcess() {
 					FullLinePosition current_line_position;
 					current_line_position.begin = result.last_position;
 					current_line_position.end = cur_position;
-					bool mock = false;
-					idx_t line_size = 0;
+					bool first_nl = false;
 					string csv_row =
-					    current_line_position.ReconstructCurrentLine(mock, result.buffer_handles, true, &line_size);
+					    current_line_position.ReconstructCurrentLine(first_nl, result.buffer_handles, true);
 					auto error =
-					    CSVError::LineSizeError(result.state_machine.options, lines_per_batch, csv_row, line_size,
+					    CSVError::LineSizeError(result.state_machine.options, lines_per_batch, csv_row,
+					                            cur_position - result.last_position - first_nl,
 					                            result.last_position.GetGlobalPosition(
 					                                result.state_machine.options.buffer_size_option.GetValue(), false),
 					                            result.state_machine.options.file_path);

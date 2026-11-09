@@ -167,21 +167,40 @@ static size_t NextSequenceLength(const char *s, size_t len, size_t i, bool &vali
 	return sequence_length;
 }
 
-size_t Utf8Proc::MakeValid(char *s, size_t len, char special_flag) {
+void Utf8Proc::MakeValid(char *s, size_t len, char special_flag) {
 	D_ASSERT(special_flag <= 127);
-	size_t result_len = 0;
 	for (size_t i = 0; i < len;) {
 		bool valid;
 		auto sequence_length = NextSequenceLength(s, len, i, valid);
-		if (valid) {
-			for (size_t k = 0; k < sequence_length; k++) {
-				s[result_len++] = s[i + k];
-			}
-		} else {
-			s[result_len++] = special_flag;
+		if (!valid) {
+			memset(s + i, special_flag, sequence_length);
 		}
 		i += sequence_length;
 	}
+	D_ASSERT(Utf8Proc::IsValid(s, len));
+}
+
+size_t Utf8Proc::ReplaceInvalid(char *s, size_t len, char special_flag) {
+	D_ASSERT(special_flag <= 127);
+	size_t result_len = 0;
+	size_t run_start = 0;
+	auto move_valid_run = [&](size_t run_end) {
+		if (result_len != run_start) {
+			memmove(s + result_len, s + run_start, run_end - run_start);
+		}
+		result_len += run_end - run_start;
+	};
+	for (size_t i = 0; i < len;) {
+		bool valid;
+		auto sequence_length = NextSequenceLength(s, len, i, valid);
+		if (!valid) {
+			move_valid_run(i);
+			s[result_len++] = special_flag;
+			run_start = i + sequence_length;
+		}
+		i += sequence_length;
+	}
+	move_valid_run(len);
 	D_ASSERT(Utf8Proc::IsValid(s, result_len));
 	return result_len;
 }

@@ -229,7 +229,7 @@ bool StringValueResult::UnsetComment(StringValueResult &result, idx_t buffer_pos
 }
 
 void FullLinePosition::SanitizeError(string &value) {
-	value.resize(Utf8Proc::MakeValid(&value[0], value.size()));
+	value.resize(Utf8Proc::ReplaceInvalid(&value[0], value.size()));
 }
 
 void StringValueResult::AddValueToVector(const char *value_ptr, idx_t size, bool allocate) {
@@ -713,9 +713,8 @@ bool LineError::HandleErrors(StringValueResult &result) {
 	for (auto &cur_error : current_errors) {
 		LinesPerBoundary lines_per_batch(result.iterator.GetBoundaryIdx(), result.lines_read);
 		bool first_nl = false;
-		idx_t line_size = 0;
 		auto borked_line = result.current_line_position.ReconstructCurrentLine(first_nl, result.buffer_handles,
-		                                                                       result.PrintErrorLine(), &line_size);
+		                                                                       result.PrintErrorLine());
 		CSVError csv_error;
 		auto col_idx = cur_error.col_idx;
 		auto &line_pos = cur_error.error_position;
@@ -790,8 +789,9 @@ bool LineError::HandleErrors(StringValueResult &result) {
 			}
 		} break;
 		case MAXIMUM_LINE_SIZE:
+			// The borked line leaves out the newline byte that starts the measured span.
 			csv_error = CSVError::LineSizeError(
-			    result.state_machine.options, lines_per_batch, borked_line, line_size,
+			    result.state_machine.options, lines_per_batch, borked_line, cur_error.current_line_size - first_nl,
 			    result.current_line_position.begin.GetGlobalPosition(result.requested_size, first_nl), result.path);
 			break;
 		case INVALID_STATE:

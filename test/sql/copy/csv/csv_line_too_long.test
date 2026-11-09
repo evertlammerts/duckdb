@@ -23,3 +23,15 @@ COPY T1(name) from '{DATA_DIR}/csv/multiple_line_too_long.csv.gz' (DELIMITER ','
 Possible Solution: Change the maximum length size, e.g., max_line_size=2097165
 
 endloop
+
+# the size of a line after the first one leaves out the \n that ends the line before it
+statement error
+FROM read_csv('{DATA_DIR}/csv/auto/test_multiple_columns_rn.csv', max_line_size=28)
+----
+Actual Size:29 bytes
+
+# the same when a buffer boundary falls right after the content of that line
+statement error
+FROM read_csv('{DATA_DIR}/csv/auto/test_multiple_columns_rn.csv', max_line_size=28, buffer_size=57)
+----
+Actual Size:28 bytes

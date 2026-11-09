@@ -53,3 +53,9 @@ statement error
 from read_csv('{DATA_DIR}/csv/test/invalid_utf_cut.csv', max_line_size=100)
 ----
 Actual Size:132 bytes
+
+# the sniffer stops at the buffer boundary inside line 6 and reports the bytes read up to it
+statement error
+from read_csv('{DATA_DIR}/csv/test/invalid_utf_cut.csv', max_line_size=100, buffer_size=180)
+----
+Actual Size:113 bytes

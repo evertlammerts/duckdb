@@ -34,10 +34,9 @@ public:
 	LinePosition begin;
 	LinePosition end;
 	static void SanitizeError(string &value);
-	//! Reconstructs the current line for error messages; line_size gets its byte length before UTF-8 repair
+	//! Reconstructs the current line to be used in error messages
 	template <class T>
-	string ReconstructCurrentLine(bool &first_char_nl, T &buffer_handles, bool reconstruct_line,
-	                              optional_ptr<idx_t> line_size = nullptr) const {
+	string ReconstructCurrentLine(bool &first_char_nl, T &buffer_handles, bool reconstruct_line) const {
 		if (!reconstruct_line || begin == end) {
 			return {};
 		}
@@ -71,9 +70,6 @@ public:
 			for (idx_t i = 0; i < end.buffer_pos; i++) {
 				result += second_buffer[i];
 			}
-		}
-		if (line_size) {
-			*line_size = result.size();
 		}
 		// sanitize borked line
 		SanitizeError(result);
