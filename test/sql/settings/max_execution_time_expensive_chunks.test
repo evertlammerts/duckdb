@@ -26,7 +26,7 @@ FROM (SELECT list(range) AS l FROM range(6000))
 ----
 Query exceeded maximum execution time
 
-# the same join on a list key without a subquery does less work than the correlated forms, so it gets a smaller bound
+# a query stops within one operator call of its deadline, so the bound has to pass before the first long probe call
 statement ok con2
 SET max_execution_time=10
 
@@ -75,3 +75,58 @@ WITH t AS (SELECT l, unnest(l) AS k FROM (SELECT list(range) AS l FROM range(100
 SELECT count(*) FROM t a JOIN t b ON a.l = b.l AND a.k = b.k
 ----
 1000
+
+# a COMMIT that outlives its deadline is reported as committed
+statement ok
+ATTACH '{TEST_DIR}/max_execution_time_commit.db' AS commit_db
+
+statement ok
+CREATE TABLE commit_db.committed (i BIGINT, s VARCHAR)
+
+statement ok con3
+BEGIN
+
+statement ok con3
+INSERT INTO commit_db.committed SELECT range, repeat('x', 100000) FROM range(1000)
+
+statement ok con3
+SET max_execution_time=50
+
+statement ok con3
+COMMIT
+
+query I
+SELECT count(*) FROM commit_db.committed
+----
+1000
+
+# the next statement in the same call keeps its own bound
+statement error con4
+BEGIN; INSERT INTO commit_db.committed VALUES (1000, 'x'); COMMIT; SET max_execution_time=50;
+SELECT count(*) FROM range(20000) a, range(20000) b WHERE a.range + b.range = -1;
+----
+Query exceeded maximum execution time
+
+query I
+SELECT count(*) FROM commit_db.committed
+----
+1001
+
+# four runs on one thread, each a single long projection call, fail only if the deadline is read before every call
+statement ok
+SET threads=1
+
+statement ok con5
+PREPARE expensive_call AS SELECT length(md5(repeat('x', 50000000 + range))) FROM range(1)
+
+statement ok con5
+SET max_execution_time=10
+
+loop i 0 4
+
+statement error con5
+EXECUTE expensive_call
+----
+Query exceeded maximum execution time
+
+endloop

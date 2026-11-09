@@ -1267,8 +1267,9 @@ void ClientContext::RunTransactionStatementInternal(const TransactionInfo &info)
 			throw TransactionException("cannot commit - no transaction is active");
 		}
 		transaction.Commit();
-		// The commit is irreversible, so ignore interrupts until the next query.
+		// The commit is irreversible, so neither an interrupt nor this statement's deadline may fail it.
 		SuppressInterrupts();
+		query_deadline.SetInvalid();
 		break;
 	case TransactionType::ROLLBACK: {
 		if (transaction.IsAutoCommit()) {
