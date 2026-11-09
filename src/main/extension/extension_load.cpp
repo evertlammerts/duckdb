@@ -787,15 +787,11 @@ void ExtensionHelper::LoadExternalExtension(DatabaseInstance &db, FileSystem &fs
                                             optional_ptr<ClientContext> context) {
 	// Loading a second copy of an extension that is already linked into this binary is an ODR
 	// violation, so ask the registry of extensions linked into this binary first.
-	// Statically linked extensions are inherently core-trusted, so only take this shortcut for a bare
-	// load or an explicit core namespace - never let community/x or myrepo/x resolve to a linked core extension.
-	bool allow_static_shortcut = options.repository.empty() || StringUtil::CIEquals(options.repository, "core");
-	if (allow_static_shortcut && !ExtensionHelper::IsFullPath(options.extension_name)) {
-		auto logical_name = ExtensionHelper::GetExtensionName(options.extension_name);
+	auto linked = FindLinkedExtensionToLoad(db, options);
+	if (linked) {
 		DuckDB db_wrapper(db);
-		if (ExtensionHelper::LoadExtension(db_wrapper, logical_name) == ExtensionLoadResult::LOADED_EXTENSION) {
-			return;
-		}
+		linked->load(db_wrapper);
+		return;
 	}
 
 	auto &manager = ExtensionManager::Get(db);

@@ -45,6 +45,16 @@ static optional_ptr<const LinkedExtension> FindLinkedExtension(const DBConfig &c
 	return nullptr;
 }
 
+optional_ptr<const LinkedExtension> ExtensionHelper::FindLinkedExtensionToLoad(DatabaseInstance &db,
+                                                                               const ExtensionLoadOptions &options) {
+	// Linked extensions are core-trusted, so only a bare or core-qualified load may resolve to one.
+	bool core_namespace = options.repository.empty() || StringUtil::CIEquals(options.repository, "core");
+	if (!core_namespace || IsFullPath(options.extension_name)) {
+		return nullptr;
+	}
+	return FindLinkedExtension(DBConfig::GetConfig(db), GetExtensionName(options.extension_name));
+}
+
 //! Loads an extension that was linked into the binary, via the registry the config carries. This is
 //! deliberately not generated code: an extension with its own copy of DuckDB links no generated
 //! loader, so a compile-time list would be invisible to it, while the config is data it can read.
@@ -181,15 +191,6 @@ string ExtensionHelper::AddExtensionInstallHintToErrorMsg(DatabaseInstance &db, 
 	return base_error;
 }
 
-// the bare load of AutoLoadOptions takes the linked shortcut of LoadExternalExtension for exactly these names, so a
-// linked extension never needs the repository
-static bool IsLinkedExtension(DatabaseInstance &db, const string &extension_name) {
-	if (ExtensionHelper::IsFullPath(extension_name)) {
-		return false;
-	}
-	return FindLinkedExtension(DBConfig::GetConfig(db), ExtensionHelper::GetExtensionName(extension_name)) != nullptr;
-}
-
 // autoloading only ever targets core extensions, so it trusts the core keys exclusively
 static ExtensionLoadOptions AutoLoadOptions(const string &extension_name) {
 	ExtensionLoadOptions options(extension_name);
@@ -211,7 +212,8 @@ bool ExtensionHelper::TryAutoLoadExtension(ClientContext &context, const string 
 }
 
 void ExtensionHelper::AutoInstallExtension(ClientContext &context, const string &extension_name) {
-	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(context) || IsLinkedExtension(*context.db, extension_name)) {
+	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(context) ||
+	    FindLinkedExtensionToLoad(*context.db, AutoLoadOptions(extension_name))) {
 		return;
 	}
 	auto autoinstall_repo = GetAutoinstallRepository(*context.db);
@@ -221,7 +223,8 @@ void ExtensionHelper::AutoInstallExtension(ClientContext &context, const string 
 }
 
 void ExtensionHelper::AutoInstallExtension(DatabaseInstance &db, FileSystem &fs, const string &extension_name) {
-	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(db) || IsLinkedExtension(db, extension_name)) {
+	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(db) ||
+	    FindLinkedExtensionToLoad(db, AutoLoadOptions(extension_name))) {
 		return;
 	}
 	auto autoinstall_repo = GetAutoinstallRepository(db);

@@ -120,15 +120,46 @@ TEST_CASE("A startup setting of an extension that is neither linked nor installe
 	if (IsLinked("httpfs")) {
 		return;
 	}
-	DBConfig config;
-	auto extension_directory = IsolateFromRepository(config);
-	config.SetOptionByName("s3_region", "eu-west-1");
+	for (bool autoinstall : {true, false}) {
+		CAPTURE(autoinstall);
+		DBConfig config;
+		auto extension_directory = IsolateFromRepository(config);
+		config.SetOptionByName("autoinstall_known_extensions", autoinstall);
+		config.SetOptionByName("s3_region", "eu-west-1");
 
-	duckdb::unique_ptr<DuckDB> db;
-	REQUIRE_THROWS_WITH(db = make_uniq<DuckDB>(nullptr, &config),
-	                    Catch::Contains("the httpfs extension needs to be loaded. But it could not be autoloaded"));
-	auto fs = FileSystem::CreateLocal();
-	REQUIRE(fs->DirectoryExists(extension_directory));
+		duckdb::unique_ptr<DuckDB> db;
+		REQUIRE_THROWS_WITH(db = make_uniq<DuckDB>(nullptr, &config),
+		                    Catch::Contains("the httpfs extension needs to be loaded. But it could not be autoloaded"));
+		auto fs = FileSystem::CreateLocal();
+		REQUIRE(fs->DirectoryExists(extension_directory) == autoinstall);
+	}
+}
+
+TEST_CASE("A runtime autoload through the client context attempts an install only with autoinstall on", "[api]") {
+	if (IsLinked("encodings")) {
+		return;
+	}
+	for (bool autoinstall : {true, false}) {
+		CAPTURE(autoinstall);
+		DBConfig config;
+		auto extension_directory = IsolateFromRepository(config);
+		config.SetOptionByName("autoinstall_known_extensions", autoinstall);
+
+		DuckDB db(nullptr, &config);
+		if (!ExtensionHelper::CanAutoloadExtension(*db.instance, "encodings")) {
+			return;
+		}
+		Connection con(db);
+		auto csv_path = TestCreatePath("startup_setting_shift_jis.csv");
+		REQUIRE_NO_FAIL(con.Query("COPY (SELECT 'a' AS c) TO '" + csv_path + "'"));
+		auto fs = FileSystem::CreateLocal();
+		REQUIRE(!fs->DirectoryExists(extension_directory));
+		// an unknown encoding asks for the encodings extension through the client context
+		auto scan = con.Query("SELECT * FROM read_csv('" + csv_path + "', encoding = 'shift_jis')");
+		REQUIRE(scan->HasError());
+		REQUIRE(StringUtil::Contains(scan->GetError(), "does not support the encoding: \"shift_jis\""));
+		REQUIRE(fs->DirectoryExists(extension_directory) == autoinstall);
+	}
 }
 
 TEST_CASE("A runtime setting of a linked extension that is not loaded yet does not need the repository", "[api]") {

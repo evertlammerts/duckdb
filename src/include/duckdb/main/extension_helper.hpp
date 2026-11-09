@@ -20,6 +20,7 @@ namespace duckdb {
 
 class DuckDB;
 class ExtensionActiveLoad;
+struct LinkedExtension;
 
 enum class ExtensionLoadResult : uint8_t { LOADED_EXTENSION = 0, EXTENSION_UNKNOWN = 1, NOT_LOADED = 2 };
 
@@ -297,6 +298,9 @@ private:
 	static void LoadExternalExtensionInternal(DatabaseInstance &db, FileSystem &fs, const string &extension,
 	                                          const string &repository_name, bool core_only, ExtensionActiveLoad &info,
 	                                          optional_ptr<ClientContext> context);
+	//! The extension linked into the binary that LoadExternalExtension loads for these options instead of a file
+	static optional_ptr<const LinkedExtension> FindLinkedExtensionToLoad(DatabaseInstance &db,
+	                                                                     const ExtensionLoadOptions &options);
 
 private:
 	static ExtensionLoadResult LoadExtensionInternal(DuckDB &db, const std::string &extension, bool initial_load);
