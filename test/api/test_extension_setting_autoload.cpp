@@ -220,6 +220,27 @@ TEST_CASE("An autoload by the file path of a linked extension still goes through
 	REQUIRE(CHECK_COLUMN(res, 0, {false}));
 }
 
+TEST_CASE("A load of a linked extension takes the linked copy only from the core repository", "[api]") {
+	if (!IsLinked("icu")) {
+		return;
+	}
+	DBConfig config;
+	auto extension_directory = IsolateFromRepository(config);
+	config.options.load_extensions = false;
+
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto community = con.Query("LOAD icu FROM community");
+	REQUIRE(community->HasError());
+	REQUIRE(StringUtil::Contains(community->GetError(), "icu.duckdb_extension\" not found"));
+	auto res = con.Query("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'icu'");
+	REQUIRE(CHECK_COLUMN(res, 0, {false}));
+
+	REQUIRE_NO_FAIL(con.Query("LOAD icu FROM core"));
+	RequireLoaded(con, "icu");
+	RequireNothingInstalled(extension_directory);
+}
+
 TEST_CASE("A startup setting of a linked extension through the C API does not need the repository", "[api][capi]") {
 	if (!IsLinked("icu")) {
 		return;
