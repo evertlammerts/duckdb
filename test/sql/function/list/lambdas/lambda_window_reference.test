@@ -197,7 +197,148 @@ SELECT * FROM range(3) r(x) MATCH_RECOGNIZE (ORDER BY x MEASURES list_transform(
 ----
 [4]
 
-# a window over a lambda outside any lambda body is unaffected
+# a lambda declared inside a window or an aggregate in a lambda body has only its own parameters, laid out without
+# the hidden ones of the enclosing lambdas
+query II
+SELECT i, list_transform([1], lambda x: first(list_transform([s], lambda y: y + 1)) OVER (ORDER BY i)) FROM t ORDER BY i;
+----
+1	[[11]]
+2	[[11]]
+3	[[11]]
+
+query I
+SELECT list_transform([10], lambda x, i: x + i + (first(list_transform([1], lambda y: y + 1)) OVER ())[1]);
+----
+[13]
+
+query II
+SELECT i, list_transform([1], lambda x: first(list_transform([s, s], lambda y, j: y + j)) OVER (ORDER BY i)) FROM t ORDER BY i;
+----
+1	[[11, 12]]
+2	[[11, 12]]
+3	[[11, 12]]
+
+query II
+SELECT i, list_transform([1], lambda x: first(list_transform([[s]], lambda y: list_transform(y, lambda z: z + len(y) + i))) OVER (ORDER BY i)) FROM t ORDER BY i;
+----
+1	[[[12]]]
+2	[[[12]]]
+3	[[[12]]]
+
+query II
+SELECT i, list_transform([1], lambda a: list_transform([2], lambda b: a + b + first(list_sum(list_transform([s], lambda c: c + s))) OVER (ORDER BY i))) FROM t ORDER BY i;
+----
+1	[[23]]
+2	[[23]]
+3	[[23]]
+
+query II
+SELECT i, list_transform([1], lambda x: x + count(*) OVER (PARTITION BY list_transform([i % 2], lambda y: y + s - s))) FROM t ORDER BY i;
+----
+1	[3]
+2	[2]
+3	[3]
+
+query II
+SELECT i, list_transform([1], lambda x: x + row_number() OVER (ORDER BY list_transform([s], lambda y: -y))) FROM t ORDER BY i;
+----
+1	[4]
+2	[3]
+3	[2]
+
+query II
+SELECT i, list_transform([1], lambda x: x + sum(list_sum(list_transform([s], lambda y: y + 1)))) FROM t GROUP BY i ORDER BY i;
+----
+1	[12]
+2	[22]
+3	[32]
+
+query I
+SELECT list_transform([10], lambda x, k: x + k + sum(list_sum(list_transform([s], lambda y: y + 1)))) FROM t;
+----
+[74]
+
+query I
+SELECT list_transform([1], lambda x: first(list_transform([[s]], lambda y: list_transform(y, lambda z: z + len(y))) ORDER BY i)) FROM t;
+----
+[[[11]]]
+
+query II
+SELECT i, list_transform([1], lambda x: first(list_reduce([s, s], lambda a, b, k: a + b + k + i)) OVER (ORDER BY i)) FROM t ORDER BY i;
+----
+1	[23]
+2	[23]
+3	[23]
+
+query I
+SELECT list_transform([1], lambda x: x + sum(list_reduce([s, s], lambda a, b: a + b + s, 0))) FROM t;
+----
+[241]
+
+query I
+SELECT list_transform([1], lambda x: x + sum(s) FILTER (WHERE list_sum(list_transform([s], lambda y: y + 1)) > 15)) FROM t;
+----
+[51]
+
+# an aggregate inside a lambda inside a window inside a lambda body hides one more binding than the window
+query I
+SELECT list_transform([1], lambda x: first(list_transform([1], lambda y: y + sum(list_sum(list_transform([s], lambda z: z + 1))))) OVER ()) FROM t;
+----
+[[64]]
+
+query I
+SELECT i FROM t GROUP BY i HAVING list_transform([1], lambda x: x + sum(list_sum(list_transform([s], lambda y: y + 1))))[1] > 15 ORDER BY i;
+----
+2
+3
+
+query I
+SELECT i FROM t QUALIFY list_transform([1], lambda x: x + max(list_sum(list_transform([s], lambda y: y + i))) OVER ())[1] = i + 33 ORDER BY i;
+----
+1
+
+query I
+SELECT * FROM range(3) r(x) MATCH_RECOGNIZE (ORDER BY x MEASURES list_transform([1], lambda v: v + sum(list_sum(list_transform([x], lambda y: y + 1)))) AS n PATTERN (A+) DEFINE A AS true);
+----
+[7]
+
+# the enclosing parameter stays hidden next to a lambda inside the window or aggregate and inside its body
+statement error
+SELECT list_transform([1], lambda x: first(x + list_sum(list_transform([s], lambda y: y))) OVER ()) FROM t;
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: count(*) OVER (PARTITION BY list_transform([s], lambda y: y + x))) FROM t;
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: row_number() OVER (ORDER BY list_transform([s], lambda y: y + x))) FROM t;
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: first(list_transform([s], lambda y: y + x)) OVER ()) FROM t;
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: sum(list_sum(list_transform([s], lambda y: y + x)))) FROM t;
+----
+aggregate functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: sum(s) FILTER (WHERE list_sum(list_transform([s], lambda y: y + x)) > 0)) FROM t;
+----
+aggregate functions cannot reference lambda parameters
+
+statement error
+SELECT list_transform([1], lambda x: first(s ORDER BY list_sum(list_transform([s], lambda y: y + x)))) FROM t;
+----
+aggregate functions cannot reference lambda parameters
+
+# outside any lambda body nothing is hidden
 query II
 SELECT i, first(list_transform([s], lambda y: y + 1)) OVER (ORDER BY i) FROM t ORDER BY i;
 ----

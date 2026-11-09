@@ -264,9 +264,8 @@ public:
 private:
 	//! Current stack depth
 	idx_t stack_depth = DConstants::INVALID_INDEX;
-	//! The number of (outer) lambda bindings whose parameters can not be referenced, e.g. inside an aggregate. A lambda
-	//! bound inside the aggregate runs over its input, so its captures and nested parameters start at this binding
-	//! index
+	//! Enclosing lambda bindings below this index are hidden, e.g. inside an aggregate: their parameters cannot be
+	//! referenced, and a lambda bound there lays out only the bindings from this index on
 	idx_t inaccessible_lambda_binding_count = 0;
 	//! What makes them inaccessible, named in the error, e.g. "aggregate functions"
 	const char *inaccessible_lambda_binding_owner = nullptr;
