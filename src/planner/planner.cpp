@@ -3,6 +3,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/thread.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -103,6 +104,24 @@ static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 		dep_join->children.push_back(std::move(trig.children[0]));
 		dep_join->children.push_back(std::move(trig.children[1]));
 		op.children[i] = std::move(dep_join);
+	}
+}
+
+void Planner::CheckStackSpace(const char *step) {
+	// binding a leaf below the last check and throwing the error take about 14 KiB on a release build, more under a
+	// sanitizer
+	static constexpr idx_t MIN_STACK_RESERVE = idx_t(64) * 1024;
+	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
+	idx_t stack_size;
+	idx_t remaining;
+	if (!ThreadUtil::GetStackSpace(stack_size, remaining)) {
+		return;
+	}
+	auto reserve = MinValue(MaxValue(stack_size / 8, MIN_STACK_RESERVE), MAX_STACK_RESERVE);
+	if (remaining < MinValue(reserve, stack_size / 2)) {
+		throw BinderException("Max expression depth exceeded: %s the query would overflow the %lld KiB stack of this "
+		                      "thread",
+		                      step, stack_size / 1024);
 	}
 }
 

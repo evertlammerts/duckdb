@@ -29,6 +29,7 @@
 #include "duckdb/planner/expression_binder/returning_binder.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/operator/logical_sample.hpp"
 #include "duckdb/planner/query_node/list.hpp"
 #include "duckdb/planner/tableref/list.hpp"
@@ -51,30 +52,12 @@ void Binder::IncreaseDepth() {
 		                      "increase the maximum expression depth.",
 		                      max_expression_depth);
 	}
-	CheckStackSpace();
+	Planner::CheckStackSpace("binding");
 }
 
 void Binder::ContinueDepth(const Binder &creator) {
 	depth = creator.GetBinderDepth();
 	IncreaseDepth();
-}
-
-void Binder::CheckStackSpace() {
-	// binding a leaf below the last check and throwing the error take about 14 KiB on a release build, more under a
-	// sanitizer
-	static constexpr idx_t MIN_STACK_RESERVE = idx_t(64) * 1024;
-	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
-	idx_t stack_size;
-	idx_t remaining;
-	if (!ThreadUtil::GetStackSpace(stack_size, remaining)) {
-		return;
-	}
-	auto reserve = MinValue(MaxValue(stack_size / 8, MIN_STACK_RESERVE), MAX_STACK_RESERVE);
-	if (remaining < MinValue(reserve, stack_size / 2)) {
-		throw BinderException("Max expression depth exceeded: binding the query would overflow the %lld KiB stack of "
-		                      "this thread",
-		                      stack_size / 1024);
-	}
 }
 
 shared_ptr<Binder> Binder::CreateBinder(ClientContext &context, optional_ptr<Binder> parent, BinderType binder_type) {

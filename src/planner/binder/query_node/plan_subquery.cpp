@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/subquery/flatten_dependent_join.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
@@ -725,6 +726,8 @@ void RecursiveDependentJoinPlanner::PlanJoinChildFilters(LogicalOperator &op) {
 }
 
 BindingReplacementGraph RecursiveDependentJoinPlanner::PlanOperator(unique_ptr<LogicalOperator> &op_ptr) {
+	// one binder level can make several plan operators, so the checks of binding do not bound this walk
+	Planner::CheckStackSpace("planning");
 	PlanJoinChildFilters(*op_ptr);
 	if (op_ptr->type == LogicalOperatorType::LOGICAL_ANY_JOIN &&
 	    op_ptr->Cast<LogicalAnyJoin>().condition->HasSubquery()) {

@@ -29,6 +29,19 @@ constexpr idx_t DEEP_MACRO_NEST = 190;
 constexpr idx_t SHALLOW_NEST = 3;
 // Enough for a macro cycle to reach a lowered max_expression_depth on any build.
 constexpr idx_t LARGE_STACK_SIZE = 16 * 1024 * 1024;
+// Planning makes three operators per EXCEPT, and walks them with more stack than binding the chain takes.
+constexpr idx_t DEEP_EXCEPT_CHAIN = 150;
+// A level that joins makes the parsed statement deeper still, and its destruction overflows 512 KiB under a sanitizer
+// at 200 levels.
+constexpr idx_t DEEP_JOIN_NEST = 100;
+// Below this the binder's error for a nest of 200 can still overflow while the parsed statement is destroyed, under
+// a sanitizer.
+constexpr idx_t SWEEP_MIN_STACK_SIZE = 512 * 1024;
+constexpr idx_t SWEEP_MAX_STACK_SIZE = 2048 * 1024;
+constexpr idx_t SWEEP_STEP = 128 * 1024;
+constexpr idx_t NARROW_SWEEP_MIN_STACK_SIZE = 384 * 1024;
+constexpr idx_t NARROW_SWEEP_MAX_STACK_SIZE = 1024 * 1024;
+constexpr idx_t NARROW_SWEEP_STEP = 32 * 1024;
 
 struct SmallStackQuery {
 	Connection &con;
@@ -111,13 +124,40 @@ SmallStackQuery QueryOnSmallStack(Connection &con, const string &sql, idx_t stac
 	return query;
 }
 
-void RequireStackError(Connection &con, const string &sql, idx_t stack_size = SMALL_STACK_SIZE) {
+bool IsStackError(const string &error, const string &step) {
+	return StringUtil::Contains(error, "Binder Error: Max expression depth exceeded: " + step +
+	                                       " the query would overflow the");
+}
+
+void RequireStackError(Connection &con, const string &sql, idx_t stack_size = SMALL_STACK_SIZE,
+                       const string &step = "binding") {
 	auto query = QueryOnSmallStack(con, sql, stack_size);
 	INFO(query.value);
 	INFO(query.error);
 	REQUIRE(query.has_error);
-	REQUIRE(StringUtil::Contains(query.error,
-	                             "Binder Error: Max expression depth exceeded: binding the query would overflow the"));
+	REQUIRE(IsStackError(query.error, step));
+}
+
+// Which step runs out of stack first depends on the compiler and the build: binding a FROM subquery takes about 3.8 KiB
+// on arm64 with GCC 11 and 1 KiB on x86 with GCC 13, planning it about the same on both. So the nest is planned on a
+// range of stacks, each of which must give the value or one of the two errors. Returns whether planning ran out.
+bool RequireValueOrStackError(Connection &con, const string &sql, const string &expected,
+                              idx_t min_stack_size = SWEEP_MIN_STACK_SIZE, idx_t max_stack_size = SWEEP_MAX_STACK_SIZE,
+                              idx_t step = SWEEP_STEP) {
+	bool planning_error = false;
+	for (idx_t stack_size = min_stack_size; stack_size <= max_stack_size; stack_size += step) {
+		auto query = QueryOnSmallStack(con, sql, stack_size);
+		INFO(stack_size);
+		INFO(query.error);
+		if (query.has_error) {
+			auto planning = IsStackError(query.error, "planning");
+			REQUIRE((planning || IsStackError(query.error, "binding")));
+			planning_error = planning_error || planning;
+		} else {
+			REQUIRE(query.value == expected);
+		}
+	}
+	return planning_error;
 }
 
 void RequireDepthError(Connection &con, const string &sql, const string &expected) {
@@ -151,6 +191,39 @@ string NestedCTEs(idx_t count) {
 		query = StringUtil::Format("WITH c%d AS (%s) SELECT * FROM c%d", i, query, i);
 	}
 	return query;
+}
+
+string NestedFromSubqueries(idx_t count) {
+	string query = "SELECT 42 AS a";
+	for (idx_t i = 0; i < count; i++) {
+		query = StringUtil::Format("SELECT * FROM (%s)", query);
+	}
+	return query;
+}
+
+string NestedFromJoins(idx_t count) {
+	string query = "SELECT 42 AS a";
+	for (idx_t i = 0; i < count; i++) {
+		query = StringUtil::Format("SELECT t%d.a FROM (%s) t%d JOIN (SELECT 42 AS a) u%d USING (a)", i, query, i, i);
+	}
+	return query;
+}
+
+string ExceptChain(idx_t count) {
+	string query = "SELECT 42";
+	for (idx_t i = 0; i < count; i++) {
+		query += StringUtil::Format(" EXCEPT SELECT %d", 100 + i);
+	}
+	return query;
+}
+
+// The chain reads the outer query's column, so decorrelation walks it as the body of a correlated subquery.
+string CorrelatedExceptChain(idx_t count) {
+	string chain = "SELECT t.a";
+	for (idx_t i = 0; i < count; i++) {
+		chain += StringUtil::Format(" EXCEPT SELECT %d", 100 + i);
+	}
+	return StringUtil::Format("SELECT (%s) FROM (SELECT 42 AS a) t", chain);
 }
 
 } // namespace
@@ -214,4 +287,38 @@ TEST_CASE("A macro cycle through a USING KEY aggregate reaches the depth limit",
 		REQUIRE_NO_FAIL(con.Query("SET search_path='main'"));
 		RequireDepthError(con, "SELECT n()", "Max expression depth limit of 100 exceeded");
 	}
+}
+
+TEST_CASE("A plan that binds on a small thread is planned without overflowing its stack", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	// these two passes do not check the stack yet, and on x86 both need more of it per operator than planning does
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='window_self_join,projection_placement'"));
+	if (!QueryOnSmallStack(con, "SELECT 42", SMALL_STACK_SIZE).stack_reported) {
+		WARN("The platform does not report the stack of a thread");
+		return;
+	}
+
+	SECTION("FROM subqueries") {
+		RequireValueOrStackError(con, NestedFromSubqueries(DEEP_STATEMENT_NEST), "42");
+		RequireValue(con, NestedFromSubqueries(SHALLOW_NEST), "42");
+	}
+	SECTION("FROM subqueries with joins") {
+		// planning a nest of joins takes seconds once it fits, so it runs on one stack only
+		RequireValueOrStackError(con, NestedFromJoins(DEEP_JOIN_NEST), "42", SMALL_STACK_SIZE, SMALL_STACK_SIZE);
+		RequireValue(con, NestedFromJoins(SHALLOW_NEST), "42");
+	}
+	SECTION("set operations") {
+		REQUIRE(RequireValueOrStackError(con, ExceptChain(DEEP_EXCEPT_CHAIN), "42"));
+		RequireValue(con, ExceptChain(SHALLOW_NEST), "42");
+	}
+	SECTION("set operations in a correlated subquery") {
+		// planning runs out first on a band of stacks a few dozen KiB wide on an arm64 release build, and not at all
+		// under a sanitizer, where binding takes more, so only the absence of a crash is required on every stack
+		RequireValueOrStackError(con, CorrelatedExceptChain(DEEP_EXCEPT_CHAIN), "42", NARROW_SWEEP_MIN_STACK_SIZE,
+		                         NARROW_SWEEP_MAX_STACK_SIZE, NARROW_SWEEP_STEP);
+		RequireValue(con, CorrelatedExceptChain(SHALLOW_NEST), "42");
+	}
+	RequireValue(con, "SELECT 42", "42");
 }
