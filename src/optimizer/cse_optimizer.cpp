@@ -15,9 +15,15 @@ namespace duckdb {
 //! underlying projection
 struct CSENode {
 	idx_t count;
+	//! Whether an occurrence sits where the operator evaluates it for every row; only such an occurrence may hoist it
+	bool has_eager_occurrence;
 	ProjectionIndex column_index;
 
-	CSENode() : count(1), column_index() {
+	CSENode() : count(0), has_eager_occurrence(false), column_index() {
+	}
+
+	bool ShouldExtract() const {
+		return count > 1 && has_eager_occurrence;
 	}
 };
 
@@ -113,18 +119,13 @@ void CommonSubExpressionOptimizer::CountExpressions(Expression &expr, CSEReplace
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE && !expr.IsVolatile() && !state.inside_try &&
 	    !kept_filter_root) {
 		// we can't move aggregates to a projection, so we only consider the children of the aggregate
-		auto node = state.expression_count.find(expr);
-		if (node == state.expression_count.end()) {
-			// hoisting an expression first seen in a lazy child would evaluate it for rows that never reach that child;
-			// a hoisted conjunction runs through Execute, which evaluates the operands Select would skip
-			const bool short_circuits =
-			    select_position && expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION;
-			if (!state.inside_lazy_child && !short_circuits) {
-				state.expression_count[expr] = CSENode();
-			}
-		} else {
-			// we encountered this expression before, increment the occurrence count
-			node->second.count++;
+		auto &node = state.expression_count[expr];
+		node.count++;
+		// hoisting for a lazy occurrence alone would evaluate it for rows that never reach it; a hoisted conjunction
+		// runs through Execute, which evaluates the operands Select would skip
+		const bool short_circuits = select_position && expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION;
+		if (!state.inside_lazy_child && !short_circuits) {
+			node.has_eager_occurrence = true;
 		}
 	}
 
@@ -198,7 +199,7 @@ void CommonSubExpressionOptimizer::PerformCSEReplacement(unique_ptr<Expression> 
 	// check if this child is eligible for CSE elimination
 	if (!state.inside_try && !kept_filter_root && state.expression_count.find(expr) != state.expression_count.end()) {
 		auto &node = state.expression_count[expr];
-		if (node.count > 1) {
+		if (node.ShouldExtract()) {
 			// this expression occurs more than once! push it into the projection
 			// check if it has already been pushed into the projection
 			auto alias = expr.GetAlias();
@@ -243,7 +244,7 @@ void CommonSubExpressionOptimizer::ExtractCommonSubExpressions(LogicalOperator &
 	// check if there are any expressions to extract
 	bool perform_replacement = false;
 	for (auto &expr : state.expression_count) {
-		if (expr.second.count > 1) {
+		if (expr.second.ShouldExtract()) {
 			perform_replacement = true;
 			break;
 		}

@@ -119,11 +119,76 @@ SELECT COALESCE(y, 10 // y) AS a, 10 // y AS b FROM s WHERE y IS DISTINCT FROM 0
 2	5
 NULL	NULL
 
-# a strict occurrence before the lazy one lets the pass extract the expression
+# a strict occurrence lets the pass extract the expression, before or after the lazy one
 query II
 EXPLAIN (FORMAT compact) SELECT 10 // y, COALESCE(y, 10 // y) FROM s
 ----
 physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*COALESCE\(y, #.*PROJECTION[^\n]*\(10 // y\).*SEQ_SCAN.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT COALESCE(y, 10 // y), 10 // y FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*COALESCE\(y, #.*PROJECTION[^\n]*\(10 // y\).*SEQ_SCAN.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT if(y <> 0, 10 // y, -1), 10 // y FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*THEN \(#[^\n]*\n *PROJECTION[^\n]*\(10 // y\).*SEQ_SCAN.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT 10 // y, if(y <> 0, 10 // y, -1) FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*THEN \(#[^\n]*\n *PROJECTION[^\n]*\(10 // y\).*SEQ_SCAN.*
+
+statement ok
+CREATE TABLE h(v VARCHAR, s VARCHAR);
+
+statement ok
+INSERT INTO h VALUES ('x', 'a'), (NULL, 'b');
+
+query II
+EXPLAIN (FORMAT compact) SELECT COALESCE(v, sha256(s)), sha256(s) FROM h
+----
+physical_plan	<!REGEX>:(?s).*sha256.*sha256.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT sha256(s), COALESCE(v, sha256(s)) FROM h
+----
+physical_plan	<!REGEX>:(?s).*sha256.*sha256.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT COALESCE(v, sha256(s)), sha256(s) FROM h
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*COALESCE\(v, #.*PROJECTION[^\n]*sha256\(s\).*SEQ_SCAN.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT sha256(s), COALESCE(v, sha256(s)) FROM h
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*COALESCE\(v, #.*PROJECTION[^\n]*sha256\(s\).*SEQ_SCAN.*
+
+query II
+SELECT COALESCE(v, sha256(s)) AS a, sha256(s) AS b FROM h ORDER BY s
+----
+x	ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb
+3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d	3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d
+
+query II
+SELECT sha256(s) AS b, COALESCE(v, sha256(s)) AS a FROM h ORDER BY s
+----
+ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb	x
+3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d	3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d
+
+# the first COALESCE argument is evaluated for every row, so it is a strict occurrence
+query II
+EXPLAIN (FORMAT compact) SELECT COALESCE(10 // y, 0), if(y <> 0, 10 // y, -1) FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*COALESCE\(#0, 0\), CASE[^\n]*THEN \(#0\)[^\n]*\n *PROJECTION[^\n]*\(10 // y\).*SEQ_SCAN.*
+
+query II
+SELECT COALESCE(10 // y, 0) AS a, if(y <> 0, 10 // y, -1) AS b FROM s WHERE y IS DISTINCT FROM 0 ORDER BY y NULLS LAST
+----
+5	5
+0	-1
 
 # a conjunction in a CASE condition or an aggregate filter short circuits through Select, so it is not extracted into
 # a projection that would evaluate all of its operands
@@ -159,12 +224,28 @@ SELECT count(*) FILTER (WHERE (y = 0 OR 10 // y > 1) AND y > -100), sum(COALESCE
 ----
 2	2
 
-# a conjunction in a projection evaluates all of its operands, so extracting it from there is safe
+# a conjunction in a projection evaluates all of its operands, so extracting it from there is safe in either order
 query II
 SELECT y <> 0 AND 10 // y > 1 AS a, if(y <> 0 AND 10 // y > 1, 1, 2) AS b FROM s WHERE y IS DISTINCT FROM 0 ORDER BY y NULLS LAST
 ----
 true	1
 NULL	2
+
+query II
+SELECT if(y <> 0 AND 10 // y > 1, 1, 2) AS b, y <> 0 AND 10 // y > 1 AS a FROM s WHERE y IS DISTINCT FROM 0 ORDER BY y NULLS LAST
+----
+1	true
+2	NULL
+
+query II
+EXPLAIN (FORMAT compact) SELECT y <> 0 AND 10 // y > 1, if(y <> 0 AND 10 // y > 1, 1, 2) FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*CASE +WHEN \(#0\).*PROJECTION[^\n]*\(\(y != 0\) AND \(\(10 // y\) > 1\)\).*SEQ_SCAN.*
+
+query II
+EXPLAIN (FORMAT compact) SELECT if(y <> 0 AND 10 // y > 1, 1, 2), y <> 0 AND 10 // y > 1 FROM s
+----
+physical_plan	<REGEX>:(?s).*PROJECTION[^\n]*CASE +WHEN \(#0\).*PROJECTION[^\n]*\(\(y != 0\) AND \(\(10 // y\) > 1\)\).*SEQ_SCAN.*
 
 # a grouped aggregate evaluates its filters in a projection, so a conjunction there is still shared
 statement ok
