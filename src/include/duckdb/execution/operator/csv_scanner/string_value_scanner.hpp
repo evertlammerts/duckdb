@@ -41,30 +41,33 @@ public:
 			return {};
 		}
 		string result;
-		if (end.buffer_idx == begin.buffer_idx || begin.buffer_pos == begin.buffer_size) {
+		// the end of a buffer is the start of the next one
+		const bool begin_at_buffer_end = begin.buffer_pos == begin.buffer_size;
+		const idx_t first_idx = begin_at_buffer_end ? begin.buffer_idx + 1 : begin.buffer_idx;
+		const idx_t first_pos = begin_at_buffer_end ? 0 : begin.buffer_pos;
+		if (end.buffer_idx == first_idx) {
 			idx_t buffer_idx = end.buffer_idx;
 			if (buffer_handles.find(buffer_idx) == buffer_handles.end()) {
 				return {};
 			}
-			idx_t start_pos = begin.buffer_pos == begin.buffer_size ? 0 : begin.buffer_pos;
 			auto buffer = buffer_handles[buffer_idx]->Ptr();
-			first_char_nl = buffer[start_pos] == '\n' || buffer[start_pos] == '\r';
-			for (idx_t i = start_pos + first_char_nl; i < end.buffer_pos; i++) {
+			first_char_nl = buffer[first_pos] == '\n' || buffer[first_pos] == '\r';
+			for (idx_t i = first_pos + first_char_nl; i < end.buffer_pos; i++) {
 				result += buffer[i];
 			}
 		} else {
-			if (buffer_handles.find(begin.buffer_idx) == buffer_handles.end() ||
+			if (buffer_handles.find(first_idx) == buffer_handles.end() ||
 			    buffer_handles.find(end.buffer_idx) == buffer_handles.end()) {
 				return {};
 			}
-			if (begin.buffer_pos >= begin.buffer_size) {
+			auto first_buffer = buffer_handles[first_idx]->Ptr();
+			auto first_buffer_size = buffer_handles[first_idx]->actual_size;
+			if (first_pos >= first_buffer_size) {
 				throw InternalException("CSV reader: buffer pos out of range for buffer");
 			}
-			auto first_buffer = buffer_handles[begin.buffer_idx]->Ptr();
-			auto first_buffer_size = buffer_handles[begin.buffer_idx]->actual_size;
 			auto second_buffer = buffer_handles[end.buffer_idx]->Ptr();
-			first_char_nl = first_buffer[begin.buffer_pos] == '\n' || first_buffer[begin.buffer_pos] == '\r';
-			for (idx_t i = begin.buffer_pos + first_char_nl; i < first_buffer_size; i++) {
+			first_char_nl = first_buffer[first_pos] == '\n' || first_buffer[first_pos] == '\r';
+			for (idx_t i = first_pos + first_char_nl; i < first_buffer_size; i++) {
 				result += first_buffer[i];
 			}
 			for (idx_t i = 0; i < end.buffer_pos; i++) {
@@ -386,7 +389,8 @@ private:
 	//! Function used to process values that go over the first buffer, extra allocation might be necessary
 	void ProcessOverBufferValue();
 
-	void ProcessExtraRow();
+	//! Scans the rest of the line in the current buffer, returns false if the buffer ends before the line is done
+	bool ProcessExtraRow();
 	//! Function used to move from one buffer to the other, if necessary
 	MoveBufferResult TryMoveToNextBuffer();
 	//! Move to the next buffer and processes the value straddling the buffer edge

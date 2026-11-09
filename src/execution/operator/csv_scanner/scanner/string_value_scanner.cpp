@@ -1271,7 +1271,7 @@ void StringValueScanner::Initialize() {
 	result.current_line_position.end = result.current_line_position.begin;
 }
 
-void StringValueScanner::ProcessExtraRow() {
+bool StringValueScanner::ProcessExtraRow() {
 	result.NullPaddingQuotedNewlineCheck();
 	idx_t to_pos = cur_buffer_handle->actual_size;
 	while (iterator.pos.buffer_pos < to_pos) {
@@ -1280,13 +1280,13 @@ void StringValueScanner::ProcessExtraRow() {
 		case CSVState::INVALID:
 			result.InvalidState(result);
 			iterator.pos.buffer_pos++;
-			return;
+			return true;
 		case CSVState::RECORD_SEPARATOR:
 			if (states.states[0] == CSVState::RECORD_SEPARATOR) {
 				result.EmptyLine(result, iterator.pos.buffer_pos);
 				iterator.pos.buffer_pos++;
 				lines_read++;
-				return;
+				return true;
 			} else if (states.states[0] != CSVState::CARRIAGE_RETURN) {
 				if (result.IsCommentSet(result)) {
 					result.UnsetComment(result, iterator.pos.buffer_pos);
@@ -1295,7 +1295,7 @@ void StringValueScanner::ProcessExtraRow() {
 				}
 				iterator.pos.buffer_pos++;
 				lines_read++;
-				return;
+				return true;
 			}
 			lines_read++;
 			iterator.pos.buffer_pos++;
@@ -1309,12 +1309,12 @@ void StringValueScanner::ProcessExtraRow() {
 				}
 				iterator.pos.buffer_pos++;
 				lines_read++;
-				return;
+				return true;
 			} else {
 				result.EmptyLine(result, iterator.pos.buffer_pos);
 				iterator.pos.buffer_pos++;
 				lines_read++;
-				return;
+				return true;
 			}
 			break;
 		case CSVState::DELIMITER:
@@ -1371,6 +1371,7 @@ void StringValueScanner::ProcessExtraRow() {
 			break;
 		}
 	}
+	return false;
 }
 
 string_t StringValueScanner::RemoveEscape(const char *str_ptr, idx_t end, char escape, char quote, bool strict_mode,
@@ -1525,10 +1526,14 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		j++;
 	}
+	// a comment with only spaces before it is no value, as UnsetComment decides for a comment within one buffer
+	const bool comment_only = result.comment && over_buffer_string.find_first_not_of(' ') == string::npos;
 	bool skip_value = false;
 	if (result.projecting_columns) {
 		if (result.cur_col_id < result.number_of_columns && !result.projected_columns[result.cur_col_id]) {
-			result.cur_col_id++;
+			if (!comment_only) {
+				result.cur_col_id++;
+			}
 			skip_value = true;
 		}
 	}
@@ -1616,7 +1621,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		if (states.EmptyLine() && state_machine->dialect_options.num_cols == 1) {
 			result.EmptyLine(result, iterator.pos.buffer_pos);
-		} else if (!states.IsNotSet() && (!result.comment || !value.Empty())) {
+		} else if (!states.IsNotSet() && (!result.comment || (!value.Empty() && !comment_only))) {
 			idx_t value_size = value.GetSize();
 			if (!removed_extra_delimiter_bytes) {
 				if (extra_delimiter_bytes > value_size) {
@@ -2008,12 +2013,46 @@ void StringValueScanner::FinalizeChunkProcess() {
 
 void StringValueScanner::FinishBoundaryScan(const bool moved) {
 	if (cur_buffer_handle) {
-		if (moved && result.cur_col_id > 0) {
-			ProcessExtraRow();
-		} else if (!moved) {
-			ProcessExtraRow();
+		bool line_ended = true;
+		if (!moved || result.cur_col_id > 0) {
+			line_ended = ProcessExtraRow();
 		}
-		if (cur_buffer_handle->is_last_buffer && iterator.pos.buffer_pos >= cur_buffer_handle->actual_size) {
+		// The next boundary skips to the line after this one, so a line that runs past the buffer is finished here,
+		// unless it is already longer than max_line_size at the end of a buffer it moved into.
+		bool crossed = moved;
+		while (!line_ended && !cur_buffer_handle->is_last_buffer) {
+			const LinePosition line_end = {iterator.pos.buffer_idx,
+			                               MinValue(iterator.pos.buffer_pos, cur_buffer_handle->actual_size),
+			                               result.buffer_size};
+			const idx_t line_size = line_end - result.current_line_position.end;
+			if (crossed && line_size > state_machine->options.maximum_line_size.GetValue()) {
+				result.current_line_position.begin = result.current_line_position.end;
+				result.current_line_position.end = line_end;
+				result.current_errors.Insert(MAXIMUM_LINE_SIZE, 1, result.chunk_col_id, result.last_position,
+				                             line_size);
+				const auto chunk_col_id_before = result.chunk_col_id;
+				if (result.current_errors.HandleErrors(result)) {
+					result.InvalidateUnwrittenColumns(chunk_col_id_before);
+					result.number_of_rows++;
+				}
+				lines_read++;
+				// the rest of the line is not read, so a quote it leaves open is not unterminated
+				states.Initialize();
+				break;
+			}
+			const auto move_result = TryMoveToNextBuffer();
+			if (move_result == MoveBufferResult::NOT_IN_MEMORY) {
+				suspended = true;
+				return;
+			}
+			if (move_result != MoveBufferResult::MOVED) {
+				break;
+			}
+			crossed = true;
+			line_ended = result.cur_col_id == 0 || ProcessExtraRow();
+		}
+		if (cur_buffer_handle && cur_buffer_handle->is_last_buffer &&
+		    iterator.pos.buffer_pos >= cur_buffer_handle->actual_size) {
 			// the last buffer has no next buffer to wait for
 			TryMoveToNextBuffer();
 		}
