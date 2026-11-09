@@ -69,7 +69,7 @@ private:
 	                                MutableDateFormatMap &date_format_map, bool user_specified_timestamp_format);
 	void EliminateCandidateTypes(idx_t vec_count, Vector &string_vector, MutableDateFormatMap &date_format_map,
 	                             bool user_specified_timestamp_format);
-	bool EliminateCandidateFormats(idx_t vec_count, Vector &string_vector, const Vector &result_vector,
+	bool EliminateCandidateFormats(idx_t vec_count, Vector &string_vector, LogicalTypeId type,
 	                               MutableDateFormatMap &date_format_map);
 
 public:
@@ -108,8 +108,7 @@ public:
 
 	//! Candidate types (if auto-detecting and type == LogicalTypeId::VARCHAR)
 	vector<LogicalTypeId> candidate_types;
-	//! Per candidate type with formats, what reads every sampled value; a type without an entry has not been tried,
-	//! so all of its candidates remain
+	//! Per candidate type with formats, what reads every sampled value; a type without an entry is not tried yet
 	type_id_map_t<JSONFormatCandidates> format_candidates;
 
 	//! Whether any UBIGINT value exceeds the BIGINT range (i.e., >= 2^63)

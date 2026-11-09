@@ -311,7 +311,7 @@ TIMESTAMP	2024-01-02 10:00:00.25
 TIMESTAMP	2024-01-02 10:00:00
 TIMESTAMP	NULL
 
-# A format that reads every value is preferred over the plain cast, which would read 96 as the year 96
+# A two digit year is read by %y-%m-%d, not by the plain cast, which would read 96 as the year 96
 statement ok
 copy (select * from (values ('{"d":"96-03-27"}'))) to '{TEMP_DIR}/two_digit_year.json' (format csv, quote '', header 0)
 
@@ -374,3 +374,224 @@ select typeof(d), d from read_json('{TEMP_DIR}/duplicate_keys_other_type.json', 
 ----
 VARCHAR	01-02-2024
 VARCHAR	01-02-2024
+
+# A type that takes over in a later vector must read the earlier vectors too: no one format reads both spellings
+statement ok
+copy (
+	select json_object('d', CASE WHEN i <= 2048 THEN '31-12-2024' ELSE '2024-12-31' END)
+	from generate_series(1, 2049) t(i)
+) to '{TEMP_DIR}/takeover_no_common.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), count(*) from read_json('{TEMP_DIR}/takeover_no_common.json', sample_size=-1) group by all
+----
+VARCHAR	2049
+
+# ISO dates in one vector and ISO timestamps in the next: the plain timestamp cast reads both
+statement ok
+copy (
+	select json_object('d', CASE WHEN i <= 2048 THEN '2024-01-02' ELSE '2024-01-02 10:00:00' END)
+	from generate_series(1, 6144) t(i)
+) to '{TEMP_DIR}/takeover_cast.json' (format csv, quote '', header 0)
+
+query III
+select typeof(d), d, count(*) from read_json('{TEMP_DIR}/takeover_cast.json', sample_size=-1) group by all order by d
+----
+TIMESTAMP	2024-01-02 00:00:00	2048
+TIMESTAMP	2024-01-02 10:00:00	4096
+
+# ISO 8601 values are read by the plain cast, so whole seconds in the sample and a fraction after it read
+statement ok
+copy (
+	select json_object('d', CASE WHEN i <= 30000 THEN '2024-01-02 10:00:00' ELSE '2024-01-02 10:00:01.5' END)
+	from generate_series(1, 30001) t(i)
+) to '{TEMP_DIR}/fraction_after_sample.json' (format csv, quote '', header 0)
+
+query III
+select typeof(d), count(*), max(d) from read_json('{TEMP_DIR}/fraction_after_sample.json') group by all
+----
+TIMESTAMP	30001	2024-01-02 10:00:01.5
+
+statement ok
+copy (
+	select json_object('d', CASE WHEN i <= 30000 THEN '2024-01-02 10:00:01.5' ELSE '2024-01-02 10:00:00' END)
+	from generate_series(1, 30001) t(i)
+) to '{TEMP_DIR}/whole_second_after_sample.json' (format csv, quote '', header 0)
+
+query III
+select typeof(d), count(*), min(d) from read_json('{TEMP_DIR}/whole_second_after_sample.json') group by all
+----
+TIMESTAMP	30001	2024-01-02 10:00:00
+
+# A zone name is not read by the plain timestamp cast, which would drop it
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00 Europe/Amsterdam"}'), ('{"d":"2024-01-03 11:00:00 America/New_York"}'))) to '{TEMP_DIR}/zone_names.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/zone_names.json')
+----
+VARCHAR	2024-01-02 10:00:00 Europe/Amsterdam
+VARCHAR	2024-01-03 11:00:00 America/New_York
+
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00"}'), ('{"d":"2024-01-03 11:00:00 UTC"}'))) to '{TEMP_DIR}/zone_name_utc.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/zone_name_utc.json')
+----
+VARCHAR	2024-01-02 10:00:00
+VARCHAR	2024-01-03 11:00:00 UTC
+
+# Past the sample a column read by the plain cast matches values as detection did, and an error names the line
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00"}'), ('{"d":"2024-01-02 10:00:00.5"}'), ('{"d":"2024-01-03 11:00:00+05:00"}'))) to '{TEMP_DIR}/cast_offset_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/cast_offset_after_sample.json', sample_size=2)
+----
+<REGEX>:.*in line 3: "2024-01-03 11:00:00\+05:00" has a time zone, which the plain cast to TIMESTAMP does not read.*Try increasing 'sample_size'.*
+
+query I
+select d from read_json('{TEMP_DIR}/cast_offset_after_sample.json', sample_size=2, ignore_errors=true)
+----
+2024-01-02 10:00:00
+2024-01-02 10:00:00.5
+NULL
+
+statement ok
+copy (select * from (values ('{"d":"2024-01-02"}'), ('{"d":"2024/01/03"}'), ('{"d":"2024-01-04 10:30:00"}'))) to '{TEMP_DIR}/cast_time_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/cast_time_after_sample.json', sample_size=2)
+----
+<REGEX>:.*in line 3: invalid date field format: "2024-01-04 10:30:00".*
+
+query I
+select d from read_json('{TEMP_DIR}/cast_time_after_sample.json', sample_size=2, ignore_errors=true)
+----
+2024-01-02
+2024-01-03
+NULL
+
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00"}'), ('{"d":"2024-01-02 10:00:00.5"}'), ('{"d":"x"}'), ('{"d":"y"}'))) to '{TEMP_DIR}/cast_text_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/cast_text_after_sample.json', sample_size=2)
+----
+<REGEX>:.*in line 3: invalid timestamp field format: "x".*
+
+# Of two misfits past the sample the first is reported
+statement ok
+copy (select * from (values ('{"d":"01-02-2024"}'), ('{"d":"13-02-2024"}'), ('{"d":"12-31-2024"}'), ('{"d":"11-30-2024"}'))) to '{TEMP_DIR}/two_misfits_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/two_misfits_after_sample.json', sample_size=2)
+----
+<REGEX>:.*in line 3: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+# A two digit year is not read by a four digit year format or the plain cast, so mixed widths are text
+statement ok
+copy (select * from (values ('{"d":"05-06-99"}'), ('{"d":"05-06-1999"}'))) to '{TEMP_DIR}/year_widths.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/year_widths.json')
+----
+VARCHAR	05-06-99
+VARCHAR	05-06-1999
+
+statement ok
+copy (select * from (values ('{"d":"05-06-99 10:00:00"}'), ('{"d":"05-06-1999 10:00:00"}'))) to '{TEMP_DIR}/year_widths_ts.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/year_widths_ts.json')
+----
+VARCHAR	05-06-99 10:00:00
+VARCHAR	05-06-1999 10:00:00
+
+statement ok
+copy (select * from (values ('{"d":"96-03-27"}'), ('{"d":"1996-03-27"}'))) to '{TEMP_DIR}/year_widths_iso.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/year_widths_iso.json')
+----
+VARCHAR	96-03-27
+VARCHAR	1996-03-27
+
+# A year written with four digits keeps them, also below 100
+statement ok
+copy (select * from (values ('{"d":"05-06-0099"}'), ('{"d":"13-06-1999"}'))) to '{TEMP_DIR}/year_four_digits_small.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/year_four_digits_small.json')
+----
+DATE	0099-06-05
+DATE	1999-06-13
+
+statement ok
+copy (select * from (values ('{"d":"0099-06-05"}'), ('{"d":"2024-01-02"}'))) to '{TEMP_DIR}/year_four_digits_small_iso.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/year_four_digits_small_iso.json')
+----
+DATE	0099-06-05
+DATE	2024-01-02
+
+# Past the sample a two digit year is an error under a four digit year format and under the plain cast
+statement ok
+copy (select * from (values ('{"d":"13-06-2024"}'), ('{"d":"05-06-99"}'))) to '{TEMP_DIR}/year_width_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/year_width_after_sample.json', sample_size=1)
+----
+<REGEX>:.*in line 2: "05-06-99" has a two digit year, which format specifier "%d-%m-%Y" does not read.*
+
+statement ok
+copy (select * from (values ('{"d":"2024-01-02"}'), ('{"d":"96-03-27"}'))) to '{TEMP_DIR}/year_width_after_sample_iso.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/year_width_after_sample_iso.json', sample_size=1)
+----
+<REGEX>:.*in line 2: "96-03-27" has a two digit year, which the plain cast does not read.*
+
+statement ok
+copy (select * from (values ('{"d":"13-06-2024 10:00:00"}'), ('{"d":"05-06-99 10:00:00"}'))) to '{TEMP_DIR}/year_width_after_sample_ts.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/year_width_after_sample_ts.json', sample_size=1)
+----
+<REGEX>:.*in line 2: "05-06-99 10:00:00" has a two digit year, which format specifier "%d-%m-%Y %H:%M:%S" does not read.*
+
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00"}'), ('{"d":"96-03-27 10:00:00"}'))) to '{TEMP_DIR}/year_width_after_sample_ts_iso.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/year_width_after_sample_ts_iso.json', sample_size=1)
+----
+<REGEX>:.*in line 2: "96-03-27 10:00:00" has a two digit year, which the plain cast does not read.*
+
+# Past the sample a zone name is not read by the plain timestamp cast either
+statement ok
+copy (select * from (values ('{"d":"2024-01-02 10:00:00"}'), ('{"d":"2024-01-03 11:00:00 Europe/Amsterdam"}'))) to '{TEMP_DIR}/zone_name_after_sample.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/zone_name_after_sample.json', sample_size=1)
+----
+<REGEX>:.*in line 2: "2024-01-03 11:00:00 Europe/Amsterdam" has a time zone, which the plain cast to TIMESTAMP does not read.*
+
+# A value that is no string comes before a later misfit, so it is the one reported
+statement ok
+copy (select * from (values ('{"d":"2024-01-02"}'), ('{"d":5}'), ('{"d":"x"}'))) to '{TEMP_DIR}/number_before_misfit_cast.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/number_before_misfit_cast.json', sample_size=1)
+----
+<REGEX>:.*in line 2: .*'5'.*
+
+statement ok
+copy (select * from (values ('{"d":"13-02-2024"}'), ('{"d":5}'), ('{"d":"31-12-2024x"}'))) to '{TEMP_DIR}/number_before_misfit_format.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/number_before_misfit_format.json', sample_size=1)
+----
+<REGEX>:.*in line 2: .*'5'.*

@@ -58,28 +58,11 @@ public:
 	static JSONTransformOptions Deserialize(Deserializer &deserializer);
 };
 
-struct TryParseDate {
-	template <class T>
-	static inline bool Operation(const StrpTimeFormat &format, const string_t &input, T &result,
-	                             string &error_message) {
-		return format.TryParseDate(input, result, error_message);
-	}
-};
-
-struct TryParseTimeStamp {
-	template <class T>
-	static inline bool Operation(const StrpTimeFormat &format, const string_t &input, T &result,
-	                             string &error_message) {
-		return format.TryParseTimestamp(input, result, error_message);
-	}
-};
-
-//! The DATE or TIMESTAMP format auto-detection chose for a column, and those of its nested values, in the shape of
-//! the column's type: one child per STRUCT field, one for the element of a LIST and one for the value of a MAP
+//! The DATE or TIMESTAMP candidate detection chose for a column, a child per struct field, list element or map value
 struct JSONColumnFormats {
 	//! Index into the DateFormatMap formats of the column's type, invalid when no format was detected
 	optional_idx format_index;
-	//! Whether the column is read with the plain cast instead, because no format read every sampled value
+	//! Whether the column is read with the plain cast instead
 	bool cast = false;
 	vector<JSONColumnFormats> children;
 

@@ -36,12 +36,12 @@ void JSONScanData::InitializeFormats(bool auto_detect_p) {
 	}
 
 	if (auto_detect_p) {
+		// ISO 8601 values are read by the plain cast, a candidate beside these, as the CSV sniffer reads them
 		static const type_id_map_t<vector<const char *>> FORMAT_TEMPLATES = {
-		    {LogicalTypeId::DATE, {"%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y", "%Y-%m-%d", "%y-%m-%d"}},
+		    {LogicalTypeId::DATE, {"%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y", "%y-%m-%d"}},
 		    {LogicalTypeId::TIMESTAMP,
-		     {"%Y-%m-%d %H:%M:%S.%f", "%m-%d-%Y %I:%M:%S %p", "%m-%d-%y %I:%M:%S %p", "%d-%m-%Y %H:%M:%S",
-		      "%d-%m-%y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
-		      "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"}},
+		     {"%m-%d-%Y %I:%M:%S %p", "%m-%d-%y %I:%M:%S %p", "%d-%m-%Y %H:%M:%S", "%d-%m-%y %H:%M:%S",
+		      "%y-%m-%d %H:%M:%S"}},
 		};
 
 		// Populate possible date/timestamp formats, assume this is consistent across columns
@@ -54,7 +54,6 @@ void JSONScanData::InitializeFormats(bool auto_detect_p) {
 			for (auto &format_string : format_strings) {
 				DateFormatMap::AddFormat(candidate_formats, logical_type, format_string);
 			}
-			// What the plain cast reads (ISO 8601, with or without fractional seconds) is not a question of format
 			cast_candidates.insert(logical_type);
 		}
 	}

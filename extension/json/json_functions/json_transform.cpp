@@ -410,24 +410,26 @@ static bool TransformGeometry(yyjson_val *vals[], Vector &result, const idx_t co
 	return success;
 }
 
-template <class OP, class T>
-static bool TransformStringWithFormat(const Vector &string_vector, const StrpTimeFormat &format, const idx_t count,
-                                      Vector &result, JSONTransformOptions &options) {
+template <class T>
+static bool TransformStringWithCandidate(const Vector &string_vector, const DateFormatMap &date_format_map,
+                                         const optional_idx format_index, const idx_t count, Vector &result,
+                                         JSONTransformOptions &options, bool success) {
 	const auto source_strings = FlatVector::GetData<string_t>(string_vector);
 	const auto &source_validity = FlatVector::Validity(string_vector);
 
 	auto target_vals = FlatVector::GetDataMutable<T>(result);
 	auto &target_validity = FlatVector::ValidityMutable(result);
 
-	bool success = true;
-	string error_message;
 	for (idx_t i = 0; i < count; i++) {
 		if (!source_validity.RowIsValid(i)) {
 			target_validity.SetInvalid(i);
-		} else if (!OP::template Operation<T>(format, source_strings[i], target_vals[i], error_message)) {
+			continue;
+		}
+		const bool report = success && options.strict_cast;
+		if (!date_format_map.CandidateReads(format_index, source_strings[i], target_vals[i],
+		                                    report ? &options.error_message : nullptr)) {
 			target_validity.SetInvalid(i);
-			if (success && options.strict_cast) {
-				options.error_message = error_message;
+			if (report) {
 				options.object_index = i;
 				success = false;
 			}
@@ -439,31 +441,30 @@ static bool TransformStringWithFormat(const Vector &string_vector, const StrpTim
 static bool TransformFromStringWithFormat(yyjson_val *vals[], Vector &result, const idx_t count,
                                           JSONTransformOptions &options,
                                           optional_ptr<const JSONColumnFormats> formats) {
-	if (formats && formats->cast) {
-		return TransformFromString(vals, result, count, options);
-	}
 	Vector string_vector(LogicalTypeId::VARCHAR, count);
 	bool success = true;
 	if (!JSONTransform::GetStringVector(vals, count, result.GetType(), string_vector, options)) {
 		success = false;
 	}
 
-	// Without a detected format the type came from the user, whose format is the only one, or no sampled value
-	// ruled a format out, and then detection prefers the last one too
 	const auto result_type_id = result.GetType().id();
-	const auto &format = formats && formats->format_index.IsValid()
-	                         ? options.date_format_map->GetFormats(result_type_id)[formats->format_index.GetIndex()]
-	                         : options.date_format_map->GetFormat(result_type_id);
+	const auto &date_format_map = *options.date_format_map;
+	optional_idx format_index;
+	if (formats && (formats->cast || formats->format_index.IsValid())) {
+		format_index = formats->format_index;
+	} else {
+		// Without a detected candidate the type came from the user, whose format is the only one, or the column is a
+		// GeoJSON property under a Properties member in another case, which reads as NULL
+		format_index = date_format_map.GetFormats(result_type_id).size() - 1;
+	}
 	switch (result_type_id) {
 	case LogicalTypeId::DATE:
-		if (!TransformStringWithFormat<TryParseDate, date_t>(string_vector, format, count, result, options)) {
-			success = false;
-		}
+		success = TransformStringWithCandidate<date_t>(string_vector, date_format_map, format_index, count, result,
+		                                               options, success);
 		break;
 	case LogicalTypeId::TIMESTAMP:
-		if (!TransformStringWithFormat<TryParseTimeStamp, timestamp_t>(string_vector, format, count, result, options)) {
-			success = false;
-		}
+		success = TransformStringWithCandidate<timestamp_t>(string_vector, date_format_map, format_index, count, result,
+		                                                    options, success);
 		break;
 	default:
 		throw InternalException("No date/timestamp formats for %s", EnumUtil::ToString(result_type_id));
