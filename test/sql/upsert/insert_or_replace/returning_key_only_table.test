@@ -144,6 +144,35 @@ INSERT OR REPLACE INTO ck VALUES (1) RETURNING *;
 ----
 1
 
+# a one column CHECK adds no indexed key to an update of other columns, which a referencing row would reject
+statement ok
+CREATE TABLE ck_parent (id INTEGER PRIMARY KEY CHECK (id > 0), v INTEGER);
+
+statement ok
+CREATE TABLE ck_child (pid INTEGER REFERENCES ck_parent (id));
+
+statement ok
+INSERT INTO ck_parent VALUES (1, 1);
+
+statement ok
+INSERT INTO ck_child VALUES (1);
+
+statement ok
+UPDATE ck_parent SET v = 2;
+
+query II
+SELECT * FROM ck_parent;
+----
+1	2
+
+statement ok
+INSERT OR REPLACE INTO ck_parent VALUES (1, 3);
+
+query II
+SELECT * FROM ck_parent;
+----
+1	3
+
 # more than one vector of replaced rows
 statement ok
 CREATE TABLE big (id INTEGER PRIMARY KEY);
