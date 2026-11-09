@@ -275,6 +275,21 @@ SELECT count(*) FROM (SELECT i FROM r);
 ----
 9
 
+statement ok
+SET explain_output = OPTIMIZED_ONLY;
+
+# the anchor and the recursive step project no s
+query II
+EXPLAIN (FORMAT compact)
+WITH RECURSIVE r(i, s) AS (
+	SELECT 1, 'x'
+	UNION ALL
+	SELECT r.i + 1, r.s FROM r, (SELECT s::INTEGER FROM r UNION ALL SELECT 5) u WHERE r.i < 3
+)
+SELECT count(*) FROM (SELECT i FROM r);
+----
+logical_opt	<REGEX>:.*REC_CTE.*Expressions: 1\n\s*DUMMY_SCAN.*Expressions: \(i \+ 1\)\n\s*CROSS_PRODUCT.*
+
 # a USING KEY recursive CTE is not pruned, but the union in its recursive step is
 query I
 WITH RECURSIVE r(i, s) USING KEY (i) AS (
@@ -298,6 +313,19 @@ SELECT max(k), count(*) FROM r;
 ----
 13	4
 
+# the anchor and the recursive step project no s
+query II
+EXPLAIN (FORMAT compact)
+WITH RECURSIVE r(i, s, k) AS (
+	SELECT 1, 'x', 10
+	UNION ALL
+	SELECT r.i + 1, r.s, r.k + 1 FROM r
+	WHERE r.i < 4 AND (SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT s::INTEGER AS x, k FROM r) SELECT * FROM c) z) > 0
+)
+SELECT max(k), count(*) FROM r;
+----
+logical_opt	<REGEX>:.*REC_CTE.*Expressions: 1, 10\n\s*DUMMY_SCAN.*Expressions: \(i \+ 1\), \(k \+ 1\)\n\s*CROSS_PRODUCT.*
+
 query I
 SELECT count(*) FROM (SELECT 1 UNION ALL SELECT NULL UNION ALL SELECT NULL::INTEGER);
 ----
@@ -319,6 +347,12 @@ query I
 WITH c AS MATERIALIZED (SELECT a::INTEGER AS cast_col, b FROM t) SELECT count(*) FROM c, t_not_null x WHERE x.b IS NOT NULL;
 ----
 6
+
+# statistics propagation turns count(b) of a NOT NULL b into count_star, and the second pass reads no column
+query I
+SELECT count(b) FROM (SELECT a::INTEGER AS cast_col, b FROM t_not_null UNION ALL SELECT 2, 3);
+----
+3
 
 # decorrelation puts the union below the count(*) into a materialized CTE that the count(*) reads no column of
 query I
@@ -402,9 +436,6 @@ query I
 SELECT last_value FROM duckdb_sequences() WHERE sequence_name = 'correlated_sequence';
 ----
 NULL
-
-statement ok
-SET explain_output = OPTIMIZED_ONLY;
 
 query II
 EXPLAIN SELECT count(*) FROM (SELECT a::INTEGER AS cast_col, b FROM t UNION ALL SELECT 2, 3);
