@@ -277,17 +277,23 @@ CREATE MACRO unpivot_name_pick(a) AS (SELECT sum(val) FROM (UNPIVOT wide ON a, b
 ----
 Conflicting column names for column a!
 
-# the column count check of an UNPIVOT still reads a parameter in an expression entry as a second source column at
-# CREATE, where a prepared parameter passes
-statement error
+# the column count check of an UNPIVOT counts only source columns, so a parameter in an expression entry is accepted
+statement ok
 CREATE MACRO unpivot_expression_table(p) AS TABLE (UNPIVOT wide ON (a + p) AS ap, b INTO NAME n VALUE val);
-----
-UNPIVOT clause must contain exactly one column
 
-statement error
-CREATE MACRO unpivot_expression_pick(p) AS (SELECT sum(val) FROM (UNPIVOT wide ON (a + p) AS ap, b INTO NAME n VALUE val));
+query II
+SELECT n, val FROM unpivot_expression_table(100) ORDER BY n;
 ----
-UNPIVOT clause must contain exactly one column
+ap	110
+b	20
+
+statement ok
+CREATE MACRO unpivot_expression_pick(p) AS (SELECT sum(val) FROM (UNPIVOT wide ON (a + p) AS ap, b INTO NAME n VALUE val));
+
+query I
+SELECT unpivot_expression_pick(100);
+----
+130
 
 statement ok
 PREPARE unpivot_prepared AS SELECT n, val FROM (UNPIVOT wide ON (a + $1) AS ap, b INTO NAME n VALUE val) ORDER BY n;
