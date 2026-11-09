@@ -10,6 +10,7 @@
 
 #include "json_common.hpp"
 #include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "json_enums.hpp"
 #include "duckdb/common/types/type_map.hpp"
@@ -29,20 +30,26 @@ public:
 		return HasFormats(candidate_formats, type);
 	}
 
-	const StrpTimeFormat &GetFormat(LogicalTypeId type) const {
-		D_ASSERT(candidate_formats.find(type) != candidate_formats.end());
-		return candidate_formats.find(type)->second.back();
-	}
-
 	const vector<StrpTimeFormat> &GetFormats(LogicalTypeId type) const {
 		D_ASSERT(candidate_formats.find(type) != candidate_formats.end());
 		return candidate_formats.find(type)->second;
 	}
 
-	//! Whether the plain cast is a candidate for type too, preferred below every format
+	//! Whether the plain cast is a candidate for type too
 	bool CastIsCandidate(LogicalTypeId type) const {
 		return cast_candidates.find(type) != cast_candidates.end();
 	}
+
+	//! Whether the candidate, the format at format_index or the plain cast when it is invalid, reads input
+	bool CandidateReads(optional_idx format_index, const string_t &input, date_t &result,
+	                    optional_ptr<string> error_message) const;
+	bool CandidateReads(optional_idx format_index, const string_t &input, timestamp_t &result,
+	                    optional_ptr<string> error_message) const;
+
+private:
+	bool HasTwoDigitYear(LogicalTypeId type, const string_t &input) const;
+	bool FourDigitYearReads(LogicalTypeId type, optional_idx format_index, const string_t &input, int32_t year,
+	                        optional_ptr<string> error_message) const;
 
 public:
 	static void AddFormat(type_id_map_t<vector<StrpTimeFormat>> &candidate_formats, LogicalTypeId type,
@@ -86,14 +93,9 @@ public:
 		return date_format_map.CastIsCandidate(type);
 	}
 
-	bool GetFormatAtIndex(LogicalTypeId type, idx_t index, StrpTimeFormat &format) {
-		lock_guard<mutex> lock(format_lock);
-		auto &formats = date_format_map.candidate_formats.at(type);
-		if (index >= formats.size()) {
-			return false;
-		}
-		format = formats[index];
-		return true;
+	//! The formats do not change once InitializeFormats built them, so matching values needs no lock
+	const DateFormatMap &GetDateFormatMap() const {
+		return date_format_map;
 	}
 
 private:
