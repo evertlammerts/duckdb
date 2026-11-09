@@ -222,6 +222,9 @@ public:
 	unordered_map<idx_t, FullLinePosition> line_positions_per_row;
 	bool added_last_line = false;
 	bool quoted_new_line = false;
+	//! Column and start of a value added while its quote was still open at the end of the buffer's data
+	optional_idx open_quote_col_id;
+	LinePosition open_quote_start;
 
 	//! If we are trying a row or not when figuring out the next row to start from.
 	bool try_row = false;
@@ -280,6 +283,8 @@ public:
 	//! Handles EmptyLine states
 	static inline bool EmptyLine(StringValueResult &result, const idx_t buffer_pos);
 	inline bool AddRowInternal();
+	//! Where the current line ends, at the iterator but never past the buffer's data
+	LinePosition CurrentLineEnd() const;
 	//! Marks the columns of a borked row that were never written as NULL
 	void InvalidateUnwrittenColumns(idx_t first_unwritten_col);
 	//! Force the throw of a Unicode error

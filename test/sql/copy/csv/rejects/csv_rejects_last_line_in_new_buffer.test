@@ -295,42 +295,15 @@ DROP TABLE reject_errors;
 statement ok
 DROP TABLE reject_scans;
 
-# whether the full last buffer of a compressed file is known to be the last depends on timing; either way the line takes one row
-query II
-SELECT count(*), sum(c) FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote_full_buffer_full_chunk.csv.gz',
-    columns={'c': 'INTEGER'}, auto_detect=false, buffer_size=4094, store_rejects=true);
-----
-2047	2047
-
+# a relaxed read accepts the open quote and keeps the value
 query I
-SELECT DISTINCT line FROM reject_errors;
-----
-2048
-
-statement ok
-DROP TABLE reject_errors;
-
-statement ok
-DROP TABLE reject_scans;
-
-query I
-SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote_full_buffer.csv.gz', columns={'c': 'INTEGER'},
-    auto_detect=false, buffer_size=6, store_rejects=true);
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote.csv', columns={'c': 'VARCHAR'},
+    auto_detect=false, buffer_size=6, strict_mode=false);
 ----
 1
 2
 3
-
-query I
-SELECT DISTINCT line FROM reject_errors;
-----
-4
-
-statement ok
-DROP TABLE reject_errors;
-
-statement ok
-DROP TABLE reject_scans;
+ab
 
 # a quoted value that is still open at the end of a buffer in the middle of the file is not dropped
 query II
@@ -569,3 +542,43 @@ query III
 SELECT line, byte_position, csv_line FROM reject_errors ORDER BY ALL;
 ----
 2048	4095	abc
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+# with one thread nothing reads past the full last buffer of a compressed file before it is scanned, so the open value
+# is parsed as if the line went on: it brings its own cast error, and the line still takes one row
+query I
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote_full_buffer.csv.gz', columns={'c': 'INTEGER'},
+    auto_detect=false, buffer_size=6, store_rejects=true);
+----
+1
+2
+3
+
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, csv_line FROM reject_errors ORDER BY ALL;
+----
+4	7	7	1	CAST	"abcde
+4	7	7	1	UNQUOTED VALUE	"abcde
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query II
+SELECT count(*), sum(c) FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote_full_buffer_full_chunk.csv.gz',
+    columns={'c': 'INTEGER'}, auto_detect=false, buffer_size=4094, store_rejects=true);
+----
+2047	2047
+
+query IIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type FROM reject_errors ORDER BY ALL;
+----
+2048	4095	4095	1	CAST
+2048	4095	4095	1	UNQUOTED VALUE
