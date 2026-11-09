@@ -559,28 +559,18 @@ static void BindPivotConstantInList(unique_ptr<ParsedExpression> &expr, vector<V
 }
 
 static void BindPivotInList(unique_ptr<ParsedExpression> &expr, vector<Value> &values, Binder &binder) {
-	switch (expr->GetExpressionType()) {
-	case ExpressionType::COLUMN_REF: {
-		auto &colref = expr->Cast<ColumnRefExpression>();
+	PivotColumnEntry::EnumeratePivotInListElements(expr, [&](unique_ptr<ParsedExpression> &element) {
+		if (element->GetExpressionType() != ExpressionType::COLUMN_REF) {
+			BindPivotConstantInList(element, values, binder);
+			return;
+		}
+		auto &colref = element->Cast<ColumnRefExpression>();
 		if (colref.IsQualified()) {
-			throw BinderException(expr->GetQueryLocation(), "PIVOT IN list cannot contain qualified column references");
+			throw BinderException(element->GetQueryLocation(),
+			                      "PIVOT IN list cannot contain qualified column references");
 		}
 		values.emplace_back(colref.GetColumnName());
-	} break;
-	case ExpressionType::FUNCTION: {
-		auto &function = expr->Cast<FunctionExpression>();
-		if (function.FunctionName() == "row") {
-			for (auto &child : function.GetArgumentsMutable()) {
-				BindPivotInList(child.GetExpressionMutable(), values, binder);
-			}
-		} else {
-			BindPivotConstantInList(expr, values, binder);
-		}
-	} break;
-	default: {
-		BindPivotConstantInList(expr, values, binder);
-	} break;
-	}
+	});
 }
 
 unique_ptr<SelectNode> Binder::BindPivot(PivotRef &ref, vector<unique_ptr<ParsedExpression>> all_columns) {

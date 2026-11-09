@@ -175,6 +175,20 @@ bool PivotColumnEntry::TryExtractUnpivotColumnList(const ParsedExpression &expr,
 	}
 }
 
+void PivotColumnEntry::EnumeratePivotInListElements(
+    unique_ptr<ParsedExpression> &expr, const std::function<void(unique_ptr<ParsedExpression> &element)> &callback) {
+	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
+		auto &function = expr->Cast<FunctionExpression>();
+		if (function.FunctionName() == "row") {
+			for (auto &child : function.GetArgumentsMutable()) {
+				EnumeratePivotInListElements(child.GetExpressionMutable(), callback);
+			}
+			return;
+		}
+	}
+	callback(expr);
+}
+
 static bool TryFoldForBackwardsCompatibility(const unique_ptr<ParsedExpression> &expr, vector<Value> &values) {
 	if (!expr) {
 		return true;
