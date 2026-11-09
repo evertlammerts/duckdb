@@ -582,3 +582,43 @@ SELECT line, line_byte_position, byte_position, column_idx, error_type FROM reje
 ----
 2048	4095	4095	1	CAST
 2048	4095	4095	1	UNQUOTED VALUE
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+# an escaped quote that leaves the value open in a column parsed directly brings its cast error before the value ends
+query I
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/escaped_quote_full_buffer.csv.gz', columns={'c': 'INTEGER'},
+    auto_detect=false, buffer_size=6, store_rejects=true);
+----
+1
+2
+3
+
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, csv_line FROM reject_errors ORDER BY ALL;
+----
+4	7	7	1	CAST	"a""bc
+4	7	7	1	UNQUOTED VALUE	"a""bc
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+# the open value is in the second column
+query I
+SELECT a FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote_two_columns_full_buffer.csv.gz',
+    columns={'a': 'INTEGER', 'b': 'VARCHAR'}, auto_detect=false, buffer_size=10, store_rejects=true);
+----
+1
+2
+
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, csv_line FROM reject_errors ORDER BY ALL;
+----
+3	9	11	2	UNQUOTED VALUE	3,"abcdefghi

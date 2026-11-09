@@ -1538,6 +1538,11 @@ void StringValueScanner::ProcessOverBufferValue() {
 	                               state_machine->dialect_options.state_machine_options.strict_mode.GetValue();
 	// a quote still open at the end of the file ends no value, the end of file branch reports it as unterminated
 	const bool unterminated_quote = quote_open_at_end && cur_buffer_handle->is_last_buffer;
+	if (quote_open_at_end && !unterminated_quote) {
+		// sequential input learns that a full buffer is the last only from the next read, see FinishBoundaryScan
+		result.open_quote_col_id = value_col_id;
+		result.open_quote_start = value_start;
+	}
 	bool skip_value = unterminated_quote;
 	if (!skip_value && result.projecting_columns) {
 		if (result.cur_col_id < result.number_of_columns && !result.projected_columns[result.cur_col_id]) {
@@ -1664,11 +1669,6 @@ void StringValueScanner::ProcessOverBufferValue() {
 	} else if (unterminated_quote) {
 		// the unterminated value is reported where it starts, which last_position still holds
 		++iterator.pos.buffer_pos;
-	} else if (quote_open_at_end) {
-		// sequential input learns that a full buffer is the last only from the next read, see FinishBoundaryScan
-		result.open_quote_col_id = value_col_id;
-		result.open_quote_start = value_start;
-		result.last_position = {iterator.pos.buffer_idx, ++iterator.pos.buffer_pos, result.buffer_size};
 	} else {
 		result.last_position = {iterator.pos.buffer_idx, ++iterator.pos.buffer_pos, result.buffer_size};
 	}
