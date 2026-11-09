@@ -117,8 +117,18 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 				if (!entry.expr) {
 					continue;
 				}
+				if (!is_unpivot) {
+					PivotColumnEntry::EnumeratePivotInListElements(
+					    entry.expr, [&](unique_ptr<ParsedExpression> &element) {
+						    // the binder reads a column reference here as a name, never as a column
+						    if (element->GetExpressionType() != ExpressionType::COLUMN_REF) {
+							    expr_callback(element);
+						    }
+					    });
+					continue;
+				}
 				vector<Identifier> column_names;
-				if (is_unpivot && PivotColumnEntry::TryExtractUnpivotColumnList(*entry.expr, column_names)) {
+				if (PivotColumnEntry::TryExtractUnpivotColumnList(*entry.expr, column_names)) {
 					// the binder reads this entry as source column names, which a rewrite would change
 					continue;
 				}

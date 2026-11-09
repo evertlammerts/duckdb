@@ -239,19 +239,6 @@ SELECT rn, cls FROM (VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)) t(rn,v) M
 5	C
 6	D
 
-# a navigation over a union reads the last row mapped to any member; the row being tested is one of
-# them, so the row before it is at offset one
-query IT
-SELECT rn, cls FROM (VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)) t(rn,v) MATCH_RECOGNIZE(
-    ORDER BY rn MEASURES CLASSIFIER() AS cls ALL ROWS PER MATCH
-    PATTERN (A B+) SUBSET U = (A, B) DEFINE A AS v < 15, B AS v > LAST(U.v, 1) AND v < 50
-) ORDER BY rn
-----
-1	A
-2	B
-3	B
-4	B
-
 # an ordinary reference to a union is the last row mapped to any member so far (5.7)
 query IT
 SELECT rn, cls FROM (VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)) t(rn,v) MATCH_RECOGNIZE(

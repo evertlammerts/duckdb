@@ -135,6 +135,25 @@ TEST_CASE("ParsedExpressionIterator visits UNPIVOT entry expressions but not UNP
 	}
 }
 
+TEST_CASE("ParsedExpressionIterator visits PIVOT IN expressions but not PIVOT IN names", "[api][parser]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	// p, q, r and s are names the binder reads as their own spelling; c and d sit inside expressions it folds
+	for (auto &sql : {string("SELECT * FROM (SELECT 1 AS k, 2 AS n, 3 AS v) PIVOT (max(v) FOR (k, n) IN ((p, 1 + $1), "
+	                         "(row(q, 2), c + 1), (r, s), upper(d)))"),
+	                  string("SELECT * FROM (PIVOT (SELECT 1 AS k, 2 AS n, 3 AS v) ON (k, n) IN ((p, 1 + $1), "
+	                         "(row(q, 2), c + 1), (r, s), upper(d)) USING max(v))")}) {
+		RequireWalkFindsEveryParameter(con, sql, 1);
+		auto expected =
+		    identifier_set_t {Identifier("k"), Identifier("n"), Identifier("v"), Identifier("c"), Identifier("d")};
+		auto statement = ParseSelect(con, sql);
+		CHECK(WalkedColumnNames(*statement) == expected);
+		auto reparsed = ParseSelect(con, statement->ToString());
+		CHECK(WalkedColumnNames(*reparsed) == expected);
+	}
+}
+
 TEST_CASE("ParsedExpressionIterator reports the table references inside a MATCH_RECOGNIZE input", "[api][parser]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -200,4 +219,27 @@ TEST_CASE("Table references that differ only in an iterated expression are not e
 	REQUIRE(join.Equals(*other));
 	other->Cast<JoinRef>().duplicate_eliminated_columns[0] = MakeParameter("2");
 	CHECK(!join.Equals(*other));
+}
+
+TEST_CASE("A prepared CREATE MACRO refuses a parameter in every position of a table macro body", "[api][parser]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	// SQL PREPARE refuses a CREATE statement, so only the API reaches the check of the macro body
+	for (auto &sql :
+	     {string("CREATE MACRO m() AS TABLE SELECT * FROM (VALUES (1)) t(x) WHERE x = $1::INT"),
+	      string("CREATE MACRO m() AS TABLE SELECT * FROM t AT (VERSION => $1::BIGINT)"),
+	      string("CREATE MACRO m() AS TABLE SELECT b.v FROM (VALUES (0)) a(z) JOIN (VALUES (4), (10)) b(v) "
+	             "NEAREST 1 BY DISTANCE abs(b.v - $1::INT)"),
+	      string("CREATE MACRO m() AS TABLE SELECT * FROM (PIVOT (SELECT 7 AS v, 1 AS a) ON (a + $1::INT) IN (2) "
+	             "USING max(v))"),
+	      string("CREATE MACRO m() AS TABLE SELECT m FROM (SELECT $1::INT AS x) t MATCH_RECOGNIZE (MEASURES "
+	             "FIRST(x) AS m ONE ROW PER MATCH PATTERN (A) DEFINE A AS true)")}) {
+		INFO(sql);
+		auto prepared = con.Prepare(sql);
+		REQUIRE(prepared->HasError());
+		CHECK(StringUtil::Contains(prepared->GetError(), "Parameter expressions within macro's are not supported!"));
+		auto stored = con.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = 'm'");
+		REQUIRE(CHECK_COLUMN(stored, 0, {0}));
+	}
 }

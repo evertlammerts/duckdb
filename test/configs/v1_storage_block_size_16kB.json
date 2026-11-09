@@ -27,7 +27,7 @@
     {
       "reason": "A NEAREST BY join in a macro body is only serialized with storage version v2.0.0 or higher.",
       "paths": [
-        "test/sql/catalog/function/test_macro_parameter_positions.test"
+        "test/sql/catalog/function/test_macro_parameter_positions_nearest.test"
       ]
     },
     {

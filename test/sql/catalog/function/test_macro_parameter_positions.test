@@ -1,46 +1,6 @@
 # name: test/sql/catalog/function/test_macro_parameter_positions.test
-# description: A macro parameter is substituted in every expression of a NEAREST join, a PIVOT, an UNPIVOT and a MATCH_RECOGNIZE, never in an UNPIVOT column name
+# description: A macro parameter is substituted in a PIVOT ON or aggregate expression, an UNPIVOT COLUMNS lambda and a MATCH_RECOGNIZE input and clause, never in a PIVOT IN name or an UNPIVOT column name; CREATE still refuses one in a PIVOT IN expression or an UNPIVOT expression entry
 # group: [function]
-
-statement ok
-CREATE MACRO rank_pick(c) AS (SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - c));
-
-query II
-SELECT rank_pick(100), rank_pick(0);
-----
-10	4
-
-query I
-SELECT rank_pick(NULL);
-----
-NULL
-
-# a caller column of the parameter's name does not capture the parameter
-query I
-SELECT rank_pick(100) FROM (SELECT 4::BIGINT AS c) s;
-----
-10
-
-query II
-SELECT c, rank_pick(c) FROM (VALUES (0::BIGINT), (100::BIGINT)) s(c) ORDER BY c;
-----
-0	4
-100	10
-
-query II
-SELECT b, rank_pick(b + 1) FROM (VALUES (0::BIGINT), (100::BIGINT)) s(b) ORDER BY b;
-----
-0	4
-100	10
-
-# the same parameter in ORDER BY is the control
-statement ok
-CREATE MACRO order_pick(c) AS (SELECT t.v FROM (VALUES (4::BIGINT), (10::BIGINT)) t(v) ORDER BY abs(t.v - c) LIMIT 1);
-
-query I
-SELECT order_pick(100) FROM (SELECT 4::BIGINT AS c) s;
-----
-10
 
 statement ok
 CREATE MACRO pivot_pick(a) AS (SELECT coalesce("1", 0::BIGINT) FROM (PIVOT (SELECT 7::BIGINT AS v) ON a IN (1) USING max(v)));
@@ -90,14 +50,6 @@ NULL
 
 # table macros with the same bodies
 statement ok
-CREATE MACRO rank_table(c) AS TABLE SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - c);
-
-query I
-FROM rank_table(100);
-----
-10
-
-statement ok
 CREATE MACRO pivot_table(a) AS TABLE SELECT coalesce("1", 0::BIGINT) AS r FROM (PIVOT (SELECT 7::BIGINT AS v) ON a IN (1) USING max(v));
 
 query II
@@ -113,15 +65,7 @@ FROM match_table(2);
 ----
 2
 
-# a name in a PIVOT IN list stays a name, and an AT clause takes no column, as before
-statement ok
-CREATE MACRO in_table(p) AS TABLE PIVOT (SELECT 7::BIGINT AS v, 2::BIGINT AS a) ON a IN (p) USING max(v);
-
-query I
-SELECT p FROM in_table(2);
-----
-NULL
-
+# an AT clause takes no column, as before
 statement ok
 CREATE TABLE at_source AS SELECT 1 AS i;
 
@@ -140,14 +84,6 @@ FROM key_table(5);
 1	3
 
 # a prepared statement parameter in the same positions
-statement ok
-PREPARE rank_prepared AS SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - $1::BIGINT);
-
-query I
-EXECUTE rank_prepared(100);
-----
-10
-
 statement ok
 PREPARE pivot_prepared AS SELECT coalesce("1", 0::BIGINT) FROM (PIVOT (SELECT 7::BIGINT AS v) ON (v - 7 + $1::BIGINT) IN (1) USING max(v));
 
@@ -169,7 +105,7 @@ EXECUTE match_prepared(2);
 ----
 2
 
-# table macros with a parameter in a PIVOT ON expression and a NEAREST ranking expression
+# a table macro with a parameter in a PIVOT ON expression
 statement ok
 CREATE TABLE pivot_source(k INT, c INT, v INT);
 
@@ -191,32 +127,88 @@ SELECT * FROM pivot_on_table(0) ORDER BY k;
 1	20	NULL
 2	NULL	NULL
 
+# a name in a PIVOT IN entry, alone or in a tuple at any depth, is a value spelled like it, so a parameter of the
+# same name does not replace it; the other elements of the entry are constant expressions
 statement ok
-CREATE TABLE near_left(id INT, v INT);
+CREATE MACRO in_table(p) AS TABLE PIVOT (SELECT 7::BIGINT AS v, 2::BIGINT AS a) ON a IN (p) USING max(v);
+
+query I
+SELECT p FROM in_table(2);
+----
+NULL
 
 statement ok
-INSERT INTO near_left VALUES (1, 5), (2, 9);
+CREATE MACRO in_pick(p) AS (SELECT * FROM (VALUES ('p', 7)) t(k, v) PIVOT (max(v) FOR k IN (p)));
+
+query I
+SELECT in_pick('x');
+----
+7
 
 statement ok
-CREATE TABLE near_right(id INT, v INT);
+CREATE MACRO in_constant_table(p) AS TABLE SELECT * FROM (VALUES (1, 7)) t(k, v) PIVOT (max(v + p) FOR k IN (1));
+
+query I
+FROM in_constant_table(100);
+----
+107
 
 statement ok
-INSERT INTO near_right VALUES (1, 6), (2, 100);
-
-statement ok
-CREATE MACRO nearest_table(x) AS TABLE (SELECT near_left.id, near_right.id AS bid FROM near_left JOIN near_right NEAREST 1 BY DISTANCE abs(near_right.v - x));
+CREATE MACRO mixed_pick(p) AS (SELECT * FROM (VALUES ('p', 1, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN ((p, 1))));
 
 query II
-SELECT * FROM nearest_table(7) ORDER BY id;
+SELECT mixed_pick('x'), mixed_pick(NULL);
 ----
-1	1
-2	1
+7	7
 
-query II
-SELECT * FROM nearest_table(90) ORDER BY id;
+statement ok
+CREATE MACRO mixed_table(p) AS TABLE SELECT * FROM (VALUES ('p', 1, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN ((p, 1)));
+
+query I
+FROM mixed_table('x');
 ----
-1	2
-2	2
+7
+
+statement ok
+CREATE MACRO mixed_expression_pick(p) AS (SELECT * FROM (VALUES ('p', 2, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN ((p, 1 + 1))));
+
+query I
+SELECT mixed_expression_pick('x');
+----
+7
+
+statement ok
+CREATE MACRO mixed_expression_table(p) AS TABLE SELECT * FROM (VALUES ('p', 2, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN ((p, 1 + 1)));
+
+query I
+FROM mixed_expression_table('x');
+----
+7
+
+statement ok
+CREATE MACRO nested_row_table(p) AS TABLE SELECT * FROM (VALUES ('p', 1, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN (row(row(p), 1)));
+
+query I
+FROM nested_row_table('x');
+----
+7
+
+# the control, outside a macro
+query I
+SELECT * FROM (VALUES ('p', 1, 7)) t(k, n, v) PIVOT (max(v) FOR (k, n) IN ((p, 1)));
+----
+7
+
+# the constant binder of a PIVOT IN list still refuses a parameter as a column at CREATE
+statement error
+CREATE MACRO in_expression_table(p) AS TABLE PIVOT pivot_source ON c IN (p + 0, 2) USING sum(v) GROUP BY k;
+----
+PIVOT IN list cannot contain column names
+
+statement error
+CREATE MACRO in_expression_pick(p) AS (SELECT k FROM (PIVOT pivot_source ON c IN (p + 0, 2) USING sum(v) GROUP BY k));
+----
+PIVOT IN list cannot contain column names
 
 # a parameter in MATCH_RECOGNIZE DEFINE and MEASURES, in a table macro and in a scalar macro subquery
 statement ok
@@ -284,6 +276,27 @@ statement error
 CREATE MACRO unpivot_name_pick(a) AS (SELECT sum(val) FROM (UNPIVOT wide ON a, b INTO NAME n VALUE val));
 ----
 Conflicting column names for column a!
+
+# the column count check of an UNPIVOT still reads a parameter in an expression entry as a second source column at
+# CREATE, where a prepared parameter passes
+statement error
+CREATE MACRO unpivot_expression_table(p) AS TABLE (UNPIVOT wide ON (a + p) AS ap, b INTO NAME n VALUE val);
+----
+UNPIVOT clause must contain exactly one column
+
+statement error
+CREATE MACRO unpivot_expression_pick(p) AS (SELECT sum(val) FROM (UNPIVOT wide ON (a + p) AS ap, b INTO NAME n VALUE val));
+----
+UNPIVOT clause must contain exactly one column
+
+statement ok
+PREPARE unpivot_prepared AS SELECT n, val FROM (UNPIVOT wide ON (a + $1) AS ap, b INTO NAME n VALUE val) ORDER BY n;
+
+query II
+EXECUTE unpivot_prepared(100);
+----
+ap	110
+b	20
 
 statement ok
 CREATE TABLE wide_pairs(id INT, a1 INT, a2 INT, b1 INT);
