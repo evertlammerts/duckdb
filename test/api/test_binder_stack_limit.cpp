@@ -78,6 +78,14 @@ bool RunOnSmallStack(SmallStackQuery &query) {
 	CloseHandle(thread);
 	return true;
 }
+
+// Windows rounds a stack reservation up to its allocation granularity, so sizes in between give the same stack.
+idx_t PageMultiple(idx_t size) {
+	SYSTEM_INFO info;
+	GetSystemInfo(&info);
+	auto granularity = static_cast<idx_t>(info.dwAllocationGranularity);
+	return (size + granularity - 1) / granularity * granularity;
+}
 #else
 void *RunQueryThread(void *argument) {
 	RunQuery(*static_cast<SmallStackQuery *>(argument));
@@ -107,10 +115,17 @@ bool RunOnSmallStack(SmallStackQuery &query) {
 	munmap(mapping, mapping_size);
 	return created;
 }
+
+// pthread_attr_setstack on Apple platforms takes only whole pages, which are 16 KiB on Apple silicon.
+idx_t PageMultiple(idx_t size) {
+	auto queried = sysconf(_SC_PAGESIZE);
+	auto page_size = queried > 0 ? static_cast<idx_t>(queried) : idx_t(4096);
+	return (size + page_size - 1) / page_size * page_size;
+}
 #endif
 
 SmallStackQuery QueryOnSmallStack(Connection &con, const string &sql, idx_t stack_size) {
-	SmallStackQuery query {con, sql, stack_size};
+	SmallStackQuery query {con, sql, PageMultiple(stack_size)};
 	REQUIRE(RunOnSmallStack(query));
 	return query;
 }
@@ -375,7 +390,7 @@ TEST_CASE("Ordinary queries bind on a small stack", "[api]") {
 	}
 }
 
-// Each depth puts the last check at another point of the stack, so a reserve too small for some leaf crashes at one.
+// Each depth puts the last check at another point of the stack, so a reserve well below a leaf's need crashes at one.
 TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -394,9 +409,15 @@ TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[a
 	CreateChain(con, "VIEW w%d AS ", table_function_leaf, "SELECT * FROM w%d", DEEP_NEST);
 	const vector<std::pair<string, string>> chains {{"v", "42"}, {"w", table_function_value}};
 
-	// the floor sets the reserve on all of these stacks, and an eighth of most is less than the read_csv leaf needs
+	// the floor sets the reserve on all of these stacks, and an eighth of most is less than the read_csv leaf needs;
+	// with 4 KiB pages they are every 4 KiB from 128 to 188 KiB, with 16 KiB pages 128, 144, 160, 176 and 192 KiB
+	idx_t previous_size = 0;
 	for (idx_t stack_kib = 128; stack_kib <= 188; stack_kib += 4) {
-		auto stack_size = stack_kib * 1024 * STACK_FRAME_SCALE;
+		auto stack_size = PageMultiple(stack_kib * 1024 * STACK_FRAME_SCALE);
+		if (stack_size == previous_size) {
+			continue;
+		}
+		previous_size = stack_size;
 		for (auto &chain : chains) {
 			bool refused = false;
 			for (idx_t depth = 0; depth <= DEEP_NEST && !refused; depth++) {
