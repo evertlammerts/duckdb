@@ -17,8 +17,8 @@ query II rowsort
 SELECT union_tag(u) as tag, u as val FROM tbl;
 ----
 NULL	NULL
+NULL	NULL
+NULL	NULL
 a	1
-a	NULL
-b	NULL
 
 

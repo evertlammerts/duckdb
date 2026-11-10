@@ -216,24 +216,8 @@ static bool ToUnionMemberCast(Vector &source, Vector &result, idx_t count, CastP
 
 	CastParameters child_parameters(parameters, member_cast_info.GetCastData(), parameters.local_state);
 	bool all_converted = member_cast_info.Cast(source, selected_member_vector, count, child_parameters);
-	UnionVector::SetToMember(result, cast_data.tag_map[0], selected_member_vector, count, true);
-	if (!all_converted) {
-		// rows that failed to cast (under TRY_CAST) are NULL in the member - make the union NULL as well
-		auto source_validity = source.Validity();
-		auto member_validity = selected_member_vector.Validity();
-		if (result.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-			if (source_validity.IsValid(0) && !member_validity.IsValid(0)) {
-				ConstantVector::SetNull(result, count_t(count));
-			}
-		} else {
-			for (idx_t row_idx = 0; row_idx < count; row_idx++) {
-				if (source_validity.IsValid(row_idx) && !member_validity.IsValid(row_idx)) {
-					FlatVector::SetNull(result, row_idx, true);
-				}
-			}
-		}
-	}
-
+	// A NULL member, from a NULL input row or a row that failed under TRY_CAST, makes the union and its tag NULL.
+	UnionVector::SetToMember(result, cast_data.tag_map[0], selected_member_vector, count, false);
 	result.Verify();
 
 	return all_converted;

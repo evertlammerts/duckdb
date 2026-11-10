@@ -149,7 +149,7 @@ SELECT to_json(union_value(b := 'abc')::UNION(a INTEGER, b VARCHAR, c FLOAT))
 query I
 select to_json(i::UNION(a varchar, b bool)) from (VALUES (null), ('test')) tbl(i);
 ----
-{"a":null}
+NULL
 {"a":"test"}
 
 query I

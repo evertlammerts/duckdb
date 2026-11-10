@@ -1,0 +1,248 @@
+# name: test/sql/types/union/array_of_union_null_row_cast.test
+# description: Casts to an ARRAY of UNION keep every element of a NULL array row NULL
+# group: [union]
+
+statement ok
+SET debug_verification_mode = 'verify_vectors';
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (VALUES (NULL)) t(x)
+----
+NULL
+
+# a NULL row next to a valid row
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (VALUES (NULL::INTEGER[2]), ([1, 2]), (NULL), ([3, NULL]), (NULL)) t(x)
+----
+NULL
+[1, 2]
+NULL
+[3, NULL]
+NULL
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (VALUES (['a', 'b']::VARCHAR[2]), (NULL), ([NULL, 'c'])) t(x)
+----
+[a, b]
+NULL
+[NULL, c]
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[1] FROM (VALUES ([1]::INTEGER[1]), (NULL)) t(x)
+----
+[1]
+NULL
+
+query I
+SELECT TRY_CAST(x AS UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+# to VARCHAR, as the shell renders it, and to LIST
+query I
+SELECT (x::UNION(i INTEGER, s VARCHAR)[2])::VARCHAR FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT (x::UNION(i INTEGER, s VARCHAR)[2])::VARCHAR[2] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT (x::UNION(i INTEGER, s VARCHAR)[2])::UNION(i INTEGER, s VARCHAR)[] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+# UNION to UNION elements, and a UNION member inside the UNION element
+query I
+SELECT (x::UNION(i INTEGER, s VARCHAR)[2])::UNION(i BIGINT, s VARCHAR, d DOUBLE)[2] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT x::UNION(u UNION(i INTEGER, s VARCHAR), d DOUBLE)[2] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+# nested: ARRAY in ARRAY, in LIST, in STRUCT, in a UNION member, in a MAP value
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2][2] FROM (VALUES ([[1, 2], [3, 4]]::INTEGER[2][2]), (NULL), ([NULL, [5, 6]])) t(x)
+----
+[[1, 2], [3, 4]]
+NULL
+[NULL, [5, 6]]
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2][] FROM (VALUES ([[1, 2], NULL]::INTEGER[2][]), (NULL), ([NULL, [5, 6]])) t(x)
+----
+[[1, 2], NULL]
+NULL
+[NULL, [5, 6]]
+
+query I
+SELECT x::STRUCT(a UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES ({'a': [1, 2]::INTEGER[2]}), ({'a': NULL})) t(x)
+----
+{'a': [1, 2]}
+{'a': NULL}
+
+query I
+SELECT x::UNION(a UNION(i INTEGER, s VARCHAR)[2], b VARCHAR) FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT x::MAP(VARCHAR, UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES (MAP {'k': [1, 2]::INTEGER[2], 'n': NULL})) t(x)
+----
+{k=[1, 2], n=NULL}
+
+# VARCHAR to ARRAY: a NULL string, a size mismatch and an unparsable string under TRY_CAST
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (VALUES ('[1, 2]'), (NULL), ('[NULL, x]')) t(x)
+----
+[1, 2]
+NULL
+[NULL, x]
+
+query I
+SELECT TRY_CAST(x AS UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES ('[1, 2, 3]'), ('[1, 2]')) t(x)
+----
+NULL
+[1, 2]
+
+query I
+SELECT TRY_CAST(x AS UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES ('[1, 2'), ('[3, 4]')) t(x)
+----
+NULL
+[3, 4]
+
+# a constant VARCHAR input runs the same loop on one row
+query I
+SELECT TRY_CAST(c AS UNION(i INTEGER, s VARCHAR)[2]) FROM (SELECT '[1, 2, 3]' c FROM range(3))
+----
+NULL
+NULL
+NULL
+
+query I
+SELECT TRY_CAST(c AS UNION(i INTEGER, s VARCHAR)[2]) FROM (SELECT '[1, 2' c FROM range(3))
+----
+NULL
+NULL
+NULL
+
+query I
+SELECT x::STRUCT(a UNION(i INTEGER, s VARCHAR)[2]) FROM (VALUES ('{a: [1, 2]}'), ('{a: NULL}')) t(x)
+----
+{'a': [1, 2]}
+{'a': NULL}
+
+# a flat input over several vectors with alternating NULL rows, a filtered (dictionary) input and a stored table
+statement ok
+CREATE TABLE src AS SELECT r AS id, CASE WHEN r % 2 = 1 THEN NULL ELSE [r, r + 1]::INTEGER[2] END AS x FROM range(5000) t(r)
+
+query III
+SELECT count(*), count(c), sum(union_extract(c[2], 'i')) FROM (SELECT x::UNION(i INTEGER, s VARCHAR)[2] c FROM src)
+----
+5000	2500	6250000
+
+query I
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM src LIMIT 4 OFFSET 2046
+----
+[2046, 2047]
+NULL
+[2048, 2049]
+NULL
+
+query I rowsort
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM src WHERE id % 4 IN (0, 3) AND id < 10
+----
+NULL
+NULL
+[0, 1]
+[4, 5]
+[8, 9]
+
+statement ok
+CREATE TABLE dst AS SELECT id, x::UNION(i INTEGER, s VARCHAR)[2] AS u FROM src
+
+query II rowsort
+SELECT id, u FROM dst WHERE id < 4
+----
+0	[0, 1]
+1	NULL
+2	[2, 3]
+3	NULL
+
+query II rowsort
+SELECT id, u::UNION(i BIGINT, s VARCHAR)[2] FROM dst WHERE id BETWEEN 4997 AND 4999
+----
+4997	NULL
+4998	[4998, 4999]
+4999	NULL
+
+statement ok
+CREATE TABLE nulls AS SELECT NULL::VARCHAR v, NULL::INTEGER[2] a FROM range(3000)
+
+query II
+SELECT count(v::UNION(i INTEGER, s VARCHAR)[2]), count(a::UNION(i INTEGER, s VARCHAR)[2]) FROM nulls
+----
+0	0
+
+query II
+SELECT v::UNION(i INTEGER, s VARCHAR)[2], a::UNION(i INTEGER, s VARCHAR)[2] FROM nulls LIMIT 2
+----
+NULL	NULL
+NULL	NULL
+
+# other element types are left as the element cast makes them
+query I
+SELECT x::BIGINT[2] FROM (VALUES ([1, 2]::INTEGER[2]), (NULL)) t(x)
+----
+[1, 2]
+NULL
+
+query I
+SELECT x::STRUCT(a BIGINT)[2] FROM (VALUES ([{'a': 1}, NULL]::STRUCT(a INTEGER)[2]), (NULL)) t(x)
+----
+[{'a': 1}, NULL]
+NULL
+
+# dictionary inputs
+statement ok
+SET debug_verify_vector = 'dictionary_expression'
+
+query I rowsort
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM src WHERE id < 4
+----
+NULL
+NULL
+[0, 1]
+[2, 3]
+
+query I rowsort
+SELECT x::UNION(i INTEGER, s VARCHAR)[2] FROM (SELECT x::VARCHAR x FROM src WHERE id < 4)
+----
+NULL
+NULL
+[0, 1]
+[2, 3]
+
+statement ok
+RESET debug_verify_vector
+
+statement ok
+RESET debug_verification_mode
