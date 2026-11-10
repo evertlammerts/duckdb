@@ -161,7 +161,7 @@ bool StackIsReported(Connection &con) {
 
 // The sanitizers and builds without optimization take several times the stack per frame, and under AddressSanitizer
 // the join order optimizer, which does not check the stack, overflows 256 KiB planning TPC-H query 2. The engine keeps
-// a larger reserve for these builds and for MSVC.
+// a larger reserve for these builds and on Windows.
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
     defined(DUCKDB_THREAD_SANITIZER)
 constexpr idx_t STACK_FRAME_SCALE = 4;
@@ -169,12 +169,12 @@ constexpr idx_t STACK_FRAME_SCALE = 4;
 #if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(thread_sanitizer) ||       \
     __has_feature(memory_sanitizer)
 constexpr idx_t STACK_FRAME_SCALE = 4;
-#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER)
+#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_WIN32)
 constexpr idx_t STACK_FRAME_SCALE = 4;
 #else
 constexpr idx_t STACK_FRAME_SCALE = 1;
 #endif
-#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER)
+#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_WIN32)
 constexpr idx_t STACK_FRAME_SCALE = 4;
 #else
 constexpr idx_t STACK_FRAME_SCALE = 1;
@@ -235,8 +235,10 @@ TEST_CASE("A nest deeper than the thread's stack raises the depth error", "[api]
 	}
 	SECTION("scalar macros") {
 		CreateChain(con, "MACRO m%d(x) AS ", "x", "m%d(x) + 1", DEEP_MACRO_NEST);
-		RequireStackError(con, StringUtil::Format("SELECT m%d(42)", DEEP_MACRO_NEST), MACRO_STACK_SIZE);
-		RequireValue(con, StringUtil::Format("SELECT m%d(42)", SHALLOW_NEST), "45", MACRO_STACK_SIZE);
+		RequireStackError(con, StringUtil::Format("SELECT m%d(42)", DEEP_MACRO_NEST),
+		                  MACRO_STACK_SIZE * STACK_FRAME_SCALE);
+		RequireValue(con, StringUtil::Format("SELECT m%d(42)", SHALLOW_NEST), "45",
+		             MACRO_STACK_SIZE * STACK_FRAME_SCALE);
 	}
 	// the connection is still usable on any thread
 	RequireValue(con, "SELECT 42", "42");
@@ -248,7 +250,7 @@ TEST_CASE("A deep expression raises the depth error on a small stack", "[api]") 
 	// under max_expression_depth, and binding the nest takes about 300 KiB of stack on a release build
 	constexpr idx_t DEEP_EXPRESSION_NEST = 200;
 	// small, so that the nest that overflows it is shallow and destroying it takes little stack
-	constexpr idx_t EXPRESSION_STACK_SIZE = 192 * 1024;
+	constexpr idx_t EXPRESSION_STACK_SIZE = 192 * 1024 * STACK_FRAME_SCALE;
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
@@ -392,8 +394,9 @@ TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[a
 	CreateChain(con, "VIEW w%d AS ", table_function_leaf, "SELECT * FROM w%d", DEEP_NEST);
 	const vector<std::pair<string, string>> chains {{"v", "42"}, {"w", table_function_value}};
 
-	for (idx_t stack_size : {idx_t(128) * 1024, idx_t(192) * 1024}) {
-		stack_size *= STACK_FRAME_SCALE;
+	// the floor sets the reserve on all of these stacks, and an eighth of most is less than the read_csv leaf needs
+	for (idx_t stack_kib = 128; stack_kib <= 188; stack_kib += 4) {
+		auto stack_size = stack_kib * 1024 * STACK_FRAME_SCALE;
 		for (auto &chain : chains) {
 			bool refused = false;
 			for (idx_t depth = 0; depth <= DEEP_NEST && !refused; depth++) {
