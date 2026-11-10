@@ -33,6 +33,15 @@ SELECT (SELECT SUM(i1.i)) FROM integers i1
 ----
 6
 
+# the IN operand is not walked for ownership, because the columns of the subquery would have to count as well
+query I
+SELECT (SELECT count(i1.i IN (SELECT r.range)) FROM range(3) r) FROM integers i1 ORDER BY 1
+----
+0
+3
+3
+3
+
 # one argument resolves in the subquery, so the aggregate stays there and only the
 # other argument is resolved against the outer scope
 query I
