@@ -1,6 +1,8 @@
 #include "duckdb/planner/column_qualifier.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -8,6 +10,7 @@
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/positional_reference_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/expression_binder/having_binder.hpp"
 #include "duckdb/planner/planner_extension.hpp"
@@ -316,30 +319,115 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	return func;
 }
 
-optional_idx ColumnQualifier::GetLambdaArgumentPosition(Binder &binder, const FunctionExpression &function) {
+//! Collects the parameters of a scalar macro that its body passes, directly or through another macro, to a lambda
+//! position, since macro expansion places the argument there before it binds
+static void CollectLambdaParameters(Binder &binder, ParsedExpression &expr, const identifier_set_t &parameters,
+                                    vector<identifier_set_t> &shadowed, identifier_set_t &result) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::FUNCTION: {
+		auto &function = expr.Cast<FunctionExpression>();
+		auto &arguments = function.GetArguments();
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			auto &argument = arguments[i].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				continue;
+			}
+			auto &col_ref = argument.Cast<ColumnRefExpression>();
+			if (col_ref.IsQualified() || !parameters.count(col_ref.GetColumnName()) ||
+			    LambdaExpression::IsLambdaParameter(shadowed, col_ref.GetColumnName())) {
+				continue;
+			}
+			if (ColumnQualifier::IsLambdaArgument(binder, function, i)) {
+				result.insert(col_ref.GetColumnName());
+			}
+		}
+		ColumnQualifier::EnumerateCallChildren(
+		    binder, function,
+		    [&](unique_ptr<ParsedExpression> &child) {
+			    CollectLambdaParameters(binder, *child, parameters, shadowed, result);
+		    },
+		    [&](LambdaExpression &lambda, identifier_set_t &lambda_parameters) {
+			    shadowed.push_back(std::move(lambda_parameters));
+			    CollectLambdaParameters(binder, *lambda.RightMutable(), parameters, shadowed, result);
+			    shadowed.pop_back();
+		    });
+		return;
+	}
+	case ExpressionClass::SUBQUERY: {
+		auto &subquery = expr.Cast<SubqueryExpression>().Subquery();
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery->node, [&](unique_ptr<ParsedExpression> &child) {
+			CollectLambdaParameters(binder, *child, parameters, shadowed, result);
+		});
+		break;
+	}
+	default:
+		break;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](ParsedExpression &child) { CollectLambdaParameters(binder, child, parameters, shadowed, result); });
+}
+
+const LambdaArguments &ColumnQualifier::GetLambdaArguments(Binder &binder, const FunctionExpression &function) {
 	string key;
 	for (auto &part : function.GetQualifiedName().Path()) {
 		key += part.GetIdentifierName();
 		key += '\0';
 	}
-	auto cached = binder.lambda_argument_positions.find(key);
-	if (cached != binder.lambda_argument_positions.end()) {
+	auto cached = binder.lambda_arguments.find(key);
+	if (cached != binder.lambda_arguments.end()) {
 		return cached->second;
 	}
+	// a macro that reaches itself through its body finds this empty entry instead of recursing
+	binder.lambda_arguments.emplace(key, LambdaArguments());
 	auto name = function.GetQualifiedName();
 	binder.BindSchemaOrCatalog(name);
 	bool dot_call;
 	auto func = FindFunction(binder, function, name, dot_call);
-	optional_idx position;
+	// the receiver of a dot call is the function's first argument, so the written arguments start at the second
+	const idx_t receiver_count = dot_call ? 1 : 0;
+	LambdaArguments result;
 	if (func && func->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(func->Cast<ScalarFunctionCatalogEntry>());
-		// the receiver of a dot call is the function's first argument, so the written arguments start at the second
-		if (lambda_index.IsValid() && (!dot_call || lambda_index.GetIndex() > 0)) {
-			position = optional_idx(lambda_index.GetIndex() - (dot_call ? 1 : 0));
+		if (lambda_index.IsValid() && lambda_index.GetIndex() >= receiver_count) {
+			result.positions.insert(lambda_index.GetIndex() - receiver_count);
+		}
+	} else if (func && func->type == CatalogType::MACRO_ENTRY) {
+		for (auto &macro : func->Cast<ScalarMacroCatalogEntry>().macros) {
+			if (macro->type != MacroType::SCALAR_MACRO) {
+				continue;
+			}
+			identifier_set_t parameters;
+			for (auto &parameter : macro->parameters) {
+				parameters.insert(parameter->Cast<ColumnRefExpression>().GetColumnName());
+			}
+			identifier_set_t lambda_parameters;
+			vector<identifier_set_t> shadowed;
+			CollectLambdaParameters(binder, *macro->Cast<ScalarMacroFunction>().expression, parameters, shadowed,
+			                        lambda_parameters);
+			for (idx_t i = 0; i < macro->parameters.size(); i++) {
+				auto &parameter_name = macro->parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
+				if (!lambda_parameters.count(parameter_name)) {
+					continue;
+				}
+				result.names.insert(parameter_name);
+				if (i >= receiver_count) {
+					result.positions.insert(i - receiver_count);
+				}
+			}
 		}
 	}
-	binder.lambda_argument_positions.emplace(std::move(key), position);
-	return position;
+	auto &entry = binder.lambda_arguments[key];
+	entry = std::move(result);
+	return entry;
+}
+
+bool ColumnQualifier::IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index) {
+	auto &lambda_arguments = GetLambdaArguments(binder, function);
+	auto &argument = function.GetArguments()[index];
+	if (argument.HasName()) {
+		return lambda_arguments.names.count(argument.GetName()) > 0;
+	}
+	return lambda_arguments.positions.count(index) > 0;
 }
 
 bool ColumnQualifier::TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
@@ -349,11 +437,9 @@ bool ColumnQualifier::TryGetLambdaParameters(Binder &binder, const FunctionExpre
 		return false;
 	}
 	auto &lambda = argument.Cast<LambdaExpression>();
-	if (lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD) {
-		auto position = GetLambdaArgumentPosition(binder, function);
-		if (!position.IsValid() || position.GetIndex() != index) {
-			return false;
-		}
+	if (lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD &&
+	    !IsLambdaArgument(binder, function, index)) {
+		return false;
 	}
 	string error_message;
 	auto column_refs = lambda.ExtractColumnRefExpressions(error_message);

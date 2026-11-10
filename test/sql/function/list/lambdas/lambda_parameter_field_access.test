@@ -15,6 +15,16 @@ SELECT [p_.d FOR p_ IN [{'d': 1}]] FROM t
 ----
 [1]
 
+# the parameter matches in any letter case and when quoted
+
+query III
+SELECT list_transform([{'d': 1}], lambda P_: p_.d),
+       list_transform([{'d': 1}], lambda p_: P_.D),
+       list_transform([{'d': 1}], lambda "p_": "P_"."d")
+FROM t
+----
+[1]	[1]	[1]
+
 query I
 SELECT list_transform([{'e': {'f': 2}}], lambda p_: p_.e.f) FROM t
 ----
@@ -801,21 +811,55 @@ Cannot extract field 'd' from expression "x"
 statement ok
 RESET lambda_syntax;
 
-# keyword lambdas stored before storage version v1.3.0 read back as arrow lambdas and keep their reading
+# keyword lambdas stored before storage version v1.3.0 read back as arrow lambdas and keep their reading, also where
+# a stored view or macro passes one to a macro that forwards it to a lambda position
 
 statement ok
 ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db (STORAGE_VERSION 'v1.2.0');
 
 statement ok
-CREATE TABLE old_db.t AS SELECT {'d': 99} AS p_, {'x': 98} AS x;
+USE old_db;
 
 statement ok
-CREATE VIEW old_db.vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM old_db.t;
+CREATE TABLE t AS SELECT {'d': 99} AS p_, {'x': 98} AS x, 10 AS k;
+
+statement ok
+CREATE VIEW vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM t;
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE VIEW vm AS SELECT apply_f([1, 2], lambda k: k + 1) AS r FROM t;
+
+statement ok
+CREATE VIEW vm_inner AS SELECT (SELECT max(apply_f([1], lambda k: k + 1)[1])) AS r FROM range(3) r(k);
+
+statement ok
+CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
 
 query II
-SELECT * FROM old_db.vw;
+SELECT * FROM vw;
 ----
 [1]	[1]
+
+query I
+SELECT * FROM vm;
+----
+[2, 3]
+
+query I
+SELECT count(*) FROM vm_inner;
+----
+3
+
+query I
+SELECT m_kw(5);
+----
+[2, 3]
+
+statement ok
+USE memory;
 
 statement ok
 DETACH old_db;
@@ -823,10 +867,31 @@ DETACH old_db;
 statement ok
 ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db;
 
+statement ok
+USE old_db;
+
 query II
-SELECT * FROM old_db.vw;
+SELECT * FROM vw;
 ----
 [1]	[1]
+
+query I
+SELECT * FROM vm;
+----
+[2, 3]
+
+query I
+SELECT count(*) FROM vm_inner;
+----
+3
+
+query I
+SELECT m_kw(5);
+----
+[2, 3]
+
+statement ok
+USE memory;
 
 statement ok
 DETACH old_db;

@@ -84,7 +84,7 @@ SELECT (SELECT max(list_transform(['{"a": 9}'::JSON], lambda j: j -> '$.a'))) FR
 [9]
 [9]
 
-# a macro takes no lambda, so an arrow passed to one is the JSON operator
+# a macro whose body uses its parameter as a value takes no lambda there, so an arrow passed to it is the JSON operator
 
 statement ok
 CREATE MACRO idv(v) AS v;

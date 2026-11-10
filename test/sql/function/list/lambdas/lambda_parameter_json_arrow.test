@@ -227,3 +227,98 @@ SELECT list_transform([{'path': 1}], s -> s.path) FROM sp;
 
 statement ok
 RESET lambda_syntax;
+
+# a macro takes a lambda at each parameter its body passes to a lambda position, directly or through another macro
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO apply_g(l, g) AS apply_f(l, g);
+
+statement ok
+CREATE TABLE tm AS SELECT 10 AS x, {'d': 99} AS p_;
+
+statement ok
+SET lambda_syntax = 'ENABLE_SINGLE_ARROW';
+
+query I
+SELECT apply_f([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query II
+SELECT x, apply_f([1, 2], x -> x + 1) FROM tm GROUP BY x;
+----
+10	[2, 3]
+
+query I
+SELECT apply_f([1, 2], f := x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT [1, 2].apply_f(x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT apply_f([{'d': 1}], p_ -> p_.d) FROM tm;
+----
+[1]
+
+query I
+SELECT apply_g([1, 2], x -> x * 10) FROM tm;
+----
+[10, 20]
+
+# an aggregate over a forwarded lambda reads no column, so it stays in the subquery
+
+query I
+SELECT (SELECT max(apply_f([1], x -> x + 1)[1])) FROM range(3) t(x);
+----
+2
+2
+2
+
+query I
+SELECT (SELECT max(apply_g([1], x -> x + 1)[1])) FROM range(3) t(x);
+----
+2
+2
+2
+
+statement ok
+CREATE MACRO apply_shadow(x) AS apply_f([1, 2], x -> x + 1);
+
+query I
+SELECT apply_shadow(5);
+----
+[2, 3]
+
+statement ok
+CREATE TABLE um (id INTEGER PRIMARY KEY, l INTEGER[], v INTEGER[], x INTEGER);
+
+statement ok
+INSERT INTO um VALUES (1, [1, 2], NULL, 100);
+
+statement ok
+INSERT INTO um VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = apply_f(l, x -> x + 1);
+
+query I
+SELECT v FROM um;
+----
+[2, 3]
+
+# a parameter the body passes to a lambda position and also uses as a value is read as a lambda, as main does
+
+statement ok
+CREATE MACRO lambda_and_value(l, f) AS [list_transform(l, f)[1]::VARCHAR, f::VARCHAR];
+
+query I
+SELECT lambda_and_value(['x'], k -> '$.f') FROM t;
+----
+[$.f, '"bbbb"']
+
+statement ok
+RESET lambda_syntax;
