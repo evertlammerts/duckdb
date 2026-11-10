@@ -174,6 +174,8 @@ MacroFunction &ExpressionBinder::UnfoldMacroExpression(FunctionExpression &funct
 
 	// qualify only the macro parameters with a new empty binder that only knows the macro binding
 	auto dummy_binder = Binder::CreateBinder(context);
+	// the qualifier reads arrows by the functions the expansion binds to, so it searches where the expansion does
+	dummy_binder->EntryRetriever().Inherit(binder.EntryRetriever());
 	dummy_binder->macro_binding = new_macro_binding.get();
 	ExpressionBinder::QualifyColumnNames(*dummy_binder, expr);
 

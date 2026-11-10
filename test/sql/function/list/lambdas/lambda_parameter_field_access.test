@@ -841,6 +841,15 @@ CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
 statement ok
 CREATE VIEW vk AS SELECT m_kw(5) AS r;
 
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO m_lower(k) AS lower([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vl AS SELECT m_lower(5) AS r;
+
 query I
 SELECT m_kw(5);
 ----
@@ -877,6 +886,11 @@ SELECT r FROM db_v100.vk;
 ----
 [2, 3]
 
+query I
+SELECT r FROM db_v100.vl;
+----
+[2, 3]
+
 statement ok
 DETACH db_v100;
 
@@ -906,6 +920,15 @@ CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
 
 statement ok
 CREATE VIEW vk AS SELECT m_kw(5) AS r;
+
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO m_lower(k) AS lower([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vl AS SELECT m_lower(5) AS r;
 
 query I
 SELECT m_kw(5);
@@ -940,6 +963,11 @@ SELECT r FROM db_v120.vm_inner;
 
 query I
 SELECT r FROM db_v120.vk;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v120.vl;
 ----
 [2, 3]
 

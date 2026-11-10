@@ -37,8 +37,9 @@ public:
 	unique_ptr<ParsedExpression> QualifyColumnNameWithManyDots(ColumnRefExpression &col_ref, ErrorData &error);
 	//! Returns a qualified column reference from a column reference
 	unique_ptr<ParsedExpression> QualifyColumnName(ColumnRefExpression &col_ref, ErrorData &error);
-	//! Enables special-handling of lambda parameters by tracking them in lambda_params
-	void QualifyColumnNamesInLambda(FunctionExpression &function);
+	//! Enables special-handling of lambda parameters by tracking them in lambda_params; entry is what QualifyFunction
+	//! found for the call
+	void QualifyColumnNamesInLambda(FunctionExpression &function, optional_ptr<CatalogEntry> entry);
 	//! Recursively qualifies the column references in the (children) of the expression. Passes on the
 	//! within_function_expression state from outer expressions, or sets it
 	void QualifyColumnNames(unique_ptr<ParsedExpression> &expr, const bool within_function_expression = false);
@@ -52,14 +53,17 @@ public:
 	//! Whether the reference is a parameter of one of the lambdas, or a field access on one. A table of this scope
 	//! that provides the reference wins, because that is the order in which the binder resolves it
 	bool IsLambdaParameterReference(const vector<identifier_set_t> &lambdas, const ColumnRefExpression &col_ref);
-	//! Whether argument index of the call binds as a lambda, filling in the parameter names it declares
+	//! Whether argument index of the call binds as a lambda, filling in the parameter names it declares. A non null
+	//! entry is the function the call, an expression and not a FROM clause item, was found as after its dot call
+	//! rewrite, which saves looking it up again
 	static bool TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
-	                                   identifier_set_t &parameters);
+	                                   identifier_set_t &parameters, optional_ptr<CatalogEntry> entry = nullptr);
 	//! Visits the children of a call, handing each argument that binds as a lambda to lambda_callback instead
 	static void EnumerateCallChildren(
 	    Binder &binder, FunctionExpression &function,
 	    const std::function<void(unique_ptr<ParsedExpression> &child)> &callback,
-	    const std::function<void(LambdaExpression &lambda, identifier_set_t &parameters)> &lambda_callback);
+	    const std::function<void(LambdaExpression &lambda, identifier_set_t &parameters)> &lambda_callback,
+	    optional_ptr<CatalogEntry> entry = nullptr);
 
 private:
 	Binder &binder;
@@ -82,7 +86,10 @@ private:
 
 	unique_ptr<ParsedExpression> QualifyColumnNameInternal(ColumnRefExpression &col_ref, ErrorData &error);
 	//! Whether an arrow at argument index of the call binds as a lambda
-	static bool IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index);
+	static bool IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index,
+	                             optional_ptr<CatalogEntry> entry);
+	//! Whether the call's name is a table macro, which a call in a FROM clause binds to
+	static bool IsTableMacro(Binder &binder, const FunctionExpression &function, const QualifiedName &name);
 	//! The function entry of the call; dot_call says it is written on a column, as in "x.lower()"
 	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function,
 	                                               const QualifiedName &name, bool &dot_call);

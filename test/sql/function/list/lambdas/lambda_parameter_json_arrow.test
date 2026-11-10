@@ -320,8 +320,8 @@ SELECT lambda_and_value(['x'], k -> '$.f') FROM t;
 ----
 [$.f, '"bbbb"']
 
-# shapes a reading of the macro body ahead of expansion cannot see: a view in another schema, a table macro, one
-# overload calling another, the parameter as a dot call receiver, a named argument out of order, a subquery
+# an arrow passed to a macro stays a lambda wherever the macro places it: a view in another schema, a table macro,
+# one overload calling another, the parameter as a dot call receiver, a named argument out of order, a subquery
 
 statement ok
 CREATE SCHEMA ms;
@@ -429,6 +429,52 @@ query I
 SELECT list_transform([1, 2], "lambda" := x -> x + 1) FROM tm;
 ----
 [2, 3]
+
+# a macro named like a built in function: the lookup that reads the arrow finds the entry the call binds to, in the
+# search path of a view and among the table macros of a FROM clause
+
+statement ok
+SET schema = 'ms';
+
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO lower_one(x) AS lower([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v_lower AS SELECT lower_one(100) AS r;
+
+statement ok
+CREATE MACRO concat(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO concat_one(x) AS concat([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v_concat AS SELECT concat_one(100) AS r;
+
+statement ok
+SET schema = 'main';
+
+query II
+SELECT (SELECT r FROM ms.v_lower), (SELECT r FROM ms.v_concat);
+----
+[2, 3]	[2, 3]
+
+statement ok
+CREATE MACRO lower(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO lower_from(x) AS (SELECT r FROM lower([1, 2], x -> x + 1));
+
+query I
+SELECT lower_from(100);
+----
+[2, 3]
+
+statement ok
+DROP MACRO TABLE lower;
 
 statement ok
 RESET lambda_syntax;

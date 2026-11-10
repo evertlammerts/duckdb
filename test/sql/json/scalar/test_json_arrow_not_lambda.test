@@ -86,6 +86,24 @@ SELECT (SELECT max(list_transform(['{"a": 9}'::JSON], lambda j: j -> '$.a'))) FR
 
 # a macro body may apply the arrow to its parameter inside a function
 
+# an aggregate takes no lambda, so an arrow on a macro parameter inside one is the JSON operator
+
+statement ok
+CREATE MACRO max_a(v) AS max(v -> '$.a');
+
+query I
+SELECT max_a(j) FROM jt;
+----
+3
+
+statement ok
+CREATE MACRO list_a(v) AS list(v -> '$.a' ORDER BY v -> '$.a');
+
+query I
+SELECT list_a(j) FROM jt;
+----
+[1, 2, 3]
+
 statement ok
 CREATE MACRO first_f(k) AS concat(k -> 'f', '');
 
