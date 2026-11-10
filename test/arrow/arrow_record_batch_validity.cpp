@@ -13,6 +13,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -113,6 +114,49 @@ FieldPtr Utf8(const char *name, const std::vector<string> &values) {
 	return field;
 }
 
+FieldPtr Utf8View(const char *name, const std::vector<string> &values, const std::vector<idx_t> &null_slots = {}) {
+	auto field = MakeField("vu", name, int64_t(values.size()), {});
+	field->bytes.assign(values.size() * 16, 0);
+	for (idx_t slot = 0; slot < values.size(); slot++) {
+		// Values of at most twelve bytes sit inline in their view, so no data buffer follows the views.
+		REQUIRE(values[slot].size() <= 12);
+		auto length = int32_t(values[slot].size());
+		memcpy(&field->bytes[slot * 16], &length, sizeof(length));
+		memcpy(&field->bytes[slot * 16 + 4], values[slot].data(), values[slot].size());
+	}
+	static const int64_t no_variadic_sizes[1] = {0};
+	SetBuffers(*field, {nullptr, field->bytes.data(), no_variadic_sizes});
+	SetNulls(*field, values.size(), null_slots);
+	return field;
+}
+
+FieldPtr Boolean(const char *name, const std::vector<bool> &values, const std::vector<idx_t> &null_slots = {}) {
+	auto field = MakeField("b", name, int64_t(values.size()), {});
+	field->bytes.assign((values.size() + 7) / 8, 0);
+	for (idx_t slot = 0; slot < values.size(); slot++) {
+		if (values[slot]) {
+			field->bytes[slot / 8] |= uint8_t(1u << (slot % 8));
+		}
+	}
+	SetBuffers(*field, {nullptr, field->bytes.data()});
+	SetNulls(*field, values.size(), null_slots);
+	return field;
+}
+
+// DECIMAL(10,2) in Arrow's 128 bit layout, from the unscaled values.
+FieldPtr Decimal(const char *name, const std::vector<int64_t> &unscaled, const std::vector<idx_t> &null_slots = {}) {
+	auto field = MakeField("d:10,2", name, int64_t(unscaled.size()), {});
+	field->bytes.assign(unscaled.size() * 16, 0);
+	for (idx_t slot = 0; slot < unscaled.size(); slot++) {
+		int64_t upper = unscaled[slot] < 0 ? -1 : 0;
+		memcpy(&field->bytes[slot * 16], &unscaled[slot], sizeof(int64_t));
+		memcpy(&field->bytes[slot * 16 + 8], &upper, sizeof(int64_t));
+	}
+	SetBuffers(*field, {nullptr, field->bytes.data()});
+	SetNulls(*field, unscaled.size(), null_slots);
+	return field;
+}
+
 FieldPtr Sliced(FieldPtr field, int64_t offset) {
 	field->array.offset = offset;
 	field->array.length -= offset;
@@ -145,12 +189,27 @@ FieldPtr List(const char *name, std::vector<int32_t> offsets, FieldPtr child,
 }
 
 // Two elements per slot.
-FieldPtr FixedSizeList(const char *name, FieldPtr child) {
+FieldPtr FixedSizeList(const char *name, FieldPtr child, const std::vector<idx_t> &null_slots = {}) {
 	auto slots = child->array.length / 2;
 	std::vector<FieldPtr> children;
 	children.push_back(std::move(child));
 	auto field = MakeField("+w:2", name, slots, std::move(children));
 	SetBuffers(*field, {nullptr});
+	SetNulls(*field, idx_t(slots), null_slots);
+	return field;
+}
+
+FieldPtr Map(const char *name, std::vector<int32_t> offsets, FieldPtr keys, FieldPtr values,
+             const std::vector<idx_t> &null_slots = {}) {
+	keys->schema.name = "key";
+	keys->schema.flags = 0;
+	values->schema.name = "value";
+	std::vector<FieldPtr> entries;
+	entries.push_back(std::move(keys));
+	entries.push_back(std::move(values));
+	auto field = List(name, std::move(offsets), Struct("entries", std::move(entries)), null_slots);
+	field->schema.format = "+m";
+	field->children[0]->schema.flags = 0;
 	return field;
 }
 
@@ -368,8 +427,8 @@ void RequireError(Field &record, const string &text) {
 	}
 }
 
-// Eleven columns over six slots, one of each kind a conversion handles on its own. The struct column is NULL at slot 3
-// and has a child of each kind that rebuilds or folds the struct's NULL rows.
+// Sixteen columns over six slots, one of each value layout read at the batch's offset. The struct column is NULL at
+// slot 3 and has a child of each kind that rebuilds or folds the struct's NULL rows.
 FieldPtr AllKinds(const std::vector<idx_t> &batch_null_slots, int64_t batch_offset) {
 	auto union_members = []() {
 		std::vector<FieldPtr> members;
@@ -399,24 +458,33 @@ FieldPtr AllKinds(const std::vector<idx_t> &batch_null_slots, int64_t batch_offs
 	columns.push_back(SparseUnion("u", {0, 1, 0, 1, 0, 1}, union_members()));
 	columns.push_back(Sliced(Int32("o", {0, 1, 2, 3, 4, 5, 6}, {6}), 1));
 	columns.push_back(FixedSizeList("f", Int32("", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {7})));
+	columns.push_back(FixedSizeList("fn", Int32("", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}), {0}));
 	{
 		std::vector<FieldPtr> item;
 		item.push_back(FixedBinary("w", {'a', 'b', 'c', 'd', 'e', 'f'}, {4}));
 		columns.push_back(List("ls", {0, 1, 2, 3, 4, 5, 6}, Struct("item", std::move(item), {2})));
 	}
+	columns.push_back(Boolean("b", {true, false, false, true, false, false}, {0}));
+	columns.push_back(Decimal("n", {0, 101, 202, 303, 404, 505}, {5}));
+	columns.push_back(Utf8View("sv", {"s0", "s1", "s2", "s3", "s4", "s5"}, {3}));
+	columns.push_back(
+	    Map("m", {0, 1, 2, 3, 4, 5, 6}, Int32("", {0, 1, 2, 3, 4, 5}), Int32("", {0, 10, 20, 30, 40, 50}), {4}));
 	return Record(std::move(columns), batch_null_slots, batch_offset);
 }
 
 // The rows of AllKinds by slot, when the batch marks none NULL.
 const std::vector<string> ALL_KINDS_ROWS = {
-    "1\ta\ta!\t(10, a!, NULL, 0:1, 100, (a!))\t[1]\t100\t7\t0:1\t1\t[1, 2]\t[(a!)]",
-    "2\tb\tb!\t(20, b!, NULL, 1:20, 200, (b!))\t[2]\t200\t7\t1:20\t2\t[3, 4]\t[(b!)]",
-    "3\tc\tc!\t(30, c!, 8, 0:3, 100, (c!))\t[3]\t100\tNULL\t0:3\t3\t[5, 6]\t[NULL]",
-    "4\td\td!\tNULL\t[4]\t200\tNULL\t1:40\t4\t[7, NULL]\t[(d!)]",
-    "NULL\te\tNULL\t(50, e!, 9, 0:5, NULL, (e!))\t[5]\tNULL\t9\t0:5\t5\t[9, 10]\t[(NULL)]",
-    "6\tf\tf!\t(NULL, NULL, 9, 1:60, 200, (NULL))\tNULL\t200\t9\t1:60\tNULL\t[11, 12]\t[(f!)]",
+    "1\ta\ta!\t(10, a!, NULL, 0:1, 100, (a!))\t[1]\t100\t7\t0:1\t1\t[1, 2]\tNULL\t[(a!)]\tNULL\t0.00\ts0\t{0=0}",
+    "2\tb\tb!\t(20, b!, NULL, 1:20, 200, (b!))\t[2]\t200\t7\t1:20\t2\t[3, 4]\t[3, 4]\t[(b!)]\tfalse\t1.01\ts1\t{1=10}",
+    "3\tc\tc!\t(30, c!, 8, 0:3, 100, (c!))\t[3]\t100\tNULL\t0:3\t3\t[5, 6]\t[5, 6]\t[NULL]\tfalse\t2.02\ts2\t{2=20}",
+    "4\td\td!\tNULL\t[4]\t200\tNULL\t1:40\t4\t[7, NULL]\t[7, 8]\t[(d!)]\ttrue\t3.03\tNULL\t{3=30}",
+    "NULL\te\tNULL\t(50, e!, 9, 0:5, NULL, (e!))\t[5]\tNULL\t9\t0:5\t5\t[9, 10]\t[9, "
+    "10]\t[(NULL)]\tfalse\t4.04\ts4\tNULL",
+    "6\tf\tf!\t(NULL, NULL, 9, 1:60, 200, (NULL))\tNULL\t200\t9\t1:60\tNULL\t[11, 12]\t[11, "
+    "12]\t[(f!)]\tfalse\tNULL\ts5\t{5=50}",
 };
-const string NULL_ROW = "NULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL";
+const string NULL_ROW =
+    "NULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL";
 
 } // namespace arrow_record_batch_validity_test
 

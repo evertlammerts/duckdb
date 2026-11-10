@@ -318,16 +318,8 @@ static void ArrowToDuckDBList(Vector &vector, ArrowArray &array, idx_t chunk_off
 	auto &child_vector = ListVector::GetChildMutable(vector);
 	ArrowToDuckDBConversion::SetValidityMask(child_vector, *array.children[0], chunk_offset, list_size, array.offset,
 	                                         NumericCast<int64_t>(start_offset));
-	auto &list_mask = FlatVector::ValidityMutable(vector);
 	if (parent_mask) {
-		//! Since this List is owned by a struct we must guarantee their validity map matches on Null
-		if (parent_mask->CanHaveNull()) {
-			for (idx_t i = 0; i < size; i++) {
-				if (!parent_mask->RowIsValid(i)) {
-					list_mask.SetInvalid(i);
-				}
-			}
-		}
+		MergeNullRows(FlatVector::ValidityMutable(vector), *parent_mask, size);
 	}
 	auto &child_state = array_state.GetChild(0);
 	auto &child_array = *array.children[0];
@@ -371,14 +363,7 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 
 	auto &array_mask = FlatVector::ValidityMutable(vector);
 	if (parent_mask) {
-		//! Since this List is owned by a struct we must guarantee their validity map matches on Null
-		if (parent_mask->CanHaveNull()) {
-			for (idx_t i = 0; i < size; i++) {
-				if (!parent_mask->RowIsValid(i)) {
-					array_mask.SetInvalid(i);
-				}
-			}
-		}
+		MergeNullRows(array_mask, *parent_mask, size);
 	}
 
 	// Broadcast the validity mask to the child vector
@@ -1619,13 +1604,8 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(Vector &vector, Arro
 		// validity must be read from the same effective offset as the indices
 		GetValidityMask(indices_validity, array, chunk_offset, size, NumericCast<int64_t>(parent_offset),
 		                nested_offset);
-		if (parent_mask && parent_mask->CanHaveNull()) {
-			auto &struct_validity_mask = *parent_mask;
-			for (idx_t i = 0; i < size; i++) {
-				if (!struct_validity_mask.RowIsValid(i)) {
-					indices_validity.SetInvalid(i);
-				}
-			}
+		if (parent_mask) {
+			MergeNullRows(indices_validity, *parent_mask, size);
 		}
 		SetSelectionVector(sel, indices, offset_type, size, &indices_validity,
 		                   NumericCast<idx_t>(array.dictionary->length));
