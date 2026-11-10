@@ -169,3 +169,71 @@ statement error
 SELECT (SELECT count(*) FROM range(3) a CROSS JOIN range(3) b WHERE a.range < r.i) FROM range(4) r(i) GROUP BY (SELECT count(*) FROM range(3) a POSITIONAL JOIN range(3) b WHERE a.range < r.i)
 ----
 must appear in the GROUP BY clause
+
+# GROUP BY ALL and the NULL order of an ORDER BY change the subquery's value (main: 2, 1 and 1)
+query I
+SELECT (SELECT count(*) FROM (SELECT x FROM (VALUES (1), (1), (2)) v(x))) FROM range(1) GROUP BY (SELECT count(*) FROM (SELECT x FROM (VALUES (1), (1), (2)) v(x) GROUP BY ALL))
+----
+3
+
+query I
+SELECT (SELECT x FROM (VALUES (1), (NULL)) v(x) ORDER BY x NULLS FIRST LIMIT 1) FROM range(1) GROUP BY (SELECT x FROM (VALUES (1), (NULL)) v(x) ORDER BY x NULLS LAST LIMIT 1)
+----
+NULL
+
+query I
+SELECT (SELECT first(x ORDER BY x NULLS FIRST) FROM (VALUES (1), (NULL)) v(x)) FROM range(1) GROUP BY (SELECT first(x ORDER BY x NULLS LAST) FROM (VALUES (1), (NULL)) v(x))
+----
+NULL
+
+# a name counts wherever it is written: here the subquery's own ORDER BY reads its top level alias x (main: 5)
+query I
+SELECT (SELECT 10 - t.x AS x FROM (VALUES (5), (7)) t(x) ORDER BY x LIMIT 1) FROM range(1) GROUP BY (SELECT 10 - t.x AS y FROM (VALUES (5), (7)) t(x) ORDER BY x LIMIT 1)
+----
+3
+
+# so twins that differ only in a name nothing reads no longer match either (main: 0, 1 for both)
+statement error
+SELECT (SELECT r.i AS a) FROM range(2) r(i) GROUP BY (SELECT r.i)
+----
+Binder Error: column "i" must appear in the GROUP BY clause or must be part of an aggregate function.
+
+statement error
+SELECT (SELECT r.i FROM (SELECT 1) s) FROM range(2) r(i) GROUP BY (SELECT r.i FROM (SELECT 1) s(c))
+----
+Binder Error: column "i" must appear in the GROUP BY clause or must be part of an aggregate function.
+
+# (main: true)
+statement error
+SELECT EXISTS (SELECT r.i AS x) FROM range(2) r(i) GROUP BY EXISTS (SELECT r.i)
+----
+Binder Error: column "i" must appear in the GROUP BY clause or must be part of an aggregate function.
+
+# an ORDER BY of a set operation that matches no select list entry wraps the set operation and binds outside it (main: 0, 1, 2, 3)
+statement error
+SELECT (SELECT r.i AS x) AS k FROM range(3) AS r(i) UNION ALL SELECT 3 ORDER BY (SELECT r.i)
+----
+Binder Error: Referenced table "r" not found!
+
+# the ORDER BY subquery sorts by its own constant value, so c DESC decides (main: 0, 1, 2, 3, sorted by c)
+query I
+SELECT (SELECT 3 AS x) AS c UNION ALL SELECT range FROM range(3) ORDER BY (SELECT 3), c DESC
+----
+3
+2
+1
+0
+
+statement ok
+CREATE TABLE gs AS SELECT range AS a FROM range(3)
+
+# two grouping sets of two different expressions (main: 0, 0, 1, 1, 2, 2, one expression grouped twice)
+query I
+SELECT (SELECT a) FROM gs GROUP BY GROUPING SETS ((SELECT a AS x), (SELECT a)) ORDER BY 1
+----
+0
+1
+2
+NULL
+NULL
+NULL

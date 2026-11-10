@@ -86,7 +86,7 @@ bool PivotColumnEntry::Equals(const PivotColumnEntry &other) const {
 		return false;
 	}
 	for (idx_t i = 0; i < values.size(); i++) {
-		if (!Value::NotDistinctFrom(values[i], other.values[i])) {
+		if (values[i].type() != other.values[i].type() || !Value::NotDistinctFrom(values[i], other.values[i])) {
 			return false;
 		}
 	}

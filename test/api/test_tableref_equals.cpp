@@ -157,6 +157,16 @@ TEST_CASE("Table references that differ in a field of their kind are not equal",
 		copy.Cast<PivotRef>().aggregates[1]->SetAlias(Identifier("s"));
 	});
 
+	auto pivot_in = ParseFrom(con, "src PIVOT (sum(v) FOR k IN (1))");
+	auto &entry = pivot_in->Cast<PivotRef>().pivots[0].entries[0];
+	REQUIRE(entry.expr);
+	// the parser keeps an IN constant as an expression; typed values come only from plans stored before v1.5
+	entry.expr.reset();
+	entry.values = {Value::INTEGER(1)};
+	RequireChangeBreaksEquality("IN value type", *pivot_in, [](TableRef &copy) {
+		copy.Cast<PivotRef>().pivots[0].entries[0].values[0] = Value::DECIMAL(int32_t(10), 2, 1);
+	});
+
 	auto match = ParseFrom(con, "src MATCH_RECOGNIZE (ORDER BY o MEASURES first(o) AS f, last(o) AS l PATTERN (A B) "
 	                            "DEFINE A AS v < 3, B AS v >= 3)");
 	RequireChangeBreaksEquality("measure alias", *match, [](TableRef &copy) {
@@ -182,6 +192,27 @@ TEST_CASE("Subqueries that differ in a select list alias are not equal", "[api][
 	RequireChangeBreaksEquality("rename", *subquery,
 	                            [&](TableRef &copy) { select_list(copy)[0]->SetAlias(Identifier("z")); });
 	RequireChangeBreaksEquality("drop", *subquery, [&](TableRef &copy) { select_list(copy)[1]->ClearAlias(); });
+}
+
+TEST_CASE("Subqueries that differ in GROUP BY ALL or in a NULL order are not equal", "[api][parser]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto node = [](TableRef &ref) -> SelectNode & {
+		return ref.Cast<SubqueryRef>().subquery->node->Cast<SelectNode>();
+	};
+	auto group_by_all = ParseFrom(con, "(SELECT x FROM tbl GROUP BY ALL) t");
+	REQUIRE(node(*group_by_all).aggregate_handling == AggregateHandling::FORCE_AGGREGATES);
+	RequireChangeBreaksEquality("aggregate_handling", *group_by_all, [&](TableRef &copy) {
+		node(copy).aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+	});
+
+	auto ordered = ParseFrom(con, "(SELECT x FROM tbl ORDER BY x NULLS FIRST) t");
+	REQUIRE(node(*ordered).modifiers.size() == 1);
+	REQUIRE(node(*ordered).modifiers[0]->type == ResultModifierType::ORDER_MODIFIER);
+	RequireChangeBreaksEquality("null_order", *ordered, [&](TableRef &copy) {
+		node(copy).modifiers[0]->Cast<OrderModifier>().orders[0].null_order = OrderByNullType::NULLS_LAST;
+	});
 }
 
 static unique_ptr<SelectStatement> ParseSelect(Connection &con, const string &sql) {
