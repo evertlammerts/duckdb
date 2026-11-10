@@ -362,6 +362,23 @@ SELECT l.x + 1 AS x, count(*) FROM l, r GROUP BY x;
 ----
 Ambiguous reference to column name
 
+# a USING column wins over a volatile alias of its name, as in GROUP BY of the name
+statement ok
+CREATE TABLE ul AS SELECT * FROM (VALUES (1, 10), (2, 20)) t(x, y);
+
+statement ok
+CREATE TABLE ur AS SELECT * FROM (VALUES (1), (2)) t(x);
+
+statement error
+SELECT y + (random() * 0)::INT AS x FROM ul JOIN ur USING (x) GROUP BY ALL HAVING x > 1;
+----
+the expression has side effects
+
+statement error
+SELECT y + (random() * 0)::INT AS x FROM ul JOIN ur USING (x) GROUP BY x HAVING x > 1;
+----
+column "y" must appear in the GROUP BY clause
+
 # an aggregate is not a group, so its volatile alias is still rejected
 query II
 SELECT g, sum(s) AS k FROM u GROUP BY ALL ORDER BY 10 - k;
@@ -491,6 +508,9 @@ SELECT lower(w), n FROM (SELECT (SELECT v) AS w, count(*) AS n FROM c GROUP BY 1
 ----
 a	1
 b	2
+
+statement ok
+RESET default_collation;
 
 # a lambda parameter named like a group alias is the parameter, and a lambda body reads the group by its alias
 query II
