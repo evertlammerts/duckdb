@@ -1,5 +1,5 @@
 # name: test/sql/function/list/lambdas/lambda_parameter_group_json.test
-# description: The JSON arrow operator on a lambda parameter does not bind to a group of the same name
+# description: An arrow that is not a lambda argument of a function is the JSON operator and declares no parameter
 # group: [lambdas]
 
 require json
@@ -20,3 +20,25 @@ query II
 SELECT k -> 'f' AS g, list_transform([1], lambda x: k -> 'f') FROM (SELECT '{"f":99}'::JSON AS k) t GROUP BY k -> 'f';
 ----
 99	[99]
+
+# a parameter on the left of the arrow keeps the expression out of an enclosing query's group
+statement error
+SELECT (SELECT list_transform(['{"f":1}'::JSON], lambda k: CAST(k -> 'f' AS INTEGER) + v)) FROM (VALUES ('{"f":99}'::JSON, 2)) o(k, v) GROUP BY CAST(k -> 'f' AS INTEGER) + v;
+----
+column "v" must appear in the GROUP BY clause
+
+# a column on the left of the arrow decides which scope owns an aggregate
+query I
+SELECT (SELECT sum(CAST(k -> 'f' AS INTEGER)) FROM range(1)) FROM (VALUES ('{"f":99}'::JSON), ('{"f":1}'::JSON)) o(k);
+----
+100
+
+query I
+SELECT (SELECT max(k -> 'f') FROM range(1)) FROM (VALUES ('{"f":99}'::JSON), ('{"f":1}'::JSON)) o(k);
+----
+99
+
+query I
+SELECT (SELECT sum(CAST(json_extract(k, '$.f') AS INTEGER)) FROM range(1)) FROM (VALUES ('{"f":99}'::JSON), ('{"f":1}'::JSON)) o(k);
+----
+100

@@ -170,6 +170,12 @@ SELECT (SELECT first(list_transform([1], lambda k: k + 1)) OVER () FROM range(1)
 ----
 [2]
 
+# the operand of IN belongs to the lambda body, only the subquery does not
+statement error
+SELECT (SELECT list_transform([1], lambda k: k IN (SELECT 1)) FROM range(1) GROUP BY k IN (SELECT 1)) FROM (SELECT 99 AS k) o;
+----
+subqueries in lambda expressions are not supported
+
 # the other clauses of a grouped query
 
 query I
@@ -340,6 +346,12 @@ SELECT list_transform([s], lambda x: x + 1) AS l, count(*) FROM t GROUP BY list_
 ----
 [100]	1
 
+# ... also inside a lambda body that declares the same name
+query I
+SELECT list_transform([1], lambda x: list_transform([s], lambda x: x + 1)) FROM t GROUP BY list_transform([s], lambda x: x + 1);
+----
+[[100]]
+
 query I
 SELECT list_transform([1], lambda y: s + 1) FROM t GROUP BY s + 1;
 ----
@@ -349,6 +361,11 @@ query I
 SELECT list_transform([1], lambda y: y + (s + 1)) FROM t GROUP BY s + 1;
 ----
 [101]
+
+query I
+SELECT list_transform([1], lambda x: s IN (SELECT 99)) FROM t GROUP BY s IN (SELECT 99);
+----
+[true]
 
 query II
 SELECT s AS p_, max(list_transform([1], lambda p_: p_)) FROM t GROUP BY p_;
