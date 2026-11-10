@@ -609,6 +609,50 @@ TEST_CASE("Arrow scan of NULL FIXED_SIZE_LIST rows past the first vector", "[arr
 	RequireRows(*record, expected);
 }
 
+TEST_CASE("Arrow scan of NULL FIXED_SIZE_LIST rows whose slots cross validity words", "[arrow]") {
+	using namespace arrow_fixed_size_list_null_children_test;
+	constexpr idx_t ROWS = 30;
+	struct Shape {
+		idx_t width;
+		std::vector<idx_t> null_rows;
+		idx_t own_null_slot;
+	};
+	// Width 3 puts NULL row 21 on slots 63 to 65 and row 20 beside it in the same word; widths 64 and 100 cover whole
+	// words and rows that start and end inside a word.
+	const std::vector<Shape> shapes {{3, {0, 20, 21, 23, 29}, 66}, {64, {1, 2, 29}, 0}, {100, {1, 3}, 200}};
+	std::vector<FieldPtr> columns;
+	for (auto &shape : shapes) {
+		std::vector<int32_t> values;
+		std::vector<int32_t> indices;
+		for (idx_t slot = 0; slot < ROWS * shape.width; slot++) {
+			values.push_back(int32_t(slot));
+			indices.push_back(int32_t(slot % 2));
+		}
+		columns.push_back(
+		    FixedSizeList("i", int64_t(shape.width), Int32("item", values, {shape.own_null_slot}), shape.null_rows));
+		columns.push_back(FixedSizeList("d", int64_t(shape.width), Dictionary("item", indices, Int32("", {100, 200})),
+		                                shape.null_rows));
+	}
+	auto record = Record(std::move(columns));
+	std::vector<string> expected;
+	for (idx_t row = 0; row < ROWS; row++) {
+		string line;
+		for (auto &shape : shapes) {
+			auto is_null = std::find(shape.null_rows.begin(), shape.null_rows.end(), row) != shape.null_rows.end();
+			string ints;
+			string dictionary;
+			for (idx_t slot = row * shape.width; slot < (row + 1) * shape.width; slot++) {
+				ints += (ints.empty() ? "" : ", ") + (slot == shape.own_null_slot ? string("NULL") : to_string(slot));
+				dictionary += string(dictionary.empty() ? "" : ", ") + (slot % 2 ? "200" : "100");
+			}
+			line += string(line.empty() ? "" : "\t") + (is_null ? "NULL" : "[" + ints + "]");
+			line += "\t" + (is_null ? string("NULL") : "[" + dictionary + "]");
+		}
+		expected.push_back(line);
+	}
+	RequireRows(*record, expected);
+}
+
 TEST_CASE("The vector verifier requires the child slots of a NULL ARRAY row to be NULL", "[arrow]") {
 	using namespace arrow_fixed_size_list_null_children_test;
 	VerifyVectors verify_vectors;
@@ -638,6 +682,17 @@ TEST_CASE("The vector verifier requires the child slots of a NULL ARRAY row to b
 #endif
 	ConstantVector::SetNull(constant, true);
 	REQUIRE_NOTHROW(constant.Verify());
+
+	Vector constant_child(LogicalType::ARRAY(LogicalType::INTEGER, 2), 2);
+	auto &child = ArrayVector::GetChildMutable(constant_child);
+	ConstantVector::Reference(child, Value::INTEGER(7), count_t(4));
+	FlatVector::SetSize(constant_child, 2);
+	FlatVector::ValidityMutable(constant_child).SetInvalid(1);
+#ifndef DUCKDB_CRASH_ON_ASSERT
+	REQUIRE_THROWS_WITH(constant_child.Verify(), Catch::Contains("Array NULL mismatch"));
+#endif
+	ConstantVector::SetNull(child, true);
+	REQUIRE_NOTHROW(constant_child.Verify());
 }
 
 TEST_CASE("Arrow scan of a NULL FIXED_SIZE_LIST row over FIXED_SIZE_LIST children with NULLs", "[arrow]") {

@@ -308,6 +308,18 @@ static void ArrowToDuckDBList(Vector &vector, ArrowArray &array, idx_t chunk_off
 	}
 }
 
+static void SetSlotsInvalid(ValidityMask &mask, idx_t begin, idx_t end) {
+	D_ASSERT(mask.CanHaveNull() && end <= mask.Capacity());
+	auto data = mask.GetData();
+	for (idx_t entry_idx = begin / ValidityMask::BITS_PER_VALUE; entry_idx * ValidityMask::BITS_PER_VALUE < end;
+	     entry_idx++) {
+		auto entry_begin = entry_idx * ValidityMask::BITS_PER_VALUE;
+		auto first = MaxValue(begin, entry_begin) - entry_begin;
+		auto last = MinValue(end, entry_begin + ValidityMask::BITS_PER_VALUE) - entry_begin;
+		data[entry_idx] &= ~ValidityMask::EntryWithValidBits(last) | ValidityMask::EntryWithValidBits(first);
+	}
+}
+
 static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_offset, ArrowArrayScanState &array_state,
                                idx_t size, const ArrowType &arrow_type, int64_t nested_offset,
                                const ValidityMask *parent_mask, int64_t parent_offset) {
@@ -337,18 +349,28 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 	// Conversions that set the validity of the elements themselves take the NULL rows from the parent mask.
 	ValidityMask null_row_slots;
 	if (array_mask.CanHaveNull()) {
-		null_row_slots.Initialize(child_count);
 		auto &child_validity_mask = FlatVector::ValidityMutable(child_vector);
-		for (idx_t i = 0; i < size; i++) {
-			if (!array_mask.RowIsValid(i)) {
-				for (idx_t j = 0; j < array_size; j++) {
-					null_row_slots.SetInvalid(i * array_size + j);
-					child_validity_mask.SetInvalid(i * array_size + j);
+		for (idx_t entry_idx = 0, row_begin = 0; row_begin < size;
+		     entry_idx++, row_begin += ValidityMask::BITS_PER_VALUE) {
+			auto entry = array_mask.GetValidityEntryUnsafe(entry_idx);
+			if (ValidityMask::AllValid(entry)) {
+				continue;
+			}
+			auto row_end = MinValue<idx_t>(row_begin + ValidityMask::BITS_PER_VALUE, size);
+			for (idx_t row = row_begin; row < row_end; row++) {
+				if (ValidityMask::RowIsValid(entry, row - row_begin)) {
+					continue;
 				}
+				if (null_row_slots.CannotHaveNull()) {
+					null_row_slots.Initialize(child_count);
+					child_validity_mask.EnsureWritable();
+				}
+				SetSlotsInvalid(null_row_slots, row * array_size, (row + 1) * array_size);
+				SetSlotsInvalid(child_validity_mask, row * array_size, (row + 1) * array_size);
 			}
 		}
 	}
-	auto parent_mask_of_elements = array_mask.CanHaveNull() ? &null_row_slots : nullptr;
+	auto parent_mask_of_elements = null_row_slots.CanHaveNull() ? &null_row_slots : nullptr;
 
 	auto &child_state = array_state.GetChild(0);
 	auto &child_array = *array.children[0];
@@ -371,19 +393,6 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 			ArrowToDuckDBConversion::ColumnArrowToDuckDB(child_vector, child_array, chunk_offset, child_state,
 			                                             child_count, child_type, NumericCast<int64_t>(child_offset),
 			                                             parent_mask_of_elements);
-		}
-	}
-	// Defensive only: every conversion above keeps these NULLs, and an extension's cast must carry them through itself.
-	if (parent_mask_of_elements && child_vector.GetVectorType() == VectorType::FLAT_VECTOR) {
-		for (idx_t i = 0; i < size; i++) {
-			if (array_mask.RowIsValid(i)) {
-				continue;
-			}
-			for (idx_t slot = i * array_size; slot < (i + 1) * array_size; slot++) {
-				if (!FlatVector::IsNull(child_vector, slot)) {
-					FlatVector::SetNull(child_vector, slot, true);
-				}
-			}
 		}
 	}
 }
@@ -1388,12 +1397,19 @@ template <class T>
 static void SetMaskedSelectionVectorLoop(SelectionVector &sel, data_ptr_t indices_p, idx_t size, ValidityMask &mask,
                                          idx_t last_element_pos) {
 	auto indices = reinterpret_cast<T *>(indices_p);
-	for (idx_t row = 0; row < size; row++) {
-		if (mask.RowIsValid(row)) {
-			sel.set_index(row, UnsafeNumericCast<idx_t>(indices[row]));
-		} else {
+	for (idx_t entry_idx = 0, begin = 0; begin < size; entry_idx++, begin += ValidityMask::BITS_PER_VALUE) {
+		auto end = MinValue<idx_t>(begin + ValidityMask::BITS_PER_VALUE, size);
+		auto entry = mask.GetValidityEntry(entry_idx);
+		if (ValidityMask::AllValid(entry)) {
+			for (idx_t row = begin; row < end; row++) {
+				sel.set_index(row, UnsafeNumericCast<idx_t>(indices[row]));
+			}
+			continue;
+		}
+		for (idx_t row = begin; row < end; row++) {
 			//! Need to point out to last element
-			sel.set_index(row, last_element_pos);
+			sel.set_index(row, ValidityMask::RowIsValid(entry, row - begin) ? UnsafeNumericCast<idx_t>(indices[row])
+			                                                                : last_element_pos);
 		}
 	}
 }
@@ -1586,13 +1602,8 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(Vector &vector, Arro
 		// validity must be read from the same effective offset as the indices
 		GetValidityMask(indices_validity, array, chunk_offset, size, NumericCast<int64_t>(parent_offset),
 		                nested_offset);
-		if (parent_mask && parent_mask->CanHaveNull()) {
-			auto &struct_validity_mask = *parent_mask;
-			for (idx_t i = 0; i < size; i++) {
-				if (!struct_validity_mask.RowIsValid(i)) {
-					indices_validity.SetInvalid(i);
-				}
-			}
+		if (parent_mask) {
+			indices_validity.Combine(*parent_mask, size);
 		}
 		SetSelectionVector(sel, indices, offset_type, size, &indices_validity,
 		                   NumericCast<idx_t>(array.dictionary->length));
