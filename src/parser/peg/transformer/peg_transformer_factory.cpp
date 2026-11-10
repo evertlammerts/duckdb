@@ -67,6 +67,8 @@ unique_ptr<SQLStatement> PEGTransformerFactory::TransformTopLevelStatement(Token
 	MatchContext match_context(suggestions, parse_result_allocator, process_allocator, max_token_index,
 	                           MatchMode::BUILD_PARSE_RESULT, options.identifier_case_mode, &packrat_cache);
 	MatchState state(token_iterator, match_context);
+	// the statement's text starts where the previous statement's tokens end, see Parser::ParseQuery
+	auto statement_offset = token_iterator.ConsumedEndOffset();
 	auto match_result = grammar.TopLevelStatementMatcher().MatchParseResult(state);
 	process_allocator.FreeAll();
 	if (!match_result.IsSuccess()) {
@@ -98,9 +100,6 @@ unique_ptr<SQLStatement> PEGTransformerFactory::TransformTopLevelStatement(Token
 	}
 
 	auto &stmt_pr = stmt_opt.GetResult();
-	auto stmt_start = stmt_pr.GetOffset();
-	// the parser cuts the statement's text out of its input from here, see Parser::ParseQuery
-	idx_t statement_offset = stmt_start.IsValid() ? stmt_start.GetIndex() : 0;
 	ArenaAllocator transformer_allocator(Allocator::DefaultAllocator());
 	PEGTransformer transformer(transformer_allocator, token_iterator, options, grammar, statement_offset);
 

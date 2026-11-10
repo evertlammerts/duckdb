@@ -42,6 +42,12 @@
       "paths": [
         "test/sql/error/error_location_copied_query.test"
       ]
+    },
+    {
+      "reason": "Error carets of the reparsed statement count from its printed text, which drops the whitespace and comments before the statement",
+      "paths": [
+        "test/sql/error/error_location_later_statement.test"
+      ]
     }
   ]
 }
