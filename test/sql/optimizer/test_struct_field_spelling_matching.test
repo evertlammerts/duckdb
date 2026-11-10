@@ -182,6 +182,47 @@ SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(A) AS (S
 statement ok
 SET explain_output='optimized_only';
 
+# Type pushdown shares one reader type between casts of a column only when their targets are spelled alike.
+statement ok
+COPY (SELECT '{}' AS j) TO '{TEST_DIR}/struct_field_spelling.csv' (HEADER);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<!REGEX>:.*"Expressions": "j".*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(B INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(A INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": "j".*
+
+statement ok
+SET disabled_optimizers='common_subexpressions';
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(A INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"j",\s*"j"\s*\].*
+
+statement ok
+RESET disabled_optimizers;
+
+
 query II
 EXPLAIN (FORMAT JSON) SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
 ----

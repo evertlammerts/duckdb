@@ -226,7 +226,8 @@ unique_ptr<Expression> CastCollect::VisitReplace(BoundFunctionExpression &expr, 
 		if (top_level_casts.count(&expr)) {
 			col_to_cast.emplace(binding->column_index, &expr);
 		}
-	} else if (it->second == nullptr || it->second->GetReturnType() != expr.GetReturnType() ||
+	} else if (it->second == nullptr ||
+	           !it->second->GetReturnType().EqualsIncludingFieldSpelling(expr.GetReturnType()) ||
 	           BoundCastExpression::IsTryCast(it->second->Cast<BoundFunctionExpression>()) !=
 	               BoundCastExpression::IsTryCast(expr)) {
 		// Different target type, or already a conflict.
