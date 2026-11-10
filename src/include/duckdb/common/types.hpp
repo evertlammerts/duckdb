@@ -262,6 +262,10 @@ enum class LogicalTypeId : uint8_t {
 
 struct ExtensionTypeInfo;
 
+//! KEEP_EXISTING skips the repeated member name check for a type rebuilt from existing union types, which a stored
+//! type can predate.
+enum class UnionMemberNames : uint8_t { CHECK_UNIQUE, KEEP_EXISTING };
+
 //! The kind of a LogicalTypeInfo
 enum class LogicalTypeInfoType : uint8_t {
 	INVALID_TYPE_INFO = 0,
@@ -569,6 +573,7 @@ public:
 	DUCKDB_API static LogicalType MAP(const LogicalType &child);                       // NOLINT
 	DUCKDB_API static LogicalType MAP(LogicalType key, LogicalType value);             // NOLINT
 	DUCKDB_API static LogicalType UNION(child_list_t<LogicalType> members);            // NOLINT
+	DUCKDB_API static LogicalType UNION(child_list_t<LogicalType> members, UnionMemberNames names); // NOLINT
 	DUCKDB_API static LogicalType ARRAY(const LogicalType &child, optional_idx index); // NOLINT
 	DUCKDB_API static LogicalType ENUM(const Vector &ordered_data, idx_t size);        // NOLINT
 	DUCKDB_API static LogicalType GEOMETRY();                                          // NOLINT

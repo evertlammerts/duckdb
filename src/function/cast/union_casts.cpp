@@ -440,7 +440,7 @@ BoundCastInfo DefaultCasts::UnionCastSwitch(BindCastInput &input, const LogicalT
 		for (idx_t member_idx = 0; member_idx < UnionType::GetMemberCount(source); member_idx++) {
 			varchar_members.emplace_back(make_pair(UnionType::GetMemberName(source, member_idx), LogicalType::VARCHAR));
 		}
-		auto varchar_type = LogicalType::UNION(std::move(varchar_members));
+		auto varchar_type = LogicalType::UNION(std::move(varchar_members), UnionMemberNames::KEEP_EXISTING);
 		return BoundCastInfo(UnionToVarcharCast, BindUnionToUnionCast(input, source, varchar_type),
 		                     InitToUnionLocalState);
 	}

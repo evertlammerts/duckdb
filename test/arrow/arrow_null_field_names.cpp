@@ -140,7 +140,7 @@ public:
 	vector<string> projected_columns;
 };
 
-// Renders a value without casting it, since casts of a struct or union with duplicate member names fail or misread.
+// Renders a value without casting it, since the cast of a struct with duplicate child names fails.
 string RenderValue(const Value &value) {
 	if (value.IsNull()) {
 		return "NULL";
@@ -335,9 +335,9 @@ TEST_CASE("Arrow scan of union members with a NULL name", "[arrow]") {
 		auto shape = UnnamedShape([&](const char *unnamed) { return make(unnamed, "b"); });
 		REQUIRE(shape == "u UNION(\"\" INTEGER, b INTEGER)\nproducer: \"u\"\n0:1\n1:4\n");
 	}
-	SECTION("all members unnamed") {
+	SECTION("all members unnamed is a duplicate name") {
 		auto shape = UnnamedShape([&](const char *unnamed) { return make(unnamed, unnamed); });
-		REQUIRE(shape == "u UNION(\"\" INTEGER, \"\" INTEGER)\nproducer: \"u\"\n0:1\n1:4\n");
+		REQUIRE(shape == "error: Invalid Input: Duplicate member name \"\" in UNION(\"\" INTEGER, \"\" INTEGER)");
 	}
 }
 
@@ -402,14 +402,15 @@ TEST_CASE("Arrow scan of duplicate field names", "[arrow]") {
 		});
 		REQUIRE(shape == "s STRUCT(\"\" INTEGER, \"\" INTEGER, b INTEGER)\nproducer: \"s\"\n(1, 3, 5)\n(2, 4, 6)\n");
 	}
-	SECTION("duplicate union members are kept") {
+	SECTION("duplicate union members are refused") {
 		std::vector<FieldPtr> members;
 		members.push_back(Int32("a", {1, 2}));
 		members.push_back(Int32("a", {3, 4}));
 		std::vector<FieldPtr> columns;
 		columns.push_back(SparseUnion("u", {0, 1}, std::move(members)));
 		auto record = Record(std::move(columns));
-		REQUIRE(ScanShape(*record) == "u UNION(a INTEGER, a INTEGER)\nproducer: \"u\"\n0:1\n1:4\n");
+		REQUIRE(ScanShape(*record) ==
+		        "error: Invalid Input: Duplicate member name \"a\" in UNION(a INTEGER, a INTEGER)");
 	}
 }
 
