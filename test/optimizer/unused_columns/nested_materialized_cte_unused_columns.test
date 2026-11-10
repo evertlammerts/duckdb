@@ -114,6 +114,20 @@ SELECT last_value FROM duckdb_sequences() WHERE sequence_name = 'seq';
 ----
 NULL
 
+# the same holds for an unread volatile column of the continuation
+statement ok
+CREATE SEQUENCE seq_continuation;
+
+query I
+SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT b FROM t) SELECT b, nextval('seq_continuation') AS v FROM c) s;
+----
+4
+
+query I
+SELECT last_value FROM duckdb_sequences() WHERE sequence_name = 'seq_continuation';
+----
+NULL
+
 # a column some operator reads is still evaluated
 statement error
 SELECT count(cast_col) FROM nested_view;
