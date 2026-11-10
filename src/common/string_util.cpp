@@ -939,18 +939,21 @@ static bool ReadFlatJSONString(const string &json, idx_t &pos, string &result) {
 }
 
 static bool TryReadFlatJSONMap(const string &json, unordered_map<string, string> &result) {
-	idx_t pos = 0;
-	if (pos >= json.size() || json[pos++] != '{') {
+	if (json.empty() || json[0] != '{') {
 		return false;
 	}
+	idx_t pos = 1;
 	if (pos < json.size() && json[pos] == '}') {
 		return pos + 1 == json.size();
 	}
 	while (true) {
 		string key;
 		string value;
-		if (!ReadFlatJSONString(json, pos, key) || pos >= json.size() || json[pos++] != ':' ||
-		    !ReadFlatJSONString(json, pos, value) || pos >= json.size()) {
+		if (!ReadFlatJSONString(json, pos, key) || pos >= json.size() || json[pos] != ':') {
+			return false;
+		}
+		pos++;
+		if (!ReadFlatJSONString(json, pos, value) || pos >= json.size()) {
 			return false;
 		}
 		result[std::move(key)] = std::move(value);
