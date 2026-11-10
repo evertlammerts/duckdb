@@ -1,0 +1,170 @@
+# name: test/sql/function/list/lambdas/lambda_parameter_first_part.test
+# description: Inside a lambda body a reference names the parameter only when its first name part is the parameter, unless a table of the query has the reference; the last part never decides
+# group: [lambdas]
+
+statement ok
+CREATE TABLE src2 AS SELECT 3 AS s;
+
+statement ok
+CREATE TABLE src AS SELECT {'k': 1, 'f': 'Ab'} AS s, 4 AS k;
+
+statement ok
+CREATE TABLE t AS SELECT 5 AS k;
+
+statement ok
+CREATE TABLE tk AS SELECT {'k': 50} AS k;
+
+# s.k reads the source column s whatever the parameter is called, so both fail on the INTEGER column
+
+statement error
+SELECT (SELECT list_transform([1], lambda k: s.k) FROM src2) FROM (SELECT 7 AS k) s;
+----
+Cannot extract field 'k' from expression "s"
+
+statement error
+SELECT (SELECT list_transform([1], lambda y: s.k) FROM src2) FROM (SELECT 7 AS k) s;
+----
+Cannot extract field 'k' from expression "s"
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement error
+SELECT (SELECT list_transform([1], k -> s.k) FROM src2) FROM (SELECT 7 AS k) s;
+----
+Cannot extract field 'k' from expression "s"
+
+statement ok
+RESET lambda_syntax;
+
+# HAVING reads s.k as the column s for either parameter name
+
+statement error
+SELECT k FROM src GROUP BY k HAVING list_transform([1], lambda k: s.k) = [1];
+----
+column "s" must appear in the GROUP BY clause
+
+statement error
+SELECT k FROM src GROUP BY k HAVING list_transform([1], lambda y: s.k) = [1];
+----
+column "s" must appear in the GROUP BY clause
+
+# a macro parameter p is replaced in p.k whatever the lambda parameter is called
+
+statement ok
+CREATE MACRO field_k(p) AS list_transform([1], lambda k: p.k);
+
+statement ok
+CREATE MACRO field_k_y(p) AS list_transform([1], lambda y: p.k);
+
+query II
+SELECT field_k({'k': 5}), field_k_y({'k': 5});
+----
+[5]	[5]
+
+# a lambda parameter shadows a macro parameter of its name in a field access
+
+statement ok
+CREATE MACRO shadowed(k) AS list_transform([{'f': 1}], lambda k: k.f);
+
+query I
+SELECT shadowed({'f': 9});
+----
+[1]
+
+# a first part that is the parameter names the parameter, beside a column of its name
+
+query I
+SELECT list_transform([{'k': 9}], lambda s: s.k) FROM src;
+----
+[9]
+
+query I
+SELECT (SELECT list_transform([{'k': 8}], lambda s: s.k) FROM src2) FROM (SELECT 7 AS k) s;
+----
+[8]
+
+query I
+SELECT list_transform([{'a': {'b': 6}}], lambda k: k.a.b) FROM src;
+----
+[6]
+
+query I
+SELECT list_transform([{'k': 1}], lambda k: k.k) FROM tk;
+----
+[1]
+
+# a dot call on a field of the parameter reads the parameter, a dot call on a field of a column reads the column
+
+query I
+SELECT list_transform([{'f': 'Qz'}], lambda k: k.f.lower()) FROM src;
+----
+[qz]
+
+query I
+SELECT list_transform([1], lambda f: s.f.lower()) FROM src;
+----
+[ab]
+
+# a field named like the parameter
+
+query I
+SELECT list_transform([10], lambda k: s.k + k) FROM src;
+----
+[11]
+
+query I
+SELECT list_transform([1], lambda k: src.k + k) FROM src;
+----
+[5]
+
+# nested lambdas: the outer parameter as the first part, the inner named like its field
+
+query I
+SELECT list_transform([{'f': 2}], lambda o: list_transform([10], lambda f: o.f + f)) FROM src;
+----
+[[12]]
+
+query I
+SELECT list_transform([{'k': 2}], lambda s: list_transform([10], lambda k: s.k + k)) FROM src;
+----
+[[12]]
+
+# a table of the query that has the reference wins over a parameter of its name
+
+query I
+SELECT list_transform([{'k': 9}], lambda t: t.k) FROM t;
+----
+[5]
+
+query I
+SELECT list_transform([{'z': 9}], lambda t: t.z) FROM t;
+----
+[9]
+
+query I
+WITH c AS (SELECT 5 AS k) SELECT list_transform([{'k': 1}], lambda c: c.k) FROM c;
+----
+[5]
+
+query I
+WITH c AS (SELECT 5 AS k) SELECT list_transform([{'k': 1}], lambda c: c.k) FROM range(1);
+----
+[1]
+
+# grouping by the field, and by another column
+
+query I
+SELECT list_transform([1], lambda k: s.k) FROM src GROUP BY s.k;
+----
+[1]
+
+statement error
+SELECT list_transform([1], lambda k: s.k) FROM src GROUP BY k;
+----
+column "s" must appear in the GROUP BY clause
+
+statement error
+SELECT list_transform([1], lambda y: s.k) FROM src GROUP BY k;
+----
+column "s" must appear in the GROUP BY clause

@@ -43,7 +43,15 @@ public:
 	//! within_function_expression state from outer expressions, or sets it
 	void QualifyColumnNames(unique_ptr<ParsedExpression> &expr, const bool within_function_expression = false);
 
-	optional_ptr<CatalogEntry> QualifyFunction(FunctionExpression &function);
+	//! A dot call receiver that is a parameter reference of enclosing_lambdas is left unqualified, for the binder of
+	//! its clause
+	optional_ptr<CatalogEntry> QualifyFunction(FunctionExpression &function,
+	                                           const vector<LambdaParameterScope> &enclosing_lambdas);
+	//! Whether a table of this scope has the qualified reference as [catalog.][schema path.]table.column[.field...]
+	bool TableProvidesReference(const ColumnRefExpression &col_ref);
+	//! Whether the reference is a parameter of one of the lambdas, or a field access on one. A table of this scope
+	//! that provides the reference wins, because that is the order in which the binder resolves it
+	bool IsLambdaParameterReference(const vector<LambdaParameterScope> &lambdas, const ColumnRefExpression &col_ref);
 
 private:
 	Binder &binder;
@@ -60,9 +68,9 @@ private:
 	bool TableBindingExists(const BindingAlias &alias);
 	//! Whether any binding in the current bind context has the given table name (ignoring catalog/schema)
 	bool TableNameExists(const Identifier &table_name);
-	//! Whether the reference is a parameter of a lambda this walk is inside, or a field access on one. A table of
-	//! this scope wins, because that is the order in which the binder resolves a reference of two or more parts
-	bool IsLambdaParameterReference(const ColumnRefExpression &col_ref);
+	//! The table binding that has names as [catalog.][schema path.]table.column[.field...], and the column's index
+	optional_ptr<Binding> FindTableColumn(const vector<Identifier> &names, idx_t &column_index,
+	                                      optional_ptr<ErrorData> error);
 
 	unique_ptr<ParsedExpression> QualifyColumnNameInternal(ColumnRefExpression &col_ref, ErrorData &error);
 };

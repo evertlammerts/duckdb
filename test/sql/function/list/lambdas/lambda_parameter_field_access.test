@@ -258,6 +258,115 @@ SELECT x, l FROM up
 ----
 10	[1]
 
+# a field receiver and an outer parameter as the receiver, in a clause that is not qualified up front
+statement ok
+CREATE TABLE sf AS SELECT {'g': 'Col'} AS c;
+
+query I
+SELECT 1 FROM sf WHERE list_transform([{'g': 'Ab'}], lambda c: c.g.upper()) = ['AB']
+----
+1
+
+query I
+SELECT 1 FROM sf WHERE list_transform([{'g': 'Ab'}], lambda c: upper(c.g)) = ['AB']
+----
+1
+
+query I
+SELECT 1 FROM s_ WHERE list_transform(['Xy'], lambda c: list_transform([1], lambda y: c.lower())) = [['xy']]
+----
+1
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+query II
+SELECT (SELECT count(*) FROM sf WHERE list_transform([{'g': 'Ab'}], c -> c.g.lower()) = ['ab']),
+       (SELECT count(*) FROM sf WHERE list_transform([{'g': 'Ab'}], c -> lower(c.g)) = ['ab'])
+----
+1	1
+
+statement ok
+RESET lambda_syntax;
+
+# a table that provides the receiver wins over a parameter named like it, as for the plain call
+statement ok
+CREATE TABLE sg AS SELECT 'Col' AS g;
+
+query II
+SELECT (SELECT count(*) FROM sg WHERE list_transform([{'g': 'Ab'}], lambda sg: sg.g.upper()) = ['COL']),
+       (SELECT count(*) FROM sg WHERE list_transform([{'g': 'Ab'}], lambda sg: upper(sg.g)) = ['COL'])
+----
+1	1
+
+query II
+SELECT list_transform([{'g': 'Ab'}], lambda sg: sg.g.upper()), list_transform([{'g': 'Ab'}], lambda sg: upper(sg.g))
+FROM sg
+----
+[COL]	[COL]
+
+# a clause that takes no lambda rejects a dot call on a parameter as it rejects the plain call
+statement error
+CREATE TABLE c1 (k VARCHAR CHECK (list_transform([k], lambda x: x.lower()) = [lower(k)]))
+----
+Lambda functions are currently not supported in CHECK constraints
+
+statement error
+CREATE TABLE c1 (k VARCHAR CHECK (list_transform([k], lambda x: lower(x)) = [lower(k)]))
+----
+Lambda functions are currently not supported in CHECK constraints
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1]))
+----
+DEFAULT value cannot contain column names
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform(['Dd'], lambda x: lower(x))[1]))
+----
+DEFAULT value cannot contain column names
+
+statement error
+CREATE MACRO md1(a, b := list_transform(['Dd'], lambda x: x.lower())) AS b
+----
+Default value for parameter "b" cannot contain column names
+
+statement error
+CREATE MACRO md1(a, b := list_transform(['Dd'], lambda x: lower(x))) AS b
+----
+Default value for parameter "b" cannot contain column names
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform([{'d': 'Dd'}], lambda x: x.d.lower())[1]))
+----
+DEFAULT value cannot contain column names
+
+statement ok
+CREATE TABLE d2 (i INTEGER, k VARCHAR)
+
+statement error
+ALTER TABLE d2 ALTER COLUMN k SET DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1])
+----
+DEFAULT value cannot contain column names
+
+statement error
+ALTER TABLE d2 ADD COLUMN j VARCHAR DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1])
+----
+DEFAULT value cannot contain column names
+
+statement ok
+CREATE TABLE pv AS SELECT 'Ab' AS k, 1 AS v
+
+statement error
+PIVOT pv ON k IN (list_transform(['Ab'], lambda x: x.lower())[1]) USING sum(v)
+----
+PIVOT IN list cannot contain column names
+
+statement error
+PIVOT pv ON k IN (list_transform(['Ab'], lambda x: lower(x))[1]) USING sum(v)
+----
+PIVOT IN list cannot contain column names
+
 # a macro parameter's field read inside a lambda whose parameter is named like that field
 statement ok
 CREATE MACRO m_field(s) AS list_transform([1], lambda d: s.d + d);
@@ -304,3 +413,343 @@ query I
 SELECT list_transform([{'d': 1}], lambda p_: p_.d) FROM u AS u1, u AS u2
 ----
 [1]
+
+# a parameter named like a table alias whose table has the field's name as a column: the table provides the
+# reference, so it is that column, under the GROUP BY rules of any column
+statement ok
+CREATE TABLE t2 AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30)) v(a, b);
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT count(*) FROM t2 AS z HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_filter([{'b': 5}], lambda z: z.b = 10) = []
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_transform([[{'b': 5}]], lambda y: list_transform(y, lambda z: z.b)) = [[10]]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING [z.b FOR z IN [{'b': 5}]] = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t2 AS z GROUP BY a
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a ORDER BY list_transform([{'b': 5}], lambda z: z.b)
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+query I
+SELECT a FROM t2 AS z GROUP BY ALL HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query I
+SELECT a FROM t2 AS z GROUP BY a, b HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query I
+SELECT b FROM t2 AS z GROUP BY b HAVING list_transform([{'b': 5}], lambda z: z.b) = [20]
+----
+20
+
+query I
+SELECT a FROM t2 AS z GROUP BY a HAVING max(list_transform([{'b': 5}], lambda z: z.b)) = [30]
+----
+2
+
+query II
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t2 AS z
+WHERE list_transform([{'b': 5}], lambda z: z.b) <> [20]
+ORDER BY list_transform([{'b': 5}], lambda z: z.b) DESC
+----
+2	[30]
+1	[10]
+
+query II
+SELECT a, row_number() OVER (ORDER BY b) FROM t2 AS z QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [20]
+----
+1	2
+
+query II
+SELECT a, sum(b) OVER (ORDER BY b ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t2 AS z ORDER BY b
+----
+1	10
+1	30
+2	60
+
+query II
+SELECT a, max(list_transform([{'b': 5}], lambda z: z.b)) FROM t2 AS z GROUP BY a ORDER BY a
+----
+1	[20]
+2	[30]
+
+# a parameter named like a column, in a window frame and an aggregate
+statement ok
+CREATE TABLE tc AS SELECT * FROM (VALUES (1, {'b': 7}), (2, {'b': 8})) v(a, p_);
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda p_: p_.b)[1] PRECEDING AND CURRENT ROW)
+FROM tc ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, row_number() OVER (ORDER BY a) FROM tc QUALIFY list_transform([{'b': 5}], lambda p_: p_.b) = [5] ORDER BY a
+----
+1	1
+2	2
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda p_: p_.b)) FROM tc
+----
+[5]
+
+# a parameter named like a table alias and like a column of that table, which has no column named like the field:
+# no table provides the reference, so the column does not claim it and it is the parameter's field
+statement ok
+CREATE TABLE t3 AS SELECT * FROM (VALUES (1, {'b': 7}), (2, {'b': 8})) v(a, z);
+
+query II
+SELECT list_transform([{'b': 5}], lambda z: z.b), [z.b FOR z IN [{'b': 5}]] FROM t3 AS z ORDER BY a
+----
+[5]	[5]
+[5]	[5]
+
+query I
+SELECT a FROM t3 AS z WHERE list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT count(*) FROM t3 AS z HAVING list_transform([{'b': 5}], lambda z: z.b) = [5]
+----
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY ALL HAVING list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_filter([{'b': 5}], lambda z: z.b = 5) = [{'b': 5}] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([[{'b': 5}]], lambda y: list_transform(y, lambda z: z.b)) = [[5]]
+ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING [z.b FOR z IN [{'b': 5}]] = [5] ORDER BY a
+----
+1
+2
+
+query II
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t3 AS z GROUP BY a ORDER BY a
+----
+1	[5]
+2	[5]
+
+query II
+SELECT z.b, list_transform([{'b': 5}], lambda z: z.b) FROM t3 AS z GROUP BY z.b ORDER BY 1
+----
+7	[5]
+8	[5]
+
+query I
+SELECT a FROM t3 AS z GROUP BY a ORDER BY list_transform([{'b': 5}], lambda z: z.b), a DESC
+----
+2
+1
+
+query II
+SELECT a, row_number() OVER (ORDER BY a) FROM t3 AS z QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t3 AS z ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, count(*) OVER (PARTITION BY list_transform([{'b': 5}], lambda z: z.b)) FROM t3 AS z ORDER BY a
+----
+1	2
+2	2
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda z: z.b)) FROM t3 AS z
+----
+[5]
+
+query I
+SELECT list_transform([{'b': {'c': 5}}], lambda z: z.b.c) FROM t3 AS z ORDER BY a
+----
+[5]
+[5]
+
+# with three parts the table provides z.z, so the column wins there
+query I
+SELECT list_transform([{'z': {'b': 5}}], lambda z: z.z.b) FROM t3 AS z ORDER BY a
+----
+[7]
+[8]
+
+statement error
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'z': {'b': 5}}], lambda z: z.z.b) = [7]
+----
+column "z" must appear in the GROUP BY clause or be used in an aggregate function
+
+# the same, but the table also has a column named like the field, so the table provides the reference
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10, {'b': 7}), (2, 20, {'b': 8})) v(a, b, z);
+
+query I
+SELECT list_transform([{'b': 5}], lambda z: z.b) FROM t4 AS z ORDER BY a
+----
+[10]
+[20]
+
+statement error
+SELECT a FROM t4 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+query I
+SELECT a FROM t4 AS z GROUP BY a, b HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t4 AS z ORDER BY a
+----
+1	1
+2	3
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda z: z.b)) FROM t4 AS z
+----
+[20]
+
+# a column that the subquery's own table provides keeps the aggregate in the subquery, also where the parameter
+# names that table and the qualifier wrote the column with the parameter's name in front
+statement ok
+CREATE TABLE o AS SELECT * FROM (VALUES (100), (200)) v(oa);
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b)[1] + o.oa) FROM t2 AS z) FROM o ORDER BY 1
+----
+130
+230
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: a + o.oa)) FROM t2 AS z) FROM o ORDER BY 1
+----
+[102]
+[202]
+
+query I
+SELECT (SELECT max(list_transform([1], lambda memory: b + o.oa + memory)) FROM t2) FROM o ORDER BY 1
+----
+[131]
+[231]
+
+query I
+SELECT (SELECT count(*) FROM t2 AS z HAVING max(list_transform([{'b': 5}], lambda z: z.b + o.oa)) = [130]) FROM o
+ORDER BY 1
+----
+3
+NULL
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b + a + o.oa)) FROM t3 AS z) FROM o ORDER BY 1
+----
+[107]
+[207]
+
+# HAVING reads the parameter's field where no table provides it, also through a macro and as a dot call receiver,
+# and sees the table column with a catalog in front
+statement ok
+CREATE MACRO mh() AS list_transform([{'b': 5}], lambda z: z.b);
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'b': 'Pp'}], lambda z: z.b.lower()) = ['pp'] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING mh() = [5] ORDER BY a
+----
+1
+2
+
+statement error
+SELECT a FROM t2 GROUP BY a HAVING list_transform([1], lambda memory: b + memory) = [11]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+query I
+SELECT b FROM t2 GROUP BY b HAVING list_transform([1], lambda memory: b + memory) = [11]
+----
+10
+
+# a table found through its schema wins over a parameter named like that schema
+query I
+SELECT list_transform([{'tbl': {'x': 1}}], lambda sch: sch.tbl.x) FROM sch.tbl
+----
+[5]
+
+statement error
+SELECT list_transform([{'b': 5}], lambda t2: t2.b) FROM t2, t2
+----
+Ambiguous reference to table "t2"
+
+# no table of the subquery provides z.b, so the parameter's field and the outer column leave the aggregate to the
+# outer query
+statement error
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b + o.oa)) FROM t3 AS z) FROM o
+----
+More than one row returned by a subquery

@@ -29,7 +29,8 @@ BindResult HavingBinder::BindColumnRef(unique_ptr<ParsedExpression> &expr_ptr, i
 
 	if (col_ref.IsQualified()) {
 		// a field access on a lambda parameter is neither a group nor an alias of this query
-		if (LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.ColumnNames()[0])) {
+		if (LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.ColumnNames()[0]) &&
+		    !ColumnQualifier(binder).TableProvidesReference(col_ref)) {
 			return ExpressionBinder::BindExpression(expr_ptr->Cast<ColumnRefExpression>(), depth, root_expression,
 			                                        expr_ptr);
 		}

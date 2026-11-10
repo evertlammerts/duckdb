@@ -199,7 +199,7 @@ void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, con
 		auto &col_ref = expr->Cast<ColumnRefExpression>();
 
 		// don't qualify a lambda parameter, nor a field access on one: only binding the lambda resolves it
-		if (IsLambdaParameterReference(col_ref)) {
+		if (IsLambdaParameterReference(lambda_params, col_ref)) {
 			return;
 		}
 
@@ -237,7 +237,7 @@ void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, con
 		// Special-handling for lambdas, which are inside function expressions.
 		auto &function = expr->Cast<FunctionExpression>();
 		if (!ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
-			QualifyFunction(function);
+			QualifyFunction(function, lambda_params);
 		}
 		if (function.IsLambdaFunction()) {
 			return QualifyColumnNamesInLambda(function);
@@ -256,7 +256,8 @@ void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, con
 	});
 }
 
-optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &function) {
+optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &function,
+                                                            const vector<LambdaParameterScope> &enclosing_lambdas) {
 	D_ASSERT(!ExpressionBinder::IsUnnestFunction(function.FunctionName()));
 	// lookup the function in the catalog
 	QueryErrorContext error_context(function.GetQueryLocation());
@@ -298,7 +299,7 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 		    make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema(), function.GetQualifiedName().Catalog());
 	}
 	unique_ptr<ParsedExpression> new_colref;
-	if (!IsLambdaParameterReference(*colref)) {
+	if (!IsLambdaParameterReference(enclosing_lambdas, *colref)) {
 		new_colref = QualifyColumnName(*colref, error);
 	}
 	if (!new_colref) {
@@ -361,10 +362,38 @@ unique_ptr<ParsedExpression> ColumnQualifier::QualifyColumnNameWithManyDotsInter
 	// -> table.column.field...
 	// -> column.field...
 
+	auto &names = col_ref.ColumnNames();
+	ErrorData table_error;
+	idx_t column_index = 0;
+	auto binding = FindTableColumn(names, column_index, table_error);
+	if (binding) {
+		struct_extract_start = column_index + 1;
+		return binder.bind_context.CreateColumnReference(binding->GetBindingAlias(), names[column_index]);
+	}
+	// part1 could be a column
+	ErrorData unused_error;
+	auto result_expr = QualifyColumnName(col_ref, names[0], unused_error);
+	if (result_expr) {
+		// it is! add the struct extract calls
+		struct_extract_start = 1;
+		return result_expr;
+	}
+	auto struct_pack = CreateStructPack(col_ref);
+	if (struct_pack) {
+		return struct_pack;
+	}
+
+	// we could not find the column - return the most specific error we encountered
+	error = std::move(table_error);
+	return nullptr;
+}
+
+optional_ptr<Binding> ColumnQualifier::FindTableColumn(const vector<Identifier> &names, idx_t &column_index,
+                                                       optional_ptr<ErrorData> error) {
+	D_ASSERT(names.size() >= 2);
 	// we always prefer the most top-level view - i.e. we resolve the table as far to the right as possible (so the
 	// leading components are treated as catalog/schema rather than column/struct fields), and within a given table
 	// position we prefer treating the leading component as a catalog over a schema
-	auto &names = col_ref.ColumnNames();
 	// we could not find the column - remember the most specific error to return. In order of preference:
 	//  2. the table qualification matched a binding, but it has no such column
 	//  1. the table name matches a binding, but the catalog/schema qualification does not
@@ -378,8 +407,11 @@ unique_ptr<ParsedExpression> ColumnQualifier::QualifyColumnNameWithManyDotsInter
 			ErrorData attempt_error;
 			auto binding = binder.GetMatchingBinding(alias, column_name, attempt_error);
 			if (binding) {
-				struct_extract_start = table_index + 2;
-				return binder.bind_context.CreateColumnReference(binding->GetBindingAlias(), column_name);
+				column_index = table_index + 1;
+				return binding;
+			}
+			if (!error) {
+				continue;
 			}
 			idx_t priority = 0;
 			if (TableBindingExists(alias)) {
@@ -399,22 +431,18 @@ unique_ptr<ParsedExpression> ColumnQualifier::QualifyColumnNameWithManyDotsInter
 			break;
 		}
 	}
-	// part1 could be a column
-	ErrorData unused_error;
-	auto result_expr = QualifyColumnName(col_ref, names[0], unused_error);
-	if (result_expr) {
-		// it is! add the struct extract calls
-		struct_extract_start = 1;
-		return result_expr;
+	if (error) {
+		*error = std::move(best_error);
 	}
-	auto struct_pack = CreateStructPack(col_ref);
-	if (struct_pack) {
-		return struct_pack;
-	}
-
-	// we could not find the column - return the most specific error we encountered
-	error = std::move(best_error);
 	return nullptr;
+}
+
+bool ColumnQualifier::TableProvidesReference(const ColumnRefExpression &col_ref) {
+	if (!col_ref.IsQualified()) {
+		return false;
+	}
+	idx_t column_index = 0;
+	return FindTableColumn(col_ref.ColumnNames(), column_index, nullptr) != nullptr;
 }
 
 bool ColumnQualifier::TableNameExists(const Identifier &table_name) {
@@ -426,11 +454,12 @@ bool ColumnQualifier::TableNameExists(const Identifier &table_name) {
 	return false;
 }
 
-bool ColumnQualifier::IsLambdaParameterReference(const ColumnRefExpression &col_ref) {
-	if (!LambdaExpression::IsLambdaParameter(lambda_params, col_ref)) {
+bool ColumnQualifier::IsLambdaParameterReference(const vector<LambdaParameterScope> &lambdas,
+                                                 const ColumnRefExpression &col_ref) {
+	if (!LambdaExpression::IsLambdaParameter(lambdas, col_ref)) {
 		return false;
 	}
-	return !col_ref.IsQualified() || !TableNameExists(col_ref.ColumnNames()[0]);
+	return !TableProvidesReference(col_ref);
 }
 
 bool ColumnQualifier::TableBindingExists(const BindingAlias &alias) {

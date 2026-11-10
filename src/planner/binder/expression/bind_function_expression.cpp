@@ -263,8 +263,20 @@ BindResult ExpressionBinder::TryBindLambdaOrJson(FunctionExpression &function, i
 CatalogEntry &ExpressionBinder::BindFunction(FunctionExpression &function) {
 	QueryErrorContext error_context(function.GetQueryLocation());
 
-	ColumnQualifier qualifier(binder, lambda_bindings);
-	auto func = qualifier.QualifyFunction(function);
+	// the qualifier gets no lambda bindings, so a receiver naming a parameter stays a column reference that this
+	// binder binds, and rejects, as it binds the argument of the plain call
+	ColumnQualifier qualifier(binder);
+	vector<LambdaParameterScope> enclosing_lambdas;
+	if (lambda_bindings) {
+		for (auto &binding : *lambda_bindings) {
+			// this binder reads a field access on a lambda binding as the parameter's field in either lambda syntax
+			enclosing_lambdas.emplace_back(LambdaSyntaxType::LAMBDA_KEYWORD);
+			for (auto &name : binding.GetColumnNames()) {
+				enclosing_lambdas.back().names.insert(name);
+			}
+		}
+	}
+	auto func = qualifier.QualifyFunction(function, enclosing_lambdas);
 	if (!func) {
 		// function was not found - check if we this is a table function (to throw a more helpful error message)
 		EntryLookupInfo table_function_lookup(CatalogType::TABLE_FUNCTION_ENTRY, function.GetQualifiedName(),
