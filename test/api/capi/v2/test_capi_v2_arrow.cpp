@@ -2140,7 +2140,7 @@ TEST_CASE("V2 arrow: the importer rejects strings that are not valid UTF-8", "[c
 	EnvFixture fx;
 	RegisterArrowProbe(fx, "arrow_invalid_utf8_probe", ArrowInvalidUtf8Exec);
 	RunArrowProbe(fx.conn, "SELECT arrow_invalid_utf8_probe(1)");
-	REQUIRE(arrow_invalid_utf8_observed.rc != DUCKDB_V2_ERROR_NONE);
+	REQUIRE(arrow_invalid_utf8_observed.rc == DUCKDB_V2_ERROR_TYPE_CONVERSION);
 	REQUIRE_THAT(arrow_invalid_utf8_observed.text,
 	             Catch::Matchers::Contains(
 	                 "Invalid string encoding found in Arrow column \"a\": value \"ab\\xE2\" is not valid UTF8"));

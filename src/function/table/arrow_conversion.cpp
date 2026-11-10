@@ -6,9 +6,11 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 
+#include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/swar.hpp"
 #include "duckdb/common/types/arrow_aux_data.hpp"
 #include "duckdb/common/types/arrow_string_view_type.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -450,33 +452,128 @@ static void SetVectorStringView(Vector &vector, idx_t size, ArrowArray &array, i
 	}
 }
 
+//! The bytes the ASCII test of an Arrow string buffer combines without a branch
+static constexpr idx_t ASCII_BLOCK_SIZE = 256;
+//! After a non ASCII byte the values in this many bytes are checked one by one, a measured tradeoff
+static constexpr idx_t UTF8_CHECK_WINDOW = 1024;
+
+//! The first byte in [begin, end) with its high bit set, or end
+static const char *FirstNonASCII(const char *begin, const char *end) {
+	auto pos = begin;
+	// the compiler turns a block's loads into vector instructions
+	for (; idx_t(end - pos) >= ASCII_BLOCK_SIZE; pos += ASCII_BLOCK_SIZE) {
+		uint64_t word = 0;
+		for (idx_t i = 0; i < ASCII_BLOCK_SIZE; i += SwarWord::SIZE) {
+			word |= Load<uint64_t>(const_data_ptr_cast(pos + i));
+		}
+		if (!SwarWord::IsAscii(word)) {
+			break;
+		}
+	}
+	for (; idx_t(end - pos) >= SwarWord::SIZE; pos += SwarWord::SIZE) {
+		if (!SwarWord::IsAscii(Load<uint64_t>(const_data_ptr_cast(pos)))) {
+			break;
+		}
+	}
+	for (; pos < end; pos++) {
+		if (static_cast<uint8_t>(*pos) & 0x80) {
+			return pos;
+		}
+	}
+	return end;
+}
+
+static bool IsValidUTF8(const string_t &str) {
+	if (str.IsInlined()) {
+		// an inlined string is zero padded to twelve bytes, so two loads test it for ASCII without a call per value
+		auto data = const_data_ptr_cast(str.GetData());
+		if (SwarWord::IsAscii(Load<uint64_t>(data) | Load<uint32_t>(data + sizeof(uint64_t)))) {
+			return true;
+		}
+	}
+	// not Utf8Proc::IsValid, whose extra call per value costs 8 percent of a scan of non ASCII strings
+	return Utf8Proc::Analyze(str.GetData(), str.GetSize()) != UnicodeType::INVALID;
+}
+
+//! Whether a value that is not inlined is ASCII, a word at a time
+static bool IsASCIIOutOfLine(const string_t &str) {
+	// a value that is not inlined is longer than a word, so its last word may overlap the others
+	auto data = const_data_ptr_cast(str.GetData());
+	const auto size = str.GetSize();
+	auto word = Load<uint64_t>(data + size - SwarWord::SIZE);
+	for (idx_t i = 0; i + SwarWord::SIZE < size; i += SwarWord::SIZE) {
+		word |= Load<uint64_t>(data + i);
+	}
+	return SwarWord::IsAscii(word);
+}
+
+static void ThrowInvalidUTF8(const string_t &str, const ArrowArrayScanState &array_state) {
+	if (array_state.column_name.empty()) {
+		throw ConversionException("Invalid string encoding found in Arrow array: value \"%s\" is not valid UTF8",
+		                          Blob::ToString(str));
+	}
+	throw ConversionException("Invalid string encoding found in Arrow column \"%s\": value \"%s\" is not valid UTF8",
+	                          array_state.column_name, Blob::ToString(str));
+}
+
 // Arrow requires UTF-8 in string columns, but producers do not enforce it.
 static void VerifyUTF8Strings(const Vector &vector, idx_t size, const ArrowArrayScanState &array_state) {
+	// not ValidValues, which adds ten instructions per value, 7 percent of a scan of non ASCII strings
 	auto strings = FlatVector::GetData<string_t>(vector);
 	auto &validity = FlatVector::Validity(vector);
 	for (idx_t row_idx = 0; row_idx < size; row_idx++) {
-		if (!validity.RowIsValid(row_idx)) {
+		auto &str = strings[row_idx];
+		if (!validity.RowIsValid(row_idx) || (!str.IsInlined() && IsASCIIOutOfLine(str))) {
 			continue;
 		}
-		auto &str = strings[row_idx];
-		if (str.IsInlined()) {
-			// an inlined string is zero padded to twelve bytes, so two loads test it for ASCII without a call per value
-			auto data = const_data_ptr_cast(str.GetData());
-			auto bytes = Load<uint64_t>(data) | Load<uint32_t>(data + sizeof(uint64_t));
-			if ((bytes & 0x8080808080808080ULL) == 0) {
-				continue;
+		if (!IsValidUTF8(str)) {
+			ThrowInvalidUTF8(str, array_state);
+		}
+	}
+}
+
+//! Checks the strings of an offset layout, whose non NULL values all lie in one data buffer
+template <class T>
+static void VerifyUTF8OffsetStrings(const Vector &vector, idx_t size, const ArrowArrayScanState &array_state,
+                                    const char *cdata, const T *offsets) {
+	auto &validity = FlatVector::Validity(vector);
+	auto end_row = size;
+	if (validity.CanHaveNull()) {
+		// offsets of a NULL slot are unchecked, so the range ends at the last value with bytes and needs an order check
+		while (end_row > 0 && (!validity.RowIsValid(end_row - 1) || offsets[end_row - 1] == offsets[end_row])) {
+			end_row--;
+		}
+		T decreasing = 0;
+		for (idx_t row_idx = 0; row_idx < end_row; row_idx++) {
+			decreasing |= T(offsets[row_idx] > offsets[row_idx + 1]);
+		}
+		if (decreasing) {
+			VerifyUTF8Strings(vector, size, array_state);
+			return;
+		}
+	}
+	if (end_row == 0) {
+		return;
+	}
+	// the values lie in order in [offsets[0], end), so one that ends at or before a non ASCII byte is ASCII
+	auto ends = offsets + 1;
+	auto end = cdata + offsets[end_row];
+	auto ascii_end = FirstNonASCII(cdata + offsets[0], end);
+	auto strings = FlatVector::GetData<string_t>(vector);
+	idx_t row_idx = 0;
+	while (ascii_end != end) {
+		const auto ascii_offset = idx_t(ascii_end - cdata);
+		row_idx = idx_t(std::upper_bound(ends + row_idx, ends + end_row, ascii_offset) - ends);
+		D_ASSERT(row_idx < end_row);
+		const auto last_row = MinValue<idx_t>(
+		    idx_t(std::lower_bound(ends + row_idx, ends + end_row, ascii_offset + UTF8_CHECK_WINDOW) - ends),
+		    end_row - 1);
+		for (; row_idx <= last_row; row_idx++) {
+			if (validity.RowIsValid(row_idx) && !IsValidUTF8(strings[row_idx])) {
+				ThrowInvalidUTF8(strings[row_idx], array_state);
 			}
 		}
-		if (Utf8Proc::Analyze(str.GetData(), str.GetSize()) != UnicodeType::INVALID) {
-			continue;
-		}
-		if (array_state.column_name.empty()) {
-			throw ConversionException("Invalid string encoding found in Arrow array: value \"%s\" is not valid UTF8",
-			                          Blob::ToString(str));
-		}
-		throw ConversionException(
-		    "Invalid string encoding found in Arrow column \"%s\": value \"%s\" is not valid UTF8",
-		    array_state.column_name, Blob::ToString(str));
+		ascii_end = FirstNonASCII(cdata + ends[last_row], end);
 	}
 }
 
@@ -992,6 +1089,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 	case LogicalTypeId::VARCHAR: {
 		auto &string_info = arrow_type.GetTypeInfo<ArrowStringInfo>();
 		auto size_type = string_info.GetSizeType();
+		const bool verify_utf8 = vector.GetType().id() == LogicalTypeId::VARCHAR;
 		switch (size_type) {
 		case ArrowVariableSizeType::SUPER_SIZE: {
 			auto cdata = ArrowBufferData<char>(array, 2);
@@ -999,6 +1097,9 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			    array, 1, GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset),
 			    size + 1);
 			SetVectorString(vector, size, cdata, offsets.get());
+			if (verify_utf8) {
+				VerifyUTF8OffsetStrings(vector, size, array_state, cdata, offsets.get());
+			}
 			break;
 		}
 		case ArrowVariableSizeType::NORMAL: {
@@ -1007,12 +1108,18 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			    array, 1, GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset),
 			    size + 1);
 			SetVectorString(vector, size, cdata, offsets.get());
+			if (verify_utf8) {
+				VerifyUTF8OffsetStrings(vector, size, array_state, cdata, offsets.get());
+			}
 			break;
 		}
 		case ArrowVariableSizeType::VIEW: {
 			SetVectorStringView(
 			    vector, size, array,
 			    GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset));
+			if (verify_utf8) {
+				VerifyUTF8Strings(vector, size, array_state);
+			}
 			break;
 		}
 		case ArrowVariableSizeType::FIXED_SIZE: {
@@ -1034,9 +1141,6 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 				offset += blob_len;
 			}
 		}
-		}
-		if (vector.GetType().id() == LogicalTypeId::VARCHAR) {
-			VerifyUTF8Strings(vector, size, array_state);
 		}
 		break;
 	}

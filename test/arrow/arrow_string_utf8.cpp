@@ -537,6 +537,123 @@ TEST_CASE("Arrow scan of invalid UTF-8 behind a NULL, an offset or past the firs
 	REQUIRE(text[2500] == "NULL");
 }
 
+// One ASCII test over the bytes that hold a chunk's values decides whether its values are checked one by one.
+TEST_CASE("Arrow scan of invalid UTF-8 among values longer than twelve bytes", "[arrow]") {
+	const string ascii = "an ASCII value longer than twelve bytes";
+	const string accented = "a valid value with an \xC3\xA9 in it";
+	const string invalid = "an invalid value \xE2 in the middle";
+	const string rendered = "an invalid value \\xE2 in the middle";
+	for (auto format : {"u", "U", "vu"}) {
+		INFO(format);
+		// the scan converts 2048 rows at a time, so rows 0, 2047, 2048 and 2999 are first and last of a chunk
+		for (idx_t row : {idx_t(0), idx_t(2047), idx_t(2048), idx_t(2999)}) {
+			INFO(row);
+			std::vector<string> values(3000, ascii);
+			values[row] = invalid;
+			StringColumn col(format, values);
+			RequireInvalid(col, rendered);
+		}
+		StringColumn valid_before_invalid(format, {ascii, accented, ascii, invalid, ascii});
+		RequireInvalid(valid_before_invalid, rendered);
+		// past a non ASCII byte the values are checked one by one only for a while, then the ASCII test resumes
+		std::vector<string> far_apart(3000, ascii);
+		far_apart[10] = accented;
+		far_apart[500] = invalid;
+		StringColumn invalid_far_after_accented(format, far_apart);
+		RequireInvalid(invalid_far_after_accented, rendered);
+		std::vector<string> accented_run(3000, accented);
+		accented_run[1500] = invalid;
+		StringColumn invalid_in_accented_run(format, accented_run);
+		RequireInvalid(invalid_in_accented_run, rendered);
+		StringColumn accented_values(format, {ascii, accented, ascii, accented});
+		REQUIRE(ScanText(accented_values) == rows({ascii, accented, ascii, accented}));
+		StringColumn null_over_invalid(format, {ascii, invalid, ascii}, {1});
+		REQUIRE(ScanText(null_over_invalid) == rows({ascii, "NULL", ascii}));
+		StringColumn invalid_after_null_over_accented(format, {accented, ascii, invalid, ascii}, {0});
+		RequireInvalid(invalid_after_null_over_accented, rendered);
+		StringColumn all_null(format, {invalid, invalid}, {0, 1});
+		REQUIRE(ScanText(all_null) == rows({"NULL", "NULL"}));
+	}
+}
+
+// A value that is not inlined is tested for ASCII a word at a time, with a last word that overlaps the others.
+TEST_CASE("Arrow scan of an invalid byte at each word boundary of a value longer than twelve bytes", "[arrow]") {
+	for (auto format : {"u", "U", "vu"}) {
+		for (idx_t length : {idx_t(13), idx_t(16), idx_t(17), idx_t(33)}) {
+			for (idx_t pos : {idx_t(0), idx_t(7), idx_t(8), length - 1}) {
+				INFO(format << " " << length << " " << pos);
+				string value(length, 'a');
+				value[pos] = '\x80';
+				StringColumn col(format, {"ok", value, "ok"});
+				RequireInvalid(col, string(pos, 'a') + "\\x80" + string(length - pos - 1, 'a'));
+			}
+		}
+	}
+}
+
+// Arrow asks for non-decreasing offsets under NULL slots too, but the scan only checks the offsets of values.
+TEST_CASE("Arrow scan of invalid UTF-8 behind a NULL slot whose offsets go back", "[arrow]") {
+	const string ascii = "an ASCII value longer than twelve bytes";
+	const string invalid = "an invalid value \xE2 in the middle";
+	const string accented = "a valid value with an \xC3\xA9 in it";
+	const auto ascii_size = int32_t(ascii.size());
+	for (auto format : {"u", "U"}) {
+		INFO(format);
+		for (auto &second : {invalid, accented}) {
+			// data holds the second value, then the first: row 0 reads its bytes after those of row 2
+			StringColumn col(format, {second, "", ascii}, {1});
+			auto second_size = int32_t(second.size());
+			const std::vector<int32_t> offsets = {second_size, second_size + ascii_size, 0, second_size};
+			for (idx_t i = 0; i < offsets.size(); i++) {
+				if (format[0] == 'U') {
+					col.offsets64[i] = offsets[i];
+				} else {
+					col.offsets32[i] = offsets[i];
+				}
+			}
+			if (second == invalid) {
+				RequireInvalid(col, "an invalid value \\xE2 in the middle");
+			} else {
+				REQUIRE(ScanText(col) == rows({ascii, "NULL", accented}));
+			}
+		}
+	}
+}
+
+// The offset after a trailing NULL slot is not checked, so the scan must not read up to it.
+TEST_CASE("Arrow scan of a trailing NULL slot whose offset points past the data", "[arrow]") {
+	const string ascii = "an ASCII value longer than twelve bytes";
+	const string accented = "a valid value with an \xC3\xA9 in it";
+	for (auto format : {"u", "U"}) {
+		INFO(format);
+		for (auto &first : {ascii, accented}) {
+			// an empty value after the NULL slot keeps the offset, which the scan reads for no other value
+			StringColumn col(format, {first, "", ""}, {1});
+			const auto past_data = int32_t(first.size()) + 4096;
+			for (idx_t i : {idx_t(2), idx_t(3)}) {
+				if (format[0] == 'U') {
+					col.offsets64[i] = past_data;
+				} else {
+					col.offsets32[i] = past_data;
+				}
+			}
+			REQUIRE(ScanText(col) == rows({first, "NULL", ""}));
+		}
+	}
+}
+
+// A chunk of empty lists converts a child of no rows, whose producer may leave out its offsets buffer.
+TEST_CASE("Arrow scan of empty lists whose string child has no buffers", "[arrow]") {
+	for (auto format : {"u", "U"}) {
+		INFO(format);
+		ListColumn col({}, {0, 0, 0});
+		col.child.schema.format = format;
+		col.child.buffers[1] = nullptr;
+		col.child.buffers[2] = nullptr;
+		REQUIRE(ScanText(col) == rows({"[]", "[]"}));
+	}
+}
+
 // A dictionary is converted as a whole, so an entry no index points at is checked too.
 TEST_CASE("Arrow scan of dictionary encoded invalid UTF-8", "[arrow]") {
 	DictionaryColumn valid({"a", "\xC3\xA9"}, {1, 0, 1});
