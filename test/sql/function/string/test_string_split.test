@@ -288,17 +288,14 @@ select UNNEST(string_split('1,2,3,4,,6', ','))
 (empty)
 6
 
+# earlier versions gave an empty element after each comma, the zero length match that follows it
 query T
 select UNNEST(string_split_regex('1,2,3,4,,6', '(,|)'))
 ----
 1
-(empty)
 2
-(empty)
 3
-(empty)
 4
-(empty)
 (empty)
 6
 
