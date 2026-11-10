@@ -118,7 +118,7 @@ bool SelectNode::Equals(const QueryNode *other_p) const {
 	auto &other = other_p->Cast<SelectNode>();
 
 	// SELECT
-	if (!ExpressionUtil::ListEquals(select_list, other.select_list)) {
+	if (!ExpressionUtil::ListEqualsWithAliases(select_list, other.select_list)) {
 		return false;
 	}
 	// FROM

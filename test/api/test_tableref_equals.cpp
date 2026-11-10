@@ -147,9 +147,9 @@ TEST_CASE("Table references that differ in a field of their kind are not equal",
 	});
 
 	DelimGetRef delim_get(vector<LogicalType> {LogicalType::INTEGER});
-	REQUIRE(!delim_get.Equals(DelimGetRef(vector<LogicalType> {LogicalType::BIGINT})));
-	REQUIRE(!delim_get.Equals(DelimGetRef(vector<LogicalType> {LogicalType::INTEGER, LogicalType::INTEGER})));
-	REQUIRE(delim_get.Equals(*delim_get.Copy()));
+	CHECK(!delim_get.Equals(DelimGetRef(vector<LogicalType> {LogicalType::BIGINT})));
+	CHECK(!delim_get.Equals(DelimGetRef(vector<LogicalType> {LogicalType::INTEGER, LogicalType::INTEGER})));
+	CHECK(delim_get.Equals(*delim_get.Copy()));
 
 	auto pivot = ParseFrom(con, "src PIVOT (sum(v) AS s, max(v) AS m FOR k IN ('a'))");
 	RequireChangeBreaksEquality("aggregate alias", *pivot, [](TableRef &copy) {
@@ -169,6 +169,19 @@ TEST_CASE("Table references that differ in a field of their kind are not equal",
 		defines[0]->SetAlias(Identifier("B"));
 		defines[1]->SetAlias(Identifier("A"));
 	});
+}
+
+TEST_CASE("Subqueries that differ in a select list alias are not equal", "[api][parser]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto subquery = ParseFrom(con, "(SELECT 1 AS x, 2 AS y) t");
+	auto select_list = [](TableRef &ref) -> vector<unique_ptr<ParsedExpression>> & {
+		return ref.Cast<SubqueryRef>().subquery->node->Cast<SelectNode>().select_list;
+	};
+	RequireChangeBreaksEquality("rename", *subquery,
+	                            [&](TableRef &copy) { select_list(copy)[0]->SetAlias(Identifier("z")); });
+	RequireChangeBreaksEquality("drop", *subquery, [&](TableRef &copy) { select_list(copy)[1]->ClearAlias(); });
 }
 
 static unique_ptr<SelectStatement> ParseSelect(Connection &con, const string &sql) {

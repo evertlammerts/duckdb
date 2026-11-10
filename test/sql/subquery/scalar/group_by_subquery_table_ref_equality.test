@@ -109,6 +109,22 @@ SELECT (SELECT max(f) FROM mr MATCH_RECOGNIZE (ORDER BY o MEASURES first(o) AS f
 ----
 1
 
+# select list aliases name the columns of a derived table, a CTE and the inputs of UNION BY NAME
+query I
+SELECT (SELECT x FROM (SELECT 1 AS x, 2 AS y) t) FROM range(1) GROUP BY (SELECT x FROM (SELECT 1 AS y, 2 AS x) t)
+----
+1
+
+query I
+SELECT (WITH t AS (SELECT 1 AS x, 2 AS y) SELECT x FROM t) FROM range(1) GROUP BY (WITH t AS (SELECT 1 AS y, 2 AS x) SELECT x FROM t)
+----
+1
+
+query I
+SELECT (SELECT max(x) FROM (SELECT 1 AS x, 2 AS y UNION ALL BY NAME SELECT 3 AS x, 4 AS y)) FROM range(1) GROUP BY (SELECT max(x) FROM (SELECT 1 AS x, 2 AS y UNION ALL BY NAME SELECT 3 AS y, 4 AS x))
+----
+3
+
 # two GROUP BY subqueries that differ only in the join kind stay two groups
 query II
 SELECT (SELECT count(*) FROM range(3) a CROSS JOIN range(3) b), (SELECT count(*) FROM range(3) a POSITIONAL JOIN range(3) b) FROM range(1) GROUP BY (SELECT count(*) FROM range(3) a CROSS JOIN range(3) b), (SELECT count(*) FROM range(3) a POSITIONAL JOIN range(3) b)
@@ -139,6 +155,12 @@ SELECT (SELECT a_s + r.i FROM (PIVOT (SELECT 'a' AS k, 1 AS v) ON k IN ('a') USI
 
 query I rowsort
 SELECT (SELECT max(f) + r.i FROM mr MATCH_RECOGNIZE (ORDER BY o MEASURES first(o) AS f ONE ROW PER MATCH PATTERN (A B) DEFINE A AS v < 3, B AS v >= 3) AS m(f)) FROM range(2) r(i) GROUP BY (SELECT max(f) + r.i FROM mr MATCH_RECOGNIZE (ORDER BY o MEASURES first(o) AS f ONE ROW PER MATCH PATTERN (A B) DEFINE A AS v < 3, B AS v >= 3) AS m(f))
+----
+1
+2
+
+query I rowsort
+SELECT (SELECT x + r.i AS z FROM (SELECT 1 AS x, 2 AS y) t) FROM range(2) r(i) GROUP BY (SELECT x + r.i AS z FROM (SELECT 1 AS x, 2 AS y) t)
 ----
 1
 2
