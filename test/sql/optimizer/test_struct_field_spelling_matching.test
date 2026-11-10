@@ -59,6 +59,30 @@ SELECT MAP {{'A': x}: 1}::VARCHAR, MAP {{'a': x}: 1}::VARCHAR FROM t WHERE x = 1
 ----
 {{'A': 1}=1}	{{'a': 1}=1}
 
+# The TINYINT source keeps each cast, so only the nested field name in its target type differs.
+statement ok
+CREATE TABLE n AS SELECT {'a': 1::TINYINT} s, [{'a': 1::TINYINT}] l, {'s': {'a': 1::TINYINT}} ss;
+
+query TT
+SELECT ss::STRUCT(s STRUCT(A INTEGER))::VARCHAR, ss::STRUCT(s STRUCT(a INTEGER))::VARCHAR FROM n;
+----
+{'s': {'A': 1}}	{'s': {'a': 1}}
+
+query TT
+SELECT l::STRUCT(A INTEGER)[]::VARCHAR, l::STRUCT(a INTEGER)[]::VARCHAR FROM n;
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT MAP {1: s}::MAP(INTEGER, STRUCT(A INTEGER))::VARCHAR, MAP {1: s}::MAP(INTEGER, STRUCT(a INTEGER))::VARCHAR FROM n;
+----
+{1={'A': 1}}	{1={'a': 1}}
+
+query TT
+SELECT l::STRUCT(A INTEGER)[1]::VARCHAR, l::STRUCT(a INTEGER)[1]::VARCHAR FROM n;
+----
+[{'A': 1}]	[{'a': 1}]
+
 query TT
 SELECT (SELECT [{'A': x}]::VARCHAR FROM t WHERE x = 1), (SELECT [{'a': x}]::VARCHAR FROM t WHERE x = 1);
 ----
@@ -128,7 +152,7 @@ SELECT list(DISTINCT {'A': x} ORDER BY {'A': x})::VARCHAR FROM t;
 ----
 [{'A': 0}, {'A': 1}, {'A': 2}, {'A': 3}, {'A': NULL}]
 
-# Controls: the next queries keep their spelling on main too, their plans do not merge the two.
+# Plans that never merge the two expressions keep both spellings.
 query TT
 SELECT (SELECT MAP {x: {'A': x}}::VARCHAR FROM t WHERE x = 1), (SELECT MAP {x: {'a': x}}::VARCHAR FROM t WHERE x = 1);
 ----

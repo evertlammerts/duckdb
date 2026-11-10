@@ -5,6 +5,8 @@
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 
+#include <functional>
+
 using namespace duckdb;
 
 TEST_CASE("Test that LogicalType::WithAlias does not modify shared type info", "[logical_type_immutable]") {
@@ -114,4 +116,34 @@ TEST_CASE("Test that type equality is symmetric", "[logical_type_immutable]") {
 	// collations do not affect equality
 	REQUIRE(LogicalType::VARCHAR_COLLATION("nocase") == LogicalType::VARCHAR);
 	REQUIRE(LogicalType(LogicalType::VARCHAR) == LogicalType::VARCHAR_COLLATION("nocase"));
+}
+
+TEST_CASE("Test that type equality ignores the case of field names and EqualsIncludingFieldSpelling does not",
+          "[logical_type_immutable]") {
+	auto field = [](const char *name) {
+		return LogicalType::STRUCT({{name, LogicalType::INTEGER}});
+	};
+	duckdb::vector<std::function<LogicalType(const char *)>> nestings {
+	    field,
+	    [&](const char *name) {
+		    return LogicalType::STRUCT({{"s", field(name)}});
+	    },
+	    [&](const char *name) { return LogicalType::LIST(field(name)); },
+	    [&](const char *name) { return LogicalType::MAP(LogicalType::INTEGER, field(name)); },
+	    [&](const char *name) { return LogicalType::ARRAY(field(name), 2); },
+	    [&](const char *name) { return LogicalType::ANY_PARAMS(field(name)); },
+	    [](const char *name) {
+		    return LogicalType::UNION({{name, LogicalType::INTEGER}});
+	    },
+	};
+	for (auto &nest : nestings) {
+		auto upper = nest("A");
+		auto lower = nest("a");
+		REQUIRE(upper == lower);
+		REQUIRE(!upper.EqualsIncludingFieldSpelling(lower));
+		REQUIRE(!lower.EqualsIncludingFieldSpelling(upper));
+		REQUIRE(upper.EqualsIncludingFieldSpelling(nest("A")));
+		REQUIRE(upper != nest("B"));
+		REQUIRE(!upper.EqualsIncludingFieldSpelling(nest("B")));
+	}
 }

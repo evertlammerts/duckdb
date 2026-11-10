@@ -12,7 +12,7 @@ SELECT to_json([union_value(A := x)]), to_json([union_value(a := x)]) FROM t WHE
 ----
 [{"A":1}]	[{"a":1}]
 
-# Control: keeps its spelling on main too, its plan does not merge the two.
+# A plan that never merges the two expressions keeps both spellings.
 query TT
 SELECT (SELECT to_json([union_value(A := x)]) FROM t WHERE x = 1), (SELECT to_json([union_value(a := x)]) FROM t WHERE x = 1);
 ----
