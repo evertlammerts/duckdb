@@ -1,0 +1,112 @@
+# name: test/sql/error/error_location_stored_query_execution.test
+# description: An error raised at execution from a part of a stored view body points at the view reference
+# group: [error]
+
+statement ok
+CREATE TABLE cast_src (s VARCHAR);
+
+statement ok
+INSERT INTO cast_src VALUES ('x');
+
+statement ok
+CREATE VIEW v_cast AS SELECT s::INTEGER AS i FROM cast_src;
+
+statement ok
+CREATE VIEW vv_cast AS SELECT * FROM v_cast;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+                                                             ^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM vv_cast
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM vv_cast
+                                                             ^^^^^^^
+
+statement ok
+CREATE VIEW v_cast_in_subquery AS SELECT (SELECT max(s::INTEGER) FROM cast_src) AS i;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast_in_subquery
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast_in_subquery
+                                                             ^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, (SELECT max(i) FROM v_cast) AS second_column
+----
+LINE 1: SELECT 1 AS first_column, (SELECT max(i) FROM v_cast) AS second_column
+                                                      ^^^^^^
+
+# parts of a view body that the expression tree does not hold: pivot and unpivot columns, a NEAREST ranking expression
+# and the input of MATCH_RECOGNIZE
+statement ok
+CREATE TABLE pivot_src (k INTEGER, c VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO pivot_src VALUES (1, 'x', 1);
+
+statement ok
+CREATE VIEW v_pivot AS SELECT * FROM (PIVOT pivot_src ON (c::INTEGER) IN (1) USING sum(val) GROUP BY k);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+                                                             ^^^^^^^
+
+statement ok
+CREATE VIEW v_unpivot AS SELECT * FROM (UNPIVOT (SELECT k, c FROM pivot_src) ON (c::INTEGER) AS x INTO NAME n VALUE val);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_unpivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_unpivot
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE nearest_left (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE TABLE nearest_right (id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO nearest_left VALUES (1, [1, 2]);
+
+statement ok
+INSERT INTO nearest_right VALUES (1, 'x');
+
+statement ok
+CREATE VIEW v_nearest AS SELECT l.id FROM nearest_left l JOIN nearest_right r NEAREST 1 BY DISTANCE array_distance(l.e, r.s::FLOAT[2]);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE match_src (p INTEGER, o INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO match_src VALUES (1, 1, 'x');
+
+statement ok
+CREATE VIEW v_match AS SELECT * FROM (SELECT p, o, s::INTEGER AS v FROM match_src) MATCH_RECOGNIZE (PARTITION BY p ORDER BY o MEASURES FIRST(v) AS mv ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+                                                             ^^^^^^^
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+----
+<REGEX>:.*"location":"\[53,6\]".*

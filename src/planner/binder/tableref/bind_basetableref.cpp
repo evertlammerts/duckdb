@@ -5,6 +5,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -323,6 +324,8 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 		// The view may contain CTEs, but maybe only in the cte_map, so we need create CTE nodes for them
 		auto query = view_catalog_entry.GetQuery().Copy();
 		SubqueryRef subquery(unique_ptr_cast<SQLStatement, SelectStatement>(std::move(query)));
+		// the stored locations are offsets into the CREATE VIEW text, which errors are never reported against
+		ParsedExpressionIterator::ReplaceQueryLocations(*subquery.subquery->node, ref.query_location);
 
 		subquery.alias = ref.alias;
 		// construct view names by taking the view aliases
@@ -350,7 +353,7 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 		try {
 			bound_child = view_binder->Bind(subquery);
 		} catch (std::exception &ex) {
-			// locations inside the view body are offsets into the CREATE VIEW text, not into this query
+			// a scalar macro body expanded while the view is bound keeps the offsets of its CREATE MACRO text
 			ErrorData error(ex);
 			if (!error.ReplaceQueryLocation(ref.query_location)) {
 				throw;

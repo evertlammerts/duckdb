@@ -24,6 +24,9 @@ statement ok
 CREATE MACRO tm_over_view() AS TABLE SELECT a FROM v;
 
 statement ok
+CREATE VIEW v_over_tm AS SELECT * FROM tm();
+
+statement ok
 PREPARE p_over_view AS SELECT 1 AS first_column, 2 AS second_column, a FROM v;
 
 statement ok
@@ -68,6 +71,31 @@ SELECT 1 AS first_column, 2 AS second_column, * FROM tm_over_view()
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_over_view()
                                                              ^^^^^^^^^^^^^^
 
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
+                                                             ^^^^^^^^^
+
+# the body of a scalar macro that a view calls is expanded while the view is bound, after its copy was rewritten
+statement ok
+CREATE TABLE macro_src (a INTEGER);
+
+statement ok
+CREATE MACRO scalar_over_src() AS (SELECT max(a) FROM macro_src);
+
+statement ok
+CREATE VIEW v_over_macro AS SELECT scalar_over_src() AS x;
+
+statement ok
+DROP TABLE macro_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
+                                                             ^^^^^^^^^^^^
+
 # a view bound for its columns alone has no reference to point at
 statement error
 SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
@@ -101,6 +129,86 @@ SELECT 1 AS first_column, 2 AS second_column, missing_column FROM range(1)
 ----
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, missing_column FROM range(1)
                                                       ^^^^^^^^^^^^^^
+
+# parts of a view body outside its expression tree: a cast's target type, a pivot column, a NEAREST ranking expression,
+# the input of MATCH_RECOGNIZE and the key of a recursive CTE
+statement ok
+CREATE TYPE mood AS ENUM ('happy');
+
+statement ok
+CREATE VIEW v_type AS SELECT 'happy'::mood AS m;
+
+statement ok
+DROP TYPE mood;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, m FROM v_type
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, m FROM v_type
+                                                             ^^^^^^
+
+statement ok
+CREATE TABLE pivot_src (k INTEGER, c VARCHAR, val INTEGER);
+
+statement ok
+CREATE VIEW v_pivot AS SELECT * FROM (PIVOT pivot_src ON c IN ('a') USING sum(val) GROUP BY k);
+
+statement ok
+ALTER TABLE pivot_src RENAME c TO c2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+                                                             ^^^^^^^
+
+statement ok
+CREATE TABLE nearest_left (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE TABLE nearest_right (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE VIEW v_nearest AS SELECT l.id FROM nearest_left l JOIN nearest_right r NEAREST 1 BY DISTANCE array_distance(l.e, r.e);
+
+statement ok
+ALTER TABLE nearest_right RENAME e TO e2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE match_src (p INTEGER, o INTEGER, v INTEGER);
+
+statement ok
+CREATE VIEW v_match AS SELECT * FROM (SELECT p, o, v FROM match_src) MATCH_RECOGNIZE (PARTITION BY p ORDER BY o MEASURES FIRST(o) AS ms ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+statement ok
+ALTER TABLE match_src RENAME v TO v2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+                                                             ^^^^^^^
+
+statement ok
+CREATE TABLE key_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_key AS WITH RECURSIVE t USING KEY (a) AS (SELECT * FROM key_src UNION ALL SELECT * FROM t WHERE false) SELECT * FROM t;
+
+statement ok
+ALTER TABLE key_src RENAME a TO a2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_key
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_key
+                                                             ^^^^^
 
 statement ok
 CREATE TABLE prepared_src (a INTEGER);
@@ -174,3 +282,43 @@ statement error
 EXECUTE p
 ----
 <!REGEX>:.*"position".*
+
+statement error
+EXECUTE p
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<REGEX>:.*src does not exist.*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<!REGEX>:.*"position".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_tm')
+----
+<REGEX>:.*Table with name src does not exist.*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_tm')
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_macro')
+----
+<REGEX>:.*Table with name macro_src does not exist.*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_macro')
+----
+<!REGEX>:.*"location".*
