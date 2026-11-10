@@ -485,7 +485,7 @@ TEST_CASE("Ordinary queries bind on a small stack", "[api]") {
 	}
 }
 
-// Each depth puts the last check at another point of the stack, so a reserve too small for some leaf crashes at one.
+// Each depth puts the last check at another point of the stack, so a reserve well below a leaf's need crashes at one.
 TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -504,9 +504,15 @@ TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[a
 	CreateChain(con, "VIEW w%d AS ", table_function_leaf, "SELECT * FROM w%d", DEEP_NEST);
 	const vector<std::pair<string, string>> chains {{"v", "42"}, {"w", table_function_value}};
 
-	// the floor sets the reserve on all of these stacks, and an eighth of most is less than the read_csv leaf needs
+	// the floor sets the reserve on all of these stacks, and an eighth of most is less than the read_csv leaf needs;
+	// with 4 KiB pages they are every 4 KiB from 128 to 188 KiB, with 16 KiB pages 128, 144, 160, 176 and 192 KiB
+	idx_t previous_size = 0;
 	for (idx_t stack_kib = 128; stack_kib <= 188; stack_kib += 4) {
-		auto stack_size = stack_kib * 1024 * STACK_FRAME_SCALE;
+		auto stack_size = PageMultiple(stack_kib * 1024 * STACK_FRAME_SCALE);
+		if (stack_size == previous_size) {
+			continue;
+		}
+		previous_size = stack_size;
 		for (auto &chain : chains) {
 			bool refused = false;
 			for (idx_t depth = 0; depth <= DEEP_NEST && !refused; depth++) {
