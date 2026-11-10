@@ -171,6 +171,36 @@ static void MergeNullRows(ValidityMask &mask, const ValidityMask &nulls, idx_t s
 	}
 }
 
+// vector verification requires NULL fields under a NULL struct row; array elements follow FlatVector::SetNull
+static void MergeNullRows(Vector &vector, const ValidityMask &nulls, idx_t size) {
+	if (nulls.CannotHaveNull()) {
+		return;
+	}
+	MergeNullRows(FlatVector::ValidityMutable(vector), nulls, size);
+	switch (vector.GetType().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &entry : StructVector::GetEntries(vector)) {
+			MergeNullRows(entry, nulls, size);
+		}
+		break;
+	case PhysicalType::ARRAY: {
+		auto array_size = ArrayType::GetSize(vector.GetType());
+		ValidityMask element_nulls(size * array_size);
+		for (idx_t row = 0; row < size; row++) {
+			if (!nulls.RowIsValid(row)) {
+				for (idx_t i = 0; i < array_size; i++) {
+					element_nulls.SetInvalid(row * array_size + i);
+				}
+			}
+		}
+		MergeNullRows(ArrayVector::GetChildMutable(vector), element_nulls, size * array_size);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
 namespace {
 
 struct ArrowListOffsetData {
@@ -647,40 +677,125 @@ static idx_t FindRunIndex(const VectorIterator<RUN_END_TYPE> &run_ends, idx_t co
 	return begin;
 }
 
-template <class RUN_END_TYPE>
-static void FlattenRunEnds(Vector &result, ArrowArrayScanState &array_state, idx_t compressed_size, idx_t scan_offset,
-                           idx_t count, const ValidityMask *parent_mask) {
-	auto &run_end_encoding = array_state.RunEndEncoding();
-	auto run_ends_data = run_end_encoding.run_ends->Values<RUN_END_TYPE>();
-
+template <class RUN_END_TYPE, class EMIT_RUN>
+static void ForEachRun(const VectorIterator<RUN_END_TYPE> &run_ends, idx_t compressed_size, idx_t scan_offset,
+                       idx_t count, EMIT_RUN &&emit_run) {
 	// the run ends array is always valid according to the Arrow spec
-	SelectionVector sel(count);
 	idx_t row = 0;
-	for (auto run = FindRunIndex(run_ends_data, compressed_size, scan_offset); run < compressed_size && row < count;
-	     run++) {
-		auto run_end = static_cast<idx_t>(run_ends_data[run].GetValueUnsafe());
+	for (auto run = FindRunIndex(run_ends, compressed_size, scan_offset); run < compressed_size && row < count; run++) {
+		auto run_end = static_cast<idx_t>(run_ends[run].GetValueUnsafe());
 		D_ASSERT(run_end > scan_offset + row);
 		auto run_rows = MinValue<idx_t>(run_end - (scan_offset + row), count - row);
-		for (idx_t i = 0; i < run_rows; i++) {
-			sel.set_index(row + i, run);
-		}
+		emit_run(run, row, run_rows);
 		row += run_rows;
 	}
 	if (row < count) {
 		// a parent whose offsets reach past the run end encoded child would leave rows without a run
 		throw InvalidInputException("Arrow run-end encoded array is read past the end of its runs");
 	}
-	result.Reference(*run_end_encoding.values);
-	result.Flatten(sel, count);
-	result.BufferMutable().AddAuxiliaryData(make_uniq<ArrowAuxiliaryData>(array_state.owned_data));
-	// the rows take the validity of their values, so the NULL rows of a parent go in again, into nested fields too
-	if (parent_mask && parent_mask->CanHaveNull()) {
-		for (idx_t i = 0; i < count; i++) {
-			if (!parent_mask->RowIsValid(i)) {
-				FlatVector::SetNull(result, i, true);
+}
+
+template <class RUN_END_TYPE, class VALUE_TYPE>
+static void BroadcastRunValues(Vector &result, ArrowRunEndEncodingState &run_end_encoding, idx_t compressed_size,
+                               idx_t scan_offset, idx_t count) {
+	auto run_ends_data = run_end_encoding.run_ends->Values<RUN_END_TYPE>();
+	auto values_data = run_end_encoding.values->Values<VALUE_TYPE>();
+	auto result_data = FlatVector::ScatterWriter<VALUE_TYPE>(result);
+	if (!values_data.CanHaveNull()) {
+		ForEachRun(run_ends_data, compressed_size, scan_offset, count, [&](idx_t run, idx_t row, idx_t run_rows) {
+			auto value_entry = values_data[run];
+			auto &value = value_entry.GetValue();
+			for (idx_t i = 0; i < run_rows; i++) {
+				result_data[row + i] = value;
+			}
+		});
+		return;
+	}
+	auto &validity = FlatVector::ValidityMutable(result);
+	ForEachRun(run_ends_data, compressed_size, scan_offset, count, [&](idx_t run, idx_t row, idx_t run_rows) {
+		auto value_entry = values_data[run];
+		if (value_entry.IsValid()) {
+			auto &value = value_entry.GetValue();
+			for (idx_t i = 0; i < run_rows; i++) {
+				result_data[row + i] = value;
+				validity.SetValid(row + i);
+			}
+		} else {
+			for (idx_t i = 0; i < run_rows; i++) {
+				validity.SetInvalid(row + i);
 			}
 		}
+	});
+}
+
+template <class RUN_END_TYPE>
+static void GatherRunValues(Vector &result, ArrowRunEndEncodingState &run_end_encoding, idx_t compressed_size,
+                            idx_t scan_offset, idx_t count) {
+	auto run_ends_data = run_end_encoding.run_ends->Values<RUN_END_TYPE>();
+	SelectionVector sel(count);
+	ForEachRun(run_ends_data, compressed_size, scan_offset, count, [&](idx_t run, idx_t row, idx_t run_rows) {
+		for (idx_t i = 0; i < run_rows; i++) {
+			sel.set_index(row + i, run);
+		}
+	});
+	result.Reference(*run_end_encoding.values);
+	result.Flatten(sel, count);
+}
+
+template <class RUN_END_TYPE>
+static void FlattenRunEnds(Vector &result, ArrowArrayScanState &array_state, idx_t compressed_size, idx_t scan_offset,
+                           idx_t count) {
+	auto &run_end_encoding = array_state.RunEndEncoding();
+	auto physical_type = run_end_encoding.values->GetType().InternalType();
+	// one store per row is cheapest for a fixed width value; the gather shares string heaps and list children
+	switch (physical_type) {
+	case PhysicalType::BOOL:
+		BroadcastRunValues<RUN_END_TYPE, bool>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INT8:
+		BroadcastRunValues<RUN_END_TYPE, int8_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INT16:
+		BroadcastRunValues<RUN_END_TYPE, int16_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INT32:
+		BroadcastRunValues<RUN_END_TYPE, int32_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INT64:
+		BroadcastRunValues<RUN_END_TYPE, int64_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INT128:
+		BroadcastRunValues<RUN_END_TYPE, hugeint_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::UINT8:
+		BroadcastRunValues<RUN_END_TYPE, uint8_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::UINT16:
+		BroadcastRunValues<RUN_END_TYPE, uint16_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::UINT32:
+		BroadcastRunValues<RUN_END_TYPE, uint32_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::UINT64:
+		BroadcastRunValues<RUN_END_TYPE, uint64_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::UINT128:
+		BroadcastRunValues<RUN_END_TYPE, uhugeint_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::FLOAT:
+		BroadcastRunValues<RUN_END_TYPE, float>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::DOUBLE:
+		BroadcastRunValues<RUN_END_TYPE, double>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	case PhysicalType::INTERVAL:
+		BroadcastRunValues<RUN_END_TYPE, interval_t>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
+	default:
+		GatherRunValues<RUN_END_TYPE>(result, run_end_encoding, compressed_size, scan_offset, count);
+		break;
 	}
+	result.BufferMutable().AddAuxiliaryData(make_uniq<ArrowAuxiliaryData>(array_state.owned_data));
 }
 
 void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, const ArrowArray &array,
@@ -742,20 +857,20 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 	auto physical_type = run_ends_type.GetDuckType().InternalType();
 	switch (physical_type) {
 	case PhysicalType::INT16:
-		FlattenRunEnds<int16_t>(vector, array_state, compressed_size, scan_offset, size, parent_mask);
+		FlattenRunEnds<int16_t>(vector, array_state, compressed_size, scan_offset, size);
 		break;
 	case PhysicalType::INT32:
-		FlattenRunEnds<int32_t>(vector, array_state, compressed_size, scan_offset, size, parent_mask);
+		FlattenRunEnds<int32_t>(vector, array_state, compressed_size, scan_offset, size);
 		break;
 	case PhysicalType::INT64:
-		FlattenRunEnds<int64_t>(vector, array_state, compressed_size, scan_offset, size, parent_mask);
+		FlattenRunEnds<int64_t>(vector, array_state, compressed_size, scan_offset, size);
 		break;
 	default:
 		throw NotImplementedException("Type '%s' not implemented for RunEndEncoding", TypeIdToString(physical_type));
 	}
 	// decoding writes the validity of every row from the values
 	if (parent_mask) {
-		MergeNullRows(FlatVector::ValidityMutable(vector), *parent_mask, size);
+		MergeNullRows(vector, *parent_mask, size);
 	}
 }
 template <class SRC>

@@ -1554,6 +1554,78 @@ TEST_CASE("Arrow scan of a STRUCT with a NULL row over run-end encoded fields", 
 	}
 }
 
+TEST_CASE("Arrow scan of a STRUCT with a NULL row over run-end encoded fields whose values hold NULLs", "[arrow]") {
+	// run ends {3, 4}: the run of the first value crosses the NULL struct row
+	ArrowNodes nodes;
+	const uint8_t validity[] = {0x0D};
+	const int32_t run_ends[] = {3, 4};
+	const uint8_t first_valid[] = {0x01};
+	auto struct_over = [&](ArrowNodes::Node &values) -> ArrowNodes::Node & {
+		return nodes.Add("+s", "d", 4, {validity}, {RunEnds(nodes, "r", 4, run_ends, values)}, 1);
+	};
+	auto rows = [](const string &value, const string &type) {
+		auto row = "{'r': " + value + "}";
+		return RowsQuery({row, "NULL", row, "{'r': NULL}"}, "STRUCT(r " + type + ")");
+	};
+	SECTION("INTEGER") {
+		const int32_t data[] = {7, 0};
+		auto &column = struct_over(nodes.Add("i", "values", 2, {first_valid, data}, {}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("7", "INTEGER")));
+	}
+	SECTION("VARCHAR") {
+		const int32_t offsets[] = {0, 35, 35};
+		auto &column = struct_over(
+		    nodes.Add("u", "values", 2, {first_valid, offsets, "a long string past the inline limit"}, {}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("'a long string past the inline limit'", "VARCHAR")));
+	}
+	SECTION("STRUCT") {
+		const int32_t i_data[] = {1, 7};
+		auto &i = nodes.Add("i", "i", 2, {nullptr, i_data});
+		const int32_t s_offsets[] = {0, 0, 1};
+		const uint8_t s_validity[] = {0x02};
+		auto &s_field = nodes.Add("u", "s", 2, {s_validity, s_offsets, "z"}, {}, 1);
+		auto &column = struct_over(nodes.Add("+s", "values", 2, {first_valid}, {i, s_field}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("{'i': 1, 's': NULL}", "STRUCT(i INTEGER, s VARCHAR)")));
+	}
+	SECTION("LIST") {
+		const int32_t element_data[] = {1, 0};
+		auto &elements = nodes.Add("i", "item", 2, {first_valid, element_data}, {}, 1);
+		const int32_t offsets[] = {0, 2, 2};
+		auto &column = struct_over(nodes.Add("+l", "values", 2, {first_valid, offsets}, {elements}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("[1, NULL]", "INTEGER[]")));
+	}
+	SECTION("fixed-size ARRAY") {
+		const int32_t element_data[] = {1, 0, 5, 6};
+		const uint8_t element_validity[] = {0x0D};
+		auto &elements = nodes.Add("i", "item", 4, {element_validity, element_data}, {}, 1);
+		auto &column = struct_over(nodes.Add("+w:2", "values", 2, {first_valid}, {elements}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("[1, NULL]", "INTEGER[2]")));
+	}
+	SECTION("MAP") {
+		const int32_t key_offsets[] = {0, 1};
+		auto &keys = nodes.Add("u", "key", 1, {nullptr, key_offsets, "k"});
+		keys.schema.flags = 0;
+		const int32_t map_data[] = {0};
+		const uint8_t map_validity[] = {0x00};
+		auto &map_values = nodes.Add("i", "value", 1, {map_validity, map_data}, {}, 1);
+		auto &entries = nodes.Add("+s", "entries", 1, {nullptr}, {keys, map_values});
+		entries.schema.flags = 0;
+		const int32_t offsets[] = {0, 1, 1};
+		auto &column = struct_over(nodes.Add("+m", "values", 2, {first_valid, offsets}, {entries}, 1));
+		REQUIRE(StructScanReadsRows(column, rows("MAP {'k': NULL}", "MAP(VARCHAR, INTEGER)")));
+	}
+	SECTION("sparse UNION") {
+		const int32_t n_data[] = {2, 0};
+		auto &n = nodes.Add("i", "n", 2, {nullptr, n_data});
+		const int32_t s_offsets[] = {0, 0, 0};
+		const uint8_t s_validity[] = {0x00};
+		auto &s_member = nodes.Add("u", "s", 2, {s_validity, s_offsets, ""}, {}, 2);
+		const int8_t type_ids[] = {0, 1};
+		auto &column = struct_over(nodes.Add("+us:0,1", "values", 2, {type_ids}, {n, s_member}));
+		REQUIRE(StructScanReadsRows(column, rows("union_value(n := 2)", "UNION(n INTEGER, s VARCHAR)")));
+	}
+}
+
 TEST_CASE("Arrow scan of a dictionary over run-end encoded STRUCT values", "[arrow]") {
 	ArrowNodes nodes;
 	auto &struct_values = StructValues(nodes);
