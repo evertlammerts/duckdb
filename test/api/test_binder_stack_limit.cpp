@@ -96,6 +96,14 @@ bool RunOnSmallStack(SmallStackQuery &query) {
 	CloseHandle(thread);
 	return true;
 }
+
+// Windows rounds a stack reservation up to its allocation granularity, so sizes in between give the same stack.
+idx_t PageMultiple(idx_t size) {
+	SYSTEM_INFO info;
+	GetSystemInfo(&info);
+	auto granularity = static_cast<idx_t>(info.dwAllocationGranularity);
+	return (size + granularity - 1) / granularity * granularity;
+}
 #else
 void *RunQueryThread(void *argument) {
 	RunQuery(*static_cast<SmallStackQuery *>(argument));
@@ -125,10 +133,17 @@ bool RunOnSmallStack(SmallStackQuery &query) {
 	munmap(mapping, mapping_size);
 	return created;
 }
+
+// pthread_attr_setstack on Apple platforms takes only whole pages, which are 16 KiB on Apple silicon.
+idx_t PageMultiple(idx_t size) {
+	auto queried = sysconf(_SC_PAGESIZE);
+	auto page_size = queried > 0 ? static_cast<idx_t>(queried) : idx_t(4096);
+	return (size + page_size - 1) / page_size * page_size;
+}
 #endif
 
 SmallStackQuery QueryOnSmallStack(Connection &con, const string &sql, idx_t stack_size) {
-	SmallStackQuery query {con, sql, stack_size};
+	SmallStackQuery query {con, sql, PageMultiple(stack_size)};
 	REQUIRE(RunOnSmallStack(query));
 	return query;
 }
@@ -154,9 +169,16 @@ bool RequireValueOrStackError(Connection &con, const string &sql, const string &
                               idx_t min_stack_size = SWEEP_MIN_STACK_SIZE, idx_t max_stack_size = SWEEP_MAX_STACK_SIZE,
                               idx_t step = SWEEP_STEP) {
 	bool planning_error = false;
+	idx_t previous_size = 0;
 	for (idx_t stack_size = min_stack_size; stack_size <= max_stack_size; stack_size += step) {
-		auto query = QueryOnSmallStack(con, sql, stack_size);
-		INFO(stack_size);
+		// with pages, or an allocation granularity, larger than the step several steps round to the same stack
+		auto rounded_size = PageMultiple(stack_size);
+		if (rounded_size == previous_size) {
+			continue;
+		}
+		previous_size = rounded_size;
+		auto query = QueryOnSmallStack(con, sql, rounded_size);
+		INFO(query.stack_size);
 		INFO(query.error);
 		if (query.has_error) {
 			auto planning = IsStackError(query.error, "planning");
