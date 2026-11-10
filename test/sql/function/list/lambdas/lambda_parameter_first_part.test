@@ -168,3 +168,99 @@ statement error
 SELECT list_transform([1], lambda y: s.k) FROM src GROUP BY k;
 ----
 column "s" must appear in the GROUP BY clause
+
+# the arrow syntax reads the first name part as the lambda keyword does
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement ok
+CREATE TABLE ar AS SELECT {'d': 99} AS p_;
+
+statement ok
+CREATE TABLE ar_d AS SELECT {'d': 99} AS p_, 7 AS d;
+
+query I
+SELECT list_transform([{'d': 1}], p_ -> p_.d) FROM ar;
+----
+[1]
+
+query I
+SELECT list_transform([{'id': 1}], id -> id.id) FROM (VALUES ({'id': 99})) AS v(id);
+----
+[1]
+
+query I
+SELECT list_transform([{'d': {'e': 1}}], p_ -> p_.d.e) FROM (VALUES ({'d': {'e': 99}})) AS v(p_);
+----
+[1]
+
+query I
+SELECT list_transform([{'d': 1}], p_ -> list_transform([2], y -> p_.d + y)) FROM ar;
+----
+[[3]]
+
+# a table aliased like the parameter provides the reference only when it has the column
+
+query I
+SELECT list_transform([{'d': 1}], ar_d -> ar_d.d) FROM ar_d;
+----
+[7]
+
+query I
+SELECT list_transform([{'d': 1}], ar -> ar.d) FROM ar;
+----
+[1]
+
+query I
+SELECT list_transform([{'p_': {'d': 1}}], ar -> ar.p_.d) FROM ar;
+----
+[99]
+
+# a field the parameter cannot provide is an error, never the column's field
+
+statement error
+SELECT list_transform([{'d': 1}], p_ -> p_.zz) FROM (VALUES ({'zz': 5})) AS v(p_);
+----
+Could not find key "zz" in struct
+
+statement error
+SELECT list_transform([1], p_ -> p_.d) FROM ar;
+----
+Cannot extract field 'd' from expression "p_"
+
+# no group, merged join column or macro parameter claims the parameter
+
+query I
+SELECT list_transform([{'d': 1}], p_ -> p_.d) FROM ar GROUP BY ALL;
+----
+[1]
+
+query I
+SELECT count(*) FROM ar HAVING list_transform([{'d': 1}], p_ -> p_.d) = [1];
+----
+1
+
+query I
+SELECT count(*) FROM ar AS a1 JOIN ar AS a2 USING (p_) WHERE list_transform([{'d': 1}], p_ -> p_.d) = [1];
+----
+1
+
+statement ok
+CREATE MACRO arrow_param_macro(p_) AS list_transform([{'d': 1}], p_ -> p_.d);
+
+query I
+SELECT arrow_param_macro({'d': 99});
+----
+[1]
+
+statement ok
+CREATE MACRO arrow_field_macro(s) AS list_transform([1], d -> s.d + d);
+
+query I
+SELECT arrow_field_macro({'d': 10});
+----
+[11]
+
+statement ok
+RESET lambda_syntax;

@@ -800,3 +800,33 @@ Cannot extract field 'd' from expression "x"
 
 statement ok
 RESET lambda_syntax;
+
+# keyword lambdas stored before storage version v1.3.0 read back as arrow lambdas and keep their reading
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db (STORAGE_VERSION 'v1.2.0');
+
+statement ok
+CREATE TABLE old_db.t AS SELECT {'d': 99} AS p_, {'x': 98} AS x;
+
+statement ok
+CREATE VIEW old_db.vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM old_db.t;
+
+query II
+SELECT * FROM old_db.vw;
+----
+[1]	[1]
+
+statement ok
+DETACH old_db;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db;
+
+query II
+SELECT * FROM old_db.vw;
+----
+[1]	[1]
+
+statement ok
+DETACH old_db;

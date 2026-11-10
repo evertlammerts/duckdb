@@ -8,12 +8,12 @@
 
 #pragma once
 
-#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 class ColumnAliasBinder;
 class HavingBinder;
+class LambdaExpression;
 
 class ColumnQualifier {
 public:
@@ -46,12 +46,20 @@ public:
 	//! A dot call receiver that is a parameter reference of enclosing_lambdas is left unqualified, for the binder of
 	//! its clause
 	optional_ptr<CatalogEntry> QualifyFunction(FunctionExpression &function,
-	                                           const vector<LambdaParameterScope> &enclosing_lambdas);
+	                                           const vector<identifier_set_t> &enclosing_lambdas);
 	//! Whether a table of this scope has the qualified reference as [catalog.][schema path.]table.column[.field...]
 	bool TableProvidesReference(const ColumnRefExpression &col_ref);
 	//! Whether the reference is a parameter of one of the lambdas, or a field access on one. A table of this scope
 	//! that provides the reference wins, because that is the order in which the binder resolves it
-	bool IsLambdaParameterReference(const vector<LambdaParameterScope> &lambdas, const ColumnRefExpression &col_ref);
+	bool IsLambdaParameterReference(const vector<identifier_set_t> &lambdas, const ColumnRefExpression &col_ref);
+	//! Whether argument index of the call binds as a lambda, filling in the parameter names it declares
+	static bool TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
+	                                   identifier_set_t &parameters);
+	//! Visits the children of a call, handing each argument that binds as a lambda to lambda_callback instead
+	static void EnumerateCallChildren(
+	    Binder &binder, FunctionExpression &function,
+	    const std::function<void(unique_ptr<ParsedExpression> &child)> &callback,
+	    const std::function<void(LambdaExpression &lambda, identifier_set_t &parameters)> &lambda_callback);
 
 private:
 	Binder &binder;
@@ -59,7 +67,7 @@ private:
 	optional_ptr<ColumnAliasBinder> alias_binder;
 	optional_ptr<HavingBinder> having_binder;
 	//! The parameters of the lambdas that QualifyColumnNames is inside, innermost last; they are not bound yet
-	vector<LambdaParameterScope> lambda_params;
+	vector<identifier_set_t> lambda_params;
 
 private:
 	unique_ptr<ParsedExpression> QualifyColumnNameWithManyDotsInternal(ColumnRefExpression &col_ref, ErrorData &error,
@@ -73,6 +81,11 @@ private:
 	                                      optional_ptr<ErrorData> error);
 
 	unique_ptr<ParsedExpression> QualifyColumnNameInternal(ColumnRefExpression &col_ref, ErrorData &error);
+	//! The argument of the call as written that takes a lambda, looked up once per function name and binder
+	static optional_idx GetLambdaArgumentPosition(Binder &binder, const FunctionExpression &function);
+	//! The function entry of the call; dot_call says it is written on a column, as in "x.lower()"
+	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function,
+	                                               const QualifiedName &name, bool &dot_call);
 };
 
 } // namespace duckdb
