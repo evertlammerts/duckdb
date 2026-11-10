@@ -39,7 +39,7 @@
 #define DUCKDB_PLANNER_LARGE_STACK_FRAMES
 #endif
 #endif
-#if !defined(DUCKDB_PLANNER_LARGE_STACK_FRAMES) && ((defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER))
+#if !defined(DUCKDB_PLANNER_LARGE_STACK_FRAMES) && ((defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_WIN32))
 #define DUCKDB_PLANNER_LARGE_STACK_FRAMES
 #endif
 
@@ -126,10 +126,10 @@ void Planner::CheckStackSpace(PlanningStep step) {
 	// a floor covers its step's work below the last check and the throw; frames are larger under the sanitizers and
 	// without optimization, and on Windows guard pages and a catch block on top of the throw take more
 #ifdef DUCKDB_PLANNER_LARGE_STACK_FRAMES
-	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(64) * 1024;
-	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(64) * 1024;
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(104) * 1024;
+	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(104) * 1024;
 #else
-	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(24) * 1024;
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(40) * 1024;
 	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(16) * 1024;
 #endif
 	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
