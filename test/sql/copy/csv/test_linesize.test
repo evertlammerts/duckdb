@@ -5,7 +5,7 @@
 statement error
 FROM read_csv('{DATA_DIR}/csv/15473.csv', max_line_size = 10)
 ----
-Possible Solution: Change the maximum length size, e.g., max_line_size=19
+Possible Solution: Change the maximum length size, e.g., max_line_size=18
 
 statement error
 FROM read_csv('{DATA_DIR}/csv/15473.csv', max_line_size = 1152921504606846976)

@@ -34,46 +34,107 @@ public:
 	LinePosition begin;
 	LinePosition end;
 	static void SanitizeError(string &value);
-	//! Reconstructs the current line to be used in error messages
+	//! The size of a buffer, or fallback when its handle is gone
+	template <class T>
+	static idx_t BufferSize(T &buffer_handles, idx_t buffer_idx, idx_t fallback) {
+		auto entry = buffer_handles.find(buffer_idx);
+		return entry == buffer_handles.end() ? fallback : entry->second->actual_size;
+	}
+	//! The end of a buffer is the start of the next one
+	template <class T>
+	static LinePosition StartOfNextBufferAtEnd(T &buffer_handles, LinePosition position) {
+		while (true) {
+			auto entry = buffer_handles.find(position.buffer_idx);
+			auto next = buffer_handles.find(position.buffer_idx + 1);
+			if (entry == buffer_handles.end() || next == buffer_handles.end() ||
+			    position.buffer_pos < entry->second->actual_size) {
+				return position;
+			}
+			position = {position.buffer_idx + 1, 0, next->second->actual_size};
+		}
+	}
+	static bool Before(const LinePosition &a, const LinePosition &b) {
+		return a.buffer_idx < b.buffer_idx || (a.buffer_idx == b.buffer_idx && a.buffer_pos < b.buffer_pos);
+	}
+	//! The bytes from one position to a later one, counting every buffer in between
+	template <class T>
+	static idx_t Distance(T &buffer_handles, const LinePosition &from, const LinePosition &to) {
+		if (!Before(from, to)) {
+			return 0;
+		}
+		if (from.buffer_idx == to.buffer_idx) {
+			return to.buffer_pos - from.buffer_pos;
+		}
+		// buffers whose handle is gone were full, as every buffer but the last is
+		idx_t distance = BufferSize(buffer_handles, from.buffer_idx, from.buffer_size) - from.buffer_pos;
+		for (idx_t buffer_idx = from.buffer_idx + 1; buffer_idx < to.buffer_idx; buffer_idx++) {
+			distance += BufferSize(buffer_handles, buffer_idx, from.buffer_size);
+		}
+		return distance + to.buffer_pos;
+	}
+	//! Finds where the content of [begin, end) starts, after the line ends that begin may point at, and whether a
+	//! carriage return before a newline at end ends it
+	template <class T>
+	void ContentBounds(T &buffer_handles, LinePosition &content_begin, idx_t &front, idx_t &back) const {
+		content_begin = StartOfNextBufferAtEnd(buffer_handles, begin);
+		front = 0;
+		back = 0;
+		// line ends at the start are those of the line before and of empty lines, which are no content
+		while (Before(content_begin, end)) {
+			auto entry = buffer_handles.find(content_begin.buffer_idx);
+			if (entry == buffer_handles.end() || content_begin.buffer_pos >= entry->second->actual_size) {
+				break;
+			}
+			const char c = entry->second->Ptr()[content_begin.buffer_pos];
+			if (c != '\n' && c != '\r') {
+				break;
+			}
+			front++;
+			content_begin.buffer_pos++;
+			content_begin = StartOfNextBufferAtEnd(buffer_handles, content_begin);
+		}
+		auto entry = buffer_handles.find(end.buffer_idx);
+		if (Before(content_begin, end) && end.buffer_pos > 0 && entry != buffer_handles.end() &&
+		    end.buffer_pos < entry->second->actual_size && entry->second->Ptr()[end.buffer_pos] == '\n' &&
+		    entry->second->Ptr()[end.buffer_pos - 1] == '\r') {
+			back = 1;
+		}
+	}
+	//! The content size of the line, without any line end
+	template <class T>
+	idx_t LineSize(T &buffer_handles) const {
+		LinePosition content_begin;
+		idx_t front;
+		idx_t back;
+		ContentBounds(buffer_handles, content_begin, front, back);
+		const idx_t size = Distance(buffer_handles, content_begin, end);
+		return size > back ? size - back : 0;
+	}
+	//! Reconstructs the content of the current line to be used in error messages
 	template <class T>
 	string ReconstructCurrentLine(bool &first_char_nl, T &buffer_handles, bool reconstruct_line) const {
-		if (!reconstruct_line || begin == end) {
+		if (!reconstruct_line || (begin.buffer_idx == end.buffer_idx && begin.buffer_pos == end.buffer_pos)) {
 			return {};
 		}
+		LinePosition content_begin;
+		idx_t front;
+		idx_t back;
+		ContentBounds(buffer_handles, content_begin, front, back);
+		first_char_nl = front > 0;
 		string result;
-		// the end of a buffer is the start of the next one
-		const bool begin_at_buffer_end = begin.buffer_pos == begin.buffer_size;
-		const idx_t first_idx = begin_at_buffer_end ? begin.buffer_idx + 1 : begin.buffer_idx;
-		const idx_t first_pos = begin_at_buffer_end ? 0 : begin.buffer_pos;
-		if (end.buffer_idx == first_idx) {
-			idx_t buffer_idx = end.buffer_idx;
-			if (buffer_handles.find(buffer_idx) == buffer_handles.end()) {
+		for (idx_t buffer_idx = content_begin.buffer_idx; buffer_idx <= end.buffer_idx; buffer_idx++) {
+			auto entry = buffer_handles.find(buffer_idx);
+			if (entry == buffer_handles.end()) {
 				return {};
 			}
-			auto buffer = buffer_handles[buffer_idx]->Ptr();
-			first_char_nl = buffer[first_pos] == '\n' || buffer[first_pos] == '\r';
-			for (idx_t i = first_pos + first_char_nl; i < end.buffer_pos; i++) {
+			auto buffer = entry->second->Ptr();
+			const idx_t start = buffer_idx == content_begin.buffer_idx ? content_begin.buffer_pos : 0;
+			const idx_t stop = buffer_idx == end.buffer_idx ? end.buffer_pos : entry->second->actual_size;
+			for (idx_t i = start; i < stop; i++) {
 				result += buffer[i];
 			}
-		} else {
-			if (buffer_handles.find(first_idx) == buffer_handles.end() ||
-			    buffer_handles.find(end.buffer_idx) == buffer_handles.end()) {
-				return {};
-			}
-			auto first_buffer = buffer_handles[first_idx]->Ptr();
-			auto first_buffer_size = buffer_handles[first_idx]->actual_size;
-			if (first_pos >= first_buffer_size) {
-				throw InternalException("CSV reader: buffer pos out of range for buffer");
-			}
-			auto second_buffer = buffer_handles[end.buffer_idx]->Ptr();
-			first_char_nl = first_buffer[first_pos] == '\n' || first_buffer[first_pos] == '\r';
-			for (idx_t i = first_pos + first_char_nl; i < first_buffer_size; i++) {
-				result += first_buffer[i];
-			}
-			for (idx_t i = 0; i < end.buffer_pos; i++) {
-				result += second_buffer[i];
-			}
 		}
+		result.resize(result.size() > back ? result.size() - back : 0);
 		// sanitize borked line
 		SanitizeError(result);
 		return result;
@@ -132,6 +193,17 @@ public:
 	void ModifyErrorMessageOfLastError(string error_message) {
 		D_ASSERT(!current_errors.empty() && current_errors.back().type == CSVErrorType::CAST_ERROR);
 		current_errors.back().error_message = std::move(error_message);
+	}
+
+	bool HasError(CSVErrorType type, const LinePosition &error_position, idx_t requested_size) const {
+		for (auto &error : current_errors) {
+			// the end of a buffer and the start of the next one are the same byte of the file
+			if (type == error.type && error.error_position.GetGlobalPosition(requested_size) ==
+			                              error_position.GetGlobalPosition(requested_size)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool HasErrorType(CSVErrorType type) const {
@@ -423,6 +495,8 @@ private:
 	const bool can_suspend;
 	//! Set when the scanner suspends on a buffer not in memory
 	bool suspended = false;
+	//! ProcessOverBufferValue stopped at the end of the buffer inside a value that starts at the buffer's start
+	bool over_buffer_value_open = false;
 	//! The buffer a suspension waits on, a scanner suspends at most once per buffer
 	idx_t pending_buffer_idx = 0;
 };

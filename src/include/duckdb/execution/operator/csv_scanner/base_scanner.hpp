@@ -32,10 +32,6 @@ public:
 		if (other.buffer_idx == buffer_idx) {
 			return buffer_pos - other.buffer_pos;
 		}
-		if (other.buffer_pos >= other.buffer_size && other.buffer_idx + 2 == buffer_idx) {
-			// the end of a buffer is the start of the next one, and every buffer but the last is full
-			return other.buffer_size + buffer_pos;
-		}
 		return other.buffer_size - other.buffer_pos + buffer_pos;
 	}
 

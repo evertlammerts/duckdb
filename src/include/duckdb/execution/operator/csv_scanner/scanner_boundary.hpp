@@ -61,6 +61,8 @@ public:
 	//! Getters
 	idx_t GetEndPos() const;
 	idx_t GetBufferIdx() const;
+	//! The buffer the boundary starts in
+	idx_t GetBoundaryBufferIdx() const;
 	idx_t GetBoundaryIdx() const;
 
 	void SetCurrentPositionToBoundary();
