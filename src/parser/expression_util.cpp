@@ -73,26 +73,6 @@ bool ExpressionUtil::ListEqualsWithAliases(const vector<unique_ptr<ParsedExpress
 	return true;
 }
 
-bool ExpressionUtil::ListEqualsWithNames(const vector<unique_ptr<ParsedExpression>> &a,
-                                         const vector<unique_ptr<ParsedExpression>> &b,
-                                         bool column_references_named_by_binding) {
-	if (!ListEqualsWithAliases(a, b)) {
-		return false;
-	}
-	for (idx_t i = 0; i < a.size(); i++) {
-		// a bare star is named by the columns it expands to
-		auto expression_class = a[i]->GetExpressionClass();
-		if (column_references_named_by_binding && !a[i]->HasAlias() &&
-		    (expression_class == ExpressionClass::COLUMN_REF || expression_class == ExpressionClass::STAR)) {
-			continue;
-		}
-		if (a[i]->GetName().GetIdentifierName() != b[i]->GetName().GetIdentifierName()) {
-			return false;
-		}
-	}
-	return true;
-}
-
 bool ExpressionUtil::SetEquals(const vector<unique_ptr<ParsedExpression>> &a,
                                const vector<unique_ptr<ParsedExpression>> &b) {
 	return ExpressionSetEquals<ParsedExpression, parsed_expression_map_t<idx_t>>(a, b);
