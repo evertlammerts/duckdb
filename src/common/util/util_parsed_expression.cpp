@@ -1000,7 +1000,7 @@ bool TypeExpression::Equals(const ParsedExpression &other) const {
 		return false;
 	}
 	auto &other_p = other.Cast<TypeExpression>();
-	if (!ParsedExpression::ListEquals(children, other_p.children)) {
+	if (!ExpressionUtil::ListEqualsWithAliases(children, other_p.children)) {
 		return false;
 	}
 	if (qualified_name != other_p.qualified_name) {
@@ -1011,6 +1011,9 @@ bool TypeExpression::Equals(const ParsedExpression &other) const {
 
 hash_t TypeExpression::Hash() const {
 	hash_t hash = ParsedExpression::Hash();
+	for (auto &child : children) {
+		hash = CombineHash(hash, child->GetAlias().Hash());
+	}
 	hash = CombineHash(hash, qualified_name.Hash());
 	return hash;
 }

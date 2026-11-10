@@ -643,6 +643,7 @@
         "id": 203,
         "name": "children",
         "type": "vector<unique_ptr<ParsedExpression>>",
+        "equals_by_spelling": true,
         "accessor_mut": "GetChildren()"
       },
       {

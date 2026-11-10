@@ -9,11 +9,13 @@ string DelimGetRef::ToString() const {
 }
 
 bool DelimGetRef::Equals(const TableRef &other) const {
-	return TableRef::Equals(other);
+	return TableRef::Equals(other) && types == other.Cast<DelimGetRef>().types;
 }
 
 unique_ptr<TableRef> DelimGetRef::Copy() {
-	return make_uniq<DelimGetRef>(types);
+	auto copy = make_uniq<DelimGetRef>(types);
+	CopyProperties(*copy);
+	return std::move(copy);
 }
 
 void DelimGetRef::Serialize(Serializer &serializer) const {

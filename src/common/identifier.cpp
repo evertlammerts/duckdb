@@ -23,6 +23,10 @@ hash_t Identifier::Hash() const {
 	return StringUtil::CIHash(value);
 }
 
+bool Identifier::SpellingEquals(const Identifier &other) const {
+	return value == other.value;
+}
+
 bool operator==(const Identifier &a, const Identifier &b) {
 	return StringUtil::CIEquals(a.GetIdentifierName(), b.GetIdentifierName());
 }

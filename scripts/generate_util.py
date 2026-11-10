@@ -162,9 +162,25 @@ def generate_ci_vector_string_comparison(field_name, indent):
     ]
 
 
+# Names the result keeps (struct field names, output column names) compare case-sensitively.
+def generate_spelling_comparison(member, indent):
+    field_name = get_member_field_name(member)
+    type_str = member['type']
+    if is_parsed_expression_list(type_str):
+        return [
+            f'{indent}if (!ExpressionUtil::ListEqualsWithAliases({field_name}, other_p.{field_name})) {{',
+            f'{indent}\treturn false;',
+            f'{indent}}}',
+        ]
+    raise ValueError(f"{member['name']}: equals_by_spelling is not supported for type {type_str}")
+
+
 def generate_member_comparison(member, indent='\t'):
     field_name = get_member_field_name(member)
     type_str = member['type']
+
+    if member.get('equals_by_spelling', False):
+        return generate_spelling_comparison(member, indent)
 
     if type_str in ('Identifier', 'duckdb::Identifier', 'Literal'):
         return [
@@ -419,6 +435,12 @@ def generate_member_hash(member, indent='\t'):
 
     if type_str == 'TypeExpression*':
         return [f'{indent}hash = CombineHash(hash, {field_name} ? {field_name}->Hash() : 0);']
+    if member.get('equals_by_spelling', False) and is_parsed_expression_list(type_str):
+        return [
+            f'{indent}for (auto &child : {field_name}) {{',
+            f'{indent}\thash = CombineHash(hash, child->GetAlias().Hash());',
+            f'{indent}}}',
+        ]
     # Covered by EnumerateChildren in ParsedExpression::Hash
     if is_parsed_expression_ptr(type_str):
         return []

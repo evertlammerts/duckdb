@@ -93,6 +93,9 @@ bool JoinRef::Equals(const TableRef &other_p) const {
 		return false;
 	}
 	auto &other = other_p.Cast<JoinRef>();
+	if (ref_type != other.ref_type || delim_flipped != other.delim_flipped) {
+		return false;
+	}
 	if (using_columns.size() != other.using_columns.size()) {
 		return false;
 	}
@@ -119,7 +122,6 @@ unique_ptr<TableRef> JoinRef::Copy() {
 	}
 	copy->type = type;
 	copy->ref_type = ref_type;
-	copy->alias = alias;
 	copy->using_columns = using_columns;
 	copy->delim_flipped = delim_flipped;
 	for (auto &col : duplicate_eliminated_columns) {
@@ -132,6 +134,7 @@ unique_ptr<TableRef> JoinRef::Copy() {
 	copy->nearest_count = nearest_count;
 	copy->nearest_order_type = nearest_order_type;
 	copy->nearest_approx = nearest_approx;
+	CopyProperties(*copy);
 	return std::move(copy);
 }
 

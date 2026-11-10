@@ -23,8 +23,8 @@ public:
 	GroupBinder(Binder &binder, ClientContext &context, BoundSelectNode &node, SelectBindState &bind_state);
 
 public:
-	static void ReplaceSelectRef(SelectNode &node, SelectBindState &bind_state, ProjectionIndex index,
-	                             unique_ptr<ParsedExpression> &expr_ptr);
+	//! Gives each GROUP BY entry one group and remaps the grouping sets
+	static void ReplaceSelectRefs(Binder &binder, SelectNode &node, SelectBindState &bind_state);
 
 protected:
 	BindResult BindExpression(unique_ptr<ParsedExpression> &expr_ptr, idx_t depth, bool root_expression) override;
@@ -37,6 +37,9 @@ protected:
 	                              unique_ptr<ParsedExpression> &expr_ptr) override;
 
 private:
+	static optional_idx GetSelectReference(SelectNode &node, SelectBindState &bind_state, ParsedExpression &expr,
+	                                       Identifier &alias_name);
+
 	BoundSelectNode &node;
 	SelectBindState &bind_state;
 	idx_t unnest_level = 0;

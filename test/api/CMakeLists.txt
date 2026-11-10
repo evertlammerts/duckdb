@@ -60,6 +60,7 @@ set(TEST_API_OBJECTS
     test_retained_result_collection.cpp
     test_plan_serialization.cpp
     test_relation_api.cpp
+    test_tableref_equals.cpp
     test_stream_result_buffer.cpp
     test_operator_memory_limit.cpp
     test_query_profiler.cpp
@@ -73,6 +74,8 @@ set(TEST_API_OBJECTS
     test_parse_statement_iterator.cpp
     test_dialect_extension.cpp
     test_query_node_copy.cpp
+    test_query_node_equals.cpp
+    test_statement_tostring.cpp
     test_grammar_extension.cpp
     test_parser_query_completeness.cpp
     test_passthrough_dialect.cpp
@@ -82,6 +85,7 @@ set(TEST_API_OBJECTS
     test_uuid.cpp
     test_insertion_order_preserving_map.cpp
     test_bignum.cpp
+    test_persistent_secret_write_failure.cpp
     test_threads.cpp
     test_windows_header_compatibility.cpp
     test_windows_unicode_path.cpp
@@ -94,6 +98,7 @@ set(TEST_API_OBJECTS
     test_rollback_delete_checkpoint_flag.cpp
     test_constant_vector_reference.cpp
     test_group_commit_bound.cpp
+    test_deferred_checkpoint_publication.cpp
     test_data_table_scan_without_row_groups.cpp)
 
 if(NOT WIN32)
