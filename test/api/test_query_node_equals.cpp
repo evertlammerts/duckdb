@@ -59,6 +59,23 @@ TEST_CASE("Select nodes that differ in their aggregate handling are not equal", 
 	CHECK(!group_by_all->Equals(ParseNode(con, "SELECT x FROM t").get()));
 }
 
+TEST_CASE("Select nodes that differ in a select list alias are not equal", "[api][parser]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto node = ParseNode(con, "SELECT x + 1 AS a, y FROM t");
+	RequireChangeBreaksEquality("other alias", *node, [](QueryNode &copy) {
+		copy.Cast<SelectNode>().select_list[0]->SetAlias(Identifier("b"));
+	});
+	RequireChangeBreaksEquality("alias removed", *node,
+	                            [](QueryNode &copy) { copy.Cast<SelectNode>().select_list[0]->ClearAlias(); });
+	RequireChangeBreaksEquality("alias equal to the generated name", *node, [](QueryNode &copy) {
+		copy.Cast<SelectNode>().select_list[1]->SetAlias(Identifier("y"));
+	});
+	CHECK(!node->Equals(ParseNode(con, "SELECT x + 1 AS y, y AS a FROM t").get()));
+	CHECK(node->Equals(ParseNode(con, "SELECT x + 1 AS a, y FROM t").get()));
+}
+
 TEST_CASE("Orders that differ in their null order are not equal", "[api][parser]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -187,6 +204,7 @@ TEST_CASE("Query nodes equal their copy and their reparsed and deserialized form
 	    "WITH RECURSIVE t(k, a, c) USING KEY (k, sum(a) AS a) AS (SELECT 1, 1, 10 UNION ALL SELECT k, a + 1, c + 1 "
 	    "FROM t WHERE a < 3) SELECT * FROM t",
 	    "SELECT (SELECT x FROM t GROUP BY ALL ORDER BY x NULLS FIRST LIMIT 1)",
+	    "SELECT a FROM (SELECT x AS a, y + 1 AS \"(y + 1)\", z FROM t)",
 	};
 	for (auto &sql : queries) {
 		INFO(sql);
