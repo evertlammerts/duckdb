@@ -435,6 +435,25 @@ static unique_ptr<Expression> BindUncollatedFirst(Binder &binder, unique_ptr<Exp
 	return std::move(function);
 }
 
+static bool GroupByAliasNamesEntry(Binder &binder, const SelectBindState &bind_state, idx_t index) {
+	auto &alias = bind_state.original_expressions[index]->GetAlias();
+	if (alias.empty()) {
+		return false;
+	}
+	// Looked up directly, not qualified as GROUP BY <alias> does, because qualifying an ambiguous name throws.
+	auto &bind_context = binder.bind_context;
+	ErrorData unused_error;
+	if (!bind_context.GetMatchingBindings(alias).empty() ||
+	    !bind_context.GetBindings(BindingAlias(alias), unused_error).empty()) {
+		return false;
+	}
+	if (binder.macro_binding && binder.macro_binding->HasMatchingBinding(alias)) {
+		return false;
+	}
+	auto entry = bind_state.alias_map.find(alias);
+	return entry != bind_state.alias_map.end() && entry->second == index;
+}
+
 BoundStatement Binder::BindNode(SelectNode &statement) {
 	D_ASSERT(statement.from_table);
 
@@ -812,6 +831,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	// this happens after the original select entries are bound, since binding them again must not resolve to a group
 	for (auto &entry : group_by_all_groups) {
 		bind_state.AddGroup(bind_state.original_expressions[entry.first]->Copy(), entry.second);
+		if (GroupByAliasNamesEntry(*this, bind_state, entry.first)) {
+			bind_state.group_alias_map[bind_state.original_expressions[entry.first]->GetAlias()] = entry.second;
+		}
 	}
 	for (idx_t i = result.column_count; i < statement.select_list.size(); i++) {
 		bind_select_entry(i);
