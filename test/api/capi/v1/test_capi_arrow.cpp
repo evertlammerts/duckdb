@@ -1650,6 +1650,43 @@ TEST_CASE("duckdb_arrow_scan fails when its stream cannot export a schema", "[ca
 	fail_schema_exports = false;
 }
 
+TEST_CASE("duckdb_arrow_scan releases a schema the Arrow bind refuses", "[capi][arrow]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	ArrowSchema member = {};
+	ArrowSchema *members[] = {&member};
+	ArrowSchema dense_union = {};
+	ArrowSchema *columns[] = {&dense_union};
+	ArrowSchema root = {};
+	root.format = "+s";
+	root.release = ReleaseBorrowedSchema;
+	idx_t nodes_per_export = 1;
+	SECTION("a column of a type the bind cannot read") {
+		member.format = "i";
+		member.name = "m";
+		dense_union.format = "+ud:0";
+		dense_union.name = "a";
+		dense_union.n_children = 1;
+		dense_union.children = members;
+		root.n_children = 1;
+		root.children = columns;
+		nodes_per_export = 3;
+	}
+	SECTION("no columns") {
+	}
+	BatchStream batches(root, {});
+	batches.stream.get_schema = ExportBatchStreamSchema;
+	ResetSchemaCounts();
+
+	REQUIRE(duckdb_arrow_scan(tester.connection, "t", reinterpret_cast<duckdb_arrow_stream>(&batches.stream)) ==
+	        DuckDBError);
+	REQUIRE(exported_schema_nodes == nodes_per_export);
+	REQUIRE(released_schema_nodes == exported_schema_nodes);
+	auto result = tester.Query("SELECT * FROM t");
+	REQUIRE_FAIL(result);
+	REQUIRE(result->ErrorType() == DUCKDB_ERROR_CATALOG);
+}
+
 TEST_CASE("duckdb_arrow_array_scan never releases the caller's schema", "[capi][arrow]") {
 	if (STANDARD_VECTOR_SIZE < 3) {
 		return;
@@ -1678,7 +1715,27 @@ TEST_CASE("duckdb_arrow_array_scan never releases the caller's schema", "[capi][
 		}
 		REQUIRE_NO_FAIL(tester.Query("DROP VIEW t"));
 		REQUIRE(released_schema_nodes == 0);
+
+		// The stream handed back lends the caller's schema to every bind of a view over it.
+		REQUIRE(duckdb_arrow_scan(tester.connection, "s", reinterpret_cast<duckdb_arrow_stream>(input.stream)) ==
+		        DuckDBSuccess);
+		REQUIRE(released_schema_nodes == 0);
+		auto result = tester.Query("SELECT count(*), sum(a) FROM s");
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(result->Fetch<int64_t>(0, 0) == 3);
+		REQUIRE(result->Fetch<int64_t>(1, 0) == 3);
+		auto refused = tester.Query("SELECT count(*) FROM s");
+		REQUIRE_FAIL(refused);
+		REQUIRE_THAT(refused->ErrorMessage(), Catch::Matchers::Contains("can be read only once"));
+		REQUIRE(released_schema_nodes == 0);
+		auto unknown = tester.Query("SELECT missing FROM s");
+		REQUIRE_FAIL(unknown);
+		REQUIRE(unknown->ErrorType() == DUCKDB_ERROR_BINDER);
+		REQUIRE(released_schema_nodes == 0);
+		REQUIRE_NO_FAIL(tester.Query("DROP VIEW s"));
+		REQUIRE(released_schema_nodes == 0);
 	}
+	REQUIRE(exported_schema_nodes > 0);
 	REQUIRE(released_schema_nodes == exported_schema_nodes);
 }
 
