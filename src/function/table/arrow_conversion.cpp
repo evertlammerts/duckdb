@@ -7,6 +7,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/likely.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/types/arrow_aux_data.hpp"
@@ -457,12 +458,15 @@ static void DirectConversion(Vector &vector, ArrowArray &array, idx_t chunk_offs
 	SetVectorData(vector, data_ptr, size);
 }
 
+[[noreturn]] static void ThrowArrowTimeOutOfRange(int64_t raw) {
+	throw ConversionException("Invalid TIME value %d in Arrow array - TIME values must be within a day", raw);
+}
+
 // Arrow bounds a time to [0, a day) but producers do not enforce it; a TIME holds 00:00:00 to 24:00:00 inclusive.
 template <class T>
-static int64_t ArrowTimeWithinDay(T raw, int64_t units_per_day, int64_t conversion) {
-	if (raw < 0 || static_cast<int64_t>(raw) > units_per_day) {
-		throw ConversionException("Invalid TIME value %d in Arrow array - TIME values must be within a day",
-		                          static_cast<int64_t>(raw));
+static inline int64_t ArrowTimeWithinDay(T raw, int64_t units_per_day, int64_t conversion) {
+	if (DUCKDB_UNLIKELY(raw < 0 || static_cast<int64_t>(raw) > units_per_day)) {
+		ThrowArrowTimeOutOfRange(static_cast<int64_t>(raw));
 	}
 	return static_cast<int64_t>(raw) * conversion;
 }

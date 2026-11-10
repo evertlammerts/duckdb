@@ -357,6 +357,23 @@ TEST_CASE("Arrow scan of an out of range time behind a NULL or an offset", "[arr
 	RequireOutOfRange(after_offset);
 }
 
+TEST_CASE("Arrow scan of an out of range time beside a NULL", "[arrow]") {
+	TimeColumn<int64_t> micros("ttu", {3600000000, HUNDRED_HOURS_US, 86400000000}, {1});
+	REQUIRE(ScanText(micros) == rows({"01:00:00", "NULL", "24:00:00"}));
+	TimeColumn<int64_t> micros_past("ttu", {3600000000, 0, HUNDRED_HOURS_US}, {1});
+	RequireOutOfRange(micros_past);
+	TimeColumn<int64_t> micros_negative("ttu", {3600000000, 0, -1}, {1});
+	RequireOutOfRange(micros_negative);
+	TimeColumn<int32_t> seconds_past("tts", {3600, 0, 360000}, {1});
+	RequireOutOfRange(seconds_past);
+	TimeColumn<int64_t> nanos("ttn", {1000, HUNDRED_HOURS_US * 1000, 86400000000000}, {1});
+	REQUIRE(ScanText(nanos) == rows({"00:00:00.000001", "NULL", "24:00:00"}));
+	TimeColumn<int64_t> nanos_past("ttn", {1000, 0, HUNDRED_HOURS_US * 1000}, {1});
+	RequireOutOfRange(nanos_past);
+	TimeColumn<int64_t> nanos_negative("ttn", {1000, 0, -1}, {1});
+	RequireOutOfRange(nanos_negative);
+}
+
 TEST_CASE("Arrow scan of an out of range time past the first chunk", "[arrow]") {
 	std::vector<int32_t> values(3000, 3600);
 	values[2500] = 360000;
