@@ -88,26 +88,30 @@ ProjectionIndex BaseSelectBinder::TryBindGroup(ParsedExpression &expr) {
 	if (alias_map.empty() && group_map.empty()) {
 		return ProjectionIndex();
 	}
-	// a lambda parameter is the innermost name in its body, and no group is defined in terms of one
-	if (ReferencesLambdaParameter(expr)) {
-		return ProjectionIndex();
-	}
+	ProjectionIndex result;
 	// first check the group alias map, if expr is a ColumnRefExpression
 	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr.Cast<ColumnRefExpression>();
 		if (!colref.IsQualified()) {
 			auto alias_entry = alias_map.find(colref.ColumnNames()[0]);
 			if (alias_entry != alias_map.end()) {
-				// found entry!
-				return alias_entry->second;
+				result = alias_entry->second;
 			}
 		}
 	}
-	// no alias reference found
-	// check the list of group columns for a match
-	auto entry = group_map.find(expr);
-	if (entry != group_map.end()) {
-		return entry->second;
+	if (!result.IsValid()) {
+		auto entry = group_map.find(expr);
+		if (entry != group_map.end()) {
+			result = entry->second;
+		}
+	}
+	if (result.IsValid()) {
+		// no group is defined in terms of a lambda parameter; checked only after a match, since the walk covers the
+		// whole subtree and this runs at every node of a lambda body
+		if (ReferencesLambdaParameter(expr)) {
+			return ProjectionIndex();
+		}
+		return result;
 	}
 #ifdef DEBUG
 	for (auto map_entry : group_map) {
