@@ -1,0 +1,586 @@
+# name: test/sql/trigger/trigger_row_body_statement_chain.test
+# description: The statement triggers fired by the writes of FOR EACH ROW bodies fire once per firing statement, over every row those bodies wrote, each once
+# group: [trigger]
+
+require noforcestorage
+
+statement ok
+CREATE TABLE out(k VARCHAR, v INTEGER)
+
+statement ok
+CREATE TABLE s(id INTEGER)
+
+statement ok
+CREATE TABLE r(id INTEGER)
+
+# An AFTER statement trigger reading its transition table, fired by the write of a row body
+
+statement ok
+CREATE TRIGGER s1 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'st', id FROM n
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	101
+st	102
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+101
+102
+
+# No write's returned rows are crossed with the firing rows
+
+statement ok
+SET explain_output='optimized_only'
+
+query II
+EXPLAIN (FORMAT JSON) INSERT INTO r VALUES (1), (2)
+----
+logical_opt	<!REGEX>:.*"name": "CROSS_PRODUCT",\s*"children": \[\s*\{\s*"name": "INSERT".*
+
+statement ok
+RESET explain_output
+
+# One firing row, then several, with duplicates and NULL
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+INSERT INTO r VALUES (3)
+
+statement ok
+INSERT INTO r VALUES (4), (4), (NULL)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	103
+st	104
+st	104
+st	NULL
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+103
+104
+104
+NULL
+
+# The statement trigger fires once for the firing statement and counts every row the bodies wrote
+
+statement ok
+CREATE TRIGGER s2 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'cnt', count(*) FROM n
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+INSERT INTO r VALUES (1), (2), (3)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+cnt	3
+st	101
+st	102
+st	103
+
+statement ok
+DROP TRIGGER s2 ON s
+
+# A body reading its transition table twice pairs the rows of one firing statement, and two firing statements in one transaction fire twice, each over its own rows
+
+statement ok
+CREATE TRIGGER s2 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'pair', a.id * 1000 + b.id FROM n a, n b WHERE a.id < b.id
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+statement ok
+INSERT INTO r VALUES (3), (4), (5)
+
+statement ok
+COMMIT
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+pair	101102
+pair	103104
+pair	103105
+pair	104105
+st	101
+st	102
+st	103
+st	104
+st	105
+
+statement ok
+DROP TRIGGER s2 ON s
+
+# A body writing several rows per firing row
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id * 10 + range FROM range(2)
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	10
+st	11
+st	20
+st	21
+
+# A row body with its own WITH clause
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW WITH x AS (SELECT NEW.id + 400 AS v) INSERT INTO s SELECT v FROM x
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	401
+st	402
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+401
+402
+
+# BEFORE statement triggers on the written table fire once and see the table before the bodies write, volatile ones too
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
+
+statement ok
+CREATE SEQUENCE bseq
+
+statement ok
+CREATE TRIGGER b0 BEFORE INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'before', count(*) FROM s
+
+statement ok
+CREATE TRIGGER b1 BEFORE INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'rnd', (random() * 0)::INTEGER
+
+statement ok
+CREATE TRIGGER b2 BEFORE INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'bseq', nextval('bseq')
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+before	0
+bseq	1
+rnd	0
+st	101
+st	102
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+101
+102
+
+statement ok
+DROP TRIGGER b0 ON s
+
+statement ok
+DROP TRIGGER b1 ON s
+
+statement ok
+DROP TRIGGER b2 ON s
+
+# An AFTER statement trigger without a transition table fires once too
+
+statement ok
+DROP TRIGGER s1 ON s
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER s3 AFTER INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'after', count(*) FROM s
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+after	2
+
+statement ok
+DROP TRIGGER s3 ON s
+
+# Volatile AFTER statement bodies, one reading the transition table and one not, fire once
+
+statement ok
+CREATE SEQUENCE seq
+
+statement ok
+CREATE TRIGGER s6 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'seq' || nextval('seq'), id FROM n
+
+statement ok
+CREATE TRIGGER s7 AFTER INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'rnd', (random() * 0)::INTEGER
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out WHERE k = 'rnd'
+----
+rnd	0
+
+query IIII
+SELECT count(*), count(DISTINCT k), min(k), max(k) FROM out WHERE k LIKE 'seq%'
+----
+2	2	seq1	seq2
+
+query I
+SELECT v FROM out WHERE k LIKE 'seq%' ORDER BY ALL
+----
+101
+102
+
+statement ok
+DROP TRIGGER s6 ON s
+
+statement ok
+DROP TRIGGER s7 ON s
+
+# Two row triggers on the firing table, both writing s: each body's statement fires s's triggers over its own rows
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER s1 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'st', id FROM n
+
+statement ok
+CREATE TRIGGER s2 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'cnt', count(*) FROM n
+
+statement ok
+CREATE TRIGGER r2 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 200
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+cnt	2
+cnt	2
+st	101
+st	102
+st	201
+st	202
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+101
+102
+201
+202
+
+statement ok
+DROP TRIGGER r2 ON r
+
+statement ok
+DROP TRIGGER s2 ON s
+
+# A statement body of the written table writing a third table with its own statement trigger
+
+statement ok
+CREATE TABLE t(id INTEGER)
+
+statement ok
+CREATE TRIGGER t1 AFTER INSERT ON t REFERENCING NEW TABLE AS tn FOR EACH STATEMENT INSERT INTO out SELECT 't', id FROM tn
+
+statement ok
+CREATE TRIGGER s8 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO t SELECT id + 1000 FROM n
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	101
+st	102
+t	1101
+t	1102
+
+query I
+SELECT id FROM t ORDER BY ALL
+----
+1101
+1102
+
+statement ok
+DROP TRIGGER s8 ON s
+
+statement ok
+DROP TRIGGER t1 ON t
+
+# A row body fired by DELETE, reading OLD
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+INSERT INTO r VALUES (1), (2), (3)
+
+statement ok
+CREATE TRIGGER r3 AFTER DELETE ON r FOR EACH ROW INSERT INTO s SELECT OLD.id + 100
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r WHERE id <= 2
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	101
+st	102
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+101
+102
+
+# A DELETE row body into a table whose statement trigger reads OLD TABLE: each deleted row once, also when several firing rows delete the same row
+
+statement ok
+DROP TRIGGER r3 ON r
+
+statement ok
+DROP TRIGGER s1 ON s
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM r
+
+statement ok
+DELETE FROM s
+
+statement ok
+INSERT INTO s VALUES (101), (102), (103)
+
+statement ok
+CREATE TRIGGER s4 AFTER DELETE ON s REFERENCING OLD TABLE AS o FOR EACH STATEMENT INSERT INTO out SELECT 'del', id FROM o
+
+statement ok
+CREATE TRIGGER s9 AFTER DELETE ON s REFERENCING OLD TABLE AS o FOR EACH STATEMENT INSERT INTO out SELECT 'delcnt', count(*) FROM o
+
+statement ok
+CREATE TRIGGER r4 AFTER INSERT ON r FOR EACH ROW DELETE FROM s WHERE id = NEW.id + 100
+
+statement ok
+INSERT INTO r VALUES (1), (2), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+del	101
+del	102
+delcnt	2
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+103
+
+statement ok
+DROP TRIGGER r4 ON r
+
+statement ok
+DROP TRIGGER s9 ON s
+
+# UPDATE row bodies and UPDATE FOR EACH ROW triggers are refused, so no UPDATE write runs over the rows of a row trigger
+
+statement ok
+CREATE TRIGGER su AFTER UPDATE ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'upd', id FROM n
+
+statement error
+CREATE TRIGGER r7 AFTER INSERT ON r FOR EACH ROW UPDATE s SET id = id + 1000 WHERE id = NEW.id + 100
+----
+UPDATE trigger bodies in FOR EACH ROW triggers are not yet supported
+
+statement error
+CREATE TRIGGER r8 AFTER UPDATE ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
+----
+UPDATE FOR EACH ROW triggers are not yet supported
+
+statement ok
+DROP TRIGGER su ON s
+
+# A row body writing a table with its own FOR EACH ROW trigger is still refused
+
+statement ok
+DROP TRIGGER s4 ON s
+
+statement ok
+CREATE TRIGGER s5 AFTER INSERT ON s FOR EACH ROW INSERT INTO out SELECT 'srow', NEW.id
+
+statement error
+CREATE TRIGGER r5 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
+----
+cascading row triggers are not yet supported
+
+# A statement body writing a table with a statement trigger, for comparison
+
+statement ok
+DROP TRIGGER s5 ON s
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+CREATE TRIGGER s1 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'st', id FROM n
+
+statement ok
+CREATE TRIGGER r6 AFTER INSERT ON r REFERENCING NEW TABLE AS rn FOR EACH STATEMENT INSERT INTO s SELECT id + 100 FROM rn
+
+statement ok
+INSERT INTO r VALUES (1), (2)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+st	101
+st	102
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+101
+102
