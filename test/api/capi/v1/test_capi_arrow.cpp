@@ -781,6 +781,14 @@ TEST_CASE("duckdb_arrow_scan reads the columns a query selects and keeps its fil
 	INFO(plan_text);
 	REQUIRE(StringUtil::Contains(plan_text, "Expression: a = 2"));
 	REQUIRE(!StringUtil::Contains(plan_text, "Filters:"));
+
+	// A plan renders several projected columns as a list, so a single string means the scan reads c alone.
+	plan = tester.Query("EXPLAIN (FORMAT JSON) SELECT c FROM t");
+	REQUIRE_NO_FAIL(*plan);
+	plan_text = plan->Fetch<string>(1, 0);
+	INFO(plan_text);
+	REQUIRE(StringUtil::Contains(plan_text, "ARROW_SCAN_UNPROJECTED"));
+	REQUIRE(StringUtil::Contains(plan_text, "\"Projections\": \"c\""));
 }
 
 TEST_CASE("duckdb_arrow_array_scan reads the columns a query selects and keeps its filters", "[capi][arrow]") {
@@ -820,17 +828,21 @@ TEST_CASE("duckdb_arrow_scan of a run-end encoded column after another column", 
 		RequireMatchesNative(tester, query);
 	}
 
-	// The scan converts every column, so a column without a conversion fails every query, also one that skips it.
-	for (auto query : {"SELECT d FROM t", "SELECT a FROM t"}) {
-		INFO(query);
+	// d has no conversion: a query that skips it returns its rows, and one that reads it fails instead of crashing.
+	for (auto &query : {"SELECT a FROM t ORDER BY a", "SELECT count(*) FROM t"}) {
 		RunEndEncodedBatch batch;
 		BatchStream batches(batch.Schema(true), {batch.Batch(true), batch.Batch(true)});
 		REQUIRE(duckdb_arrow_scan(tester.connection, "t", reinterpret_cast<duckdb_arrow_stream>(&batches.stream)) ==
 		        DuckDBSuccess);
-		auto result = tester.Query(query);
-		REQUIRE(result->HasError());
-		REQUIRE(StringUtil::Contains(result->ErrorMessage(), "RunEndEncoded value type 'ARRAY' not supported yet"));
+		RequireMatchesNative(tester, query);
 	}
+	RunEndEncodedBatch batch;
+	BatchStream batches(batch.Schema(true), {batch.Batch(true), batch.Batch(true)});
+	REQUIRE(duckdb_arrow_scan(tester.connection, "t", reinterpret_cast<duckdb_arrow_stream>(&batches.stream)) ==
+	        DuckDBSuccess);
+	auto result = tester.Query("SELECT d FROM t");
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->ErrorMessage(), "RunEndEncoded value type 'ARRAY' not supported yet"));
 }
 
 TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
