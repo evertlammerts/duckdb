@@ -81,6 +81,8 @@ void Planner::Optimize() {
 // Pre-decorrelation pass: replace LogicalTrigger with LogicalDependentJoin so the standard
 // FlattenDependentJoins machinery can decorrelate the trigger body.
 static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
+	// one binder level can make several plan operators, so the checks of binding do not bound this walk
+	Planner::CheckStackSpace("planning");
 	for (auto &child : op.children) {
 		if (child) {
 			RewriteTriggersToDependent(binder, *child);
@@ -108,8 +110,8 @@ static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 }
 
 void Planner::CheckStackSpace(const char *step) {
-	// binding a leaf below the last check and throwing the error take about 14 KiB on a release build, more under a
-	// sanitizer
+	// a binding leaf takes about 14 KiB and one level of a planning walk at most about 4 KiB on a release build; the
+	// reserve holds that work below the last check and the throw, with room for a sanitizer's larger frames
 	static constexpr idx_t MIN_STACK_RESERVE = idx_t(64) * 1024;
 	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
 	idx_t stack_size;

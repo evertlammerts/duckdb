@@ -27,13 +27,13 @@ JoinOrderOptimizer JoinOrderOptimizer::CreateChildOptimizer() {
 
 unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
                                                          optional_ptr<RelationStats> stats) {
-	// a nested optimizer starts for every operator it cannot reorder, with more stack per level than binding takes
-	Planner::CheckStackSpace("planning");
 	if (depth > MAX_RECURSION_DEPTH) {
 		// Very deep plans will eventually consume quite some stack space
 		// Returning the current plan is always a valid choice
 		return plan;
 	}
+	// a nested optimizer starts for every operator it cannot reorder, with more stack per level than binding takes
+	Planner::CheckStackSpace("planning");
 
 	// make sure query graph manager has not extracted a relation graph already
 	auto &op = *plan;
