@@ -316,10 +316,10 @@ TEST_CASE("Arrow sparse union formats with a malformed type id list are refused 
 TEST_CASE("Arrow sparse union rows with a type id the format does not list are a scan error", "[arrow]") {
 	// rows 0 and 1 are valid, so the error is raised for the third row
 	for (int8_t type_id : {int8_t(2), int8_t(-1), int8_t(127), int8_t(-128)}) {
-		INFO(int(type_id));
+		INFO(int32_t(type_id));
 		auto record = Record(ReversedUnion("u", {0, 1, type_id}));
 		REQUIRE(Scan(*record, "SELECT u FROM src") == "error: Invalid Input Error: Arrow union row has type id " +
-		                                                  to_string(int(type_id)) +
+		                                                  to_string(int32_t(type_id)) +
 		                                                  ", which is not one of the type ids of the union");
 	}
 	vector<FieldPtr> members;

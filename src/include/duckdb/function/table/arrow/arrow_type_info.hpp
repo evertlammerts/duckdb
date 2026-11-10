@@ -71,6 +71,7 @@ public:
 	const vector<shared_ptr<ArrowType>> &GetChildren() const;
 	//! The position of the union child whose rows carry the type id, which is the tag of the DuckDB union
 	union_tag_t GetUnionChildIndex(int8_t type_id) const {
+		D_ASSERT(!union_child_indexes.empty());
 		if (type_id >= 0 && union_child_indexes[static_cast<idx_t>(type_id)] != NO_UNION_CHILD) {
 			return union_child_indexes[static_cast<idx_t>(type_id)];
 		}
