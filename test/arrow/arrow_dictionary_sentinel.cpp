@@ -2,6 +2,7 @@
 
 #include "arrow/arrow_test_helper.hpp"
 #include "duckdb/common/adbc/single_batch_array_stream.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/enums/debug_verification_mode.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -1414,6 +1415,23 @@ TEST_CASE("Arrow scan of run-end encoded fixed-size ARRAY values", "[arrow]") {
 	                      /*verify_vectors=*/true));
 }
 
+TEST_CASE("Arrow scan of run-end encoded UHUGEINT values", "[arrow]") {
+	ArrowNodes nodes;
+	// 2**127 + 5, NULL, 7 as the lower and upper 64 bits of each value
+	const uint64_t data[] = {5, 0x8000000000000000ULL, 0, 0, 7, 0};
+	const uint8_t validity[] = {0x05};
+	auto &values = nodes.Add("w:16", "values", 3, {validity, data}, {}, 1);
+	auto metadata = ArrowSchemaMetadata::NonCanonicalType("uhugeint", "DuckDB").SerializeMetadata();
+	values.schema.metadata = metadata.get();
+	const int32_t run_ends[] = {2, 3, 5};
+	auto &column = RunEnds(nodes, "d", 5, run_ends, values);
+	REQUIRE(ScanReadsRows(column.schema, column.array,
+	                      RowsQuery({"170141183460469231731687303715884105733",
+	                                 "170141183460469231731687303715884105733", "NULL", "7", "7"},
+	                                "UHUGEINT"),
+	                      /*verify_vectors=*/true));
+}
+
 TEST_CASE("Arrow scan of run-end encoded LIST values", "[arrow]") {
 	ArrowNodes nodes;
 	const int32_t run_ends[] = {1, 3, 4, 6};
@@ -1519,6 +1537,22 @@ TEST_CASE("Arrow scan of run-end encoded values with run-end encoded parts", "[a
 		    RowsQuery({"NULL", "[{'i': 3, 's': 'c'}, {'i': 3, 's': 'c'}]"}, "STRUCT(i INTEGER, s VARCHAR)[2]"),
 		    /*verify_vectors=*/true));
 	}
+	SECTION(
+	    "a fixed-size ARRAY of run-end encoded fixed-size ARRAY elements whose run under the NULL array alone holds an "
+	    "element a cast rejects") {
+		const int32_t element_data[] = {1000, 1, 3, 4};
+		auto &inner = nodes.Add("i", "item", 4, {nullptr, element_data});
+		const int32_t element_run_ends[] = {2, 4};
+		auto &elements =
+		    RunEnds(nodes, "item", 4, element_run_ends, nodes.Add("+w:2", "values", 2, {nullptr}, {inner}));
+		const uint8_t validity[] = {0x02};
+		auto &column = nodes.Add("+w:2", "d", 2, {validity}, {elements}, 1);
+		ColumnStream stream(column.schema, column.array);
+		REQUIRE(StreamReadsRows(stream.stream,
+		                        "SELECT d::TINYINT[2][2] FROM (" +
+		                            RowsQuery({"NULL", "[[3, 4], [3, 4]]"}, "INTEGER[2][2]") + ")",
+		                        /*verify_vectors=*/true, string(), "d::TINYINT[2][2]"));
+	}
 	SECTION("a fixed-size ARRAY of run-end encoded LIST elements with a NULL array") {
 		const int32_t element_run_ends[] = {1, 2, 3, 4};
 		auto &elements = RunEnds(nodes, "item", 4, element_run_ends, ListValues(nodes));
@@ -1551,6 +1585,19 @@ TEST_CASE("Arrow scan of a STRUCT with a NULL row over run-end encoded fields", 
 		                      RowsQuery({"{'r': {'i': 1, 's': 'a'}}", "NULL", "{'r': {'i': 3, 's': 'c'}}"},
 		                                "STRUCT(r STRUCT(i INTEGER, s VARCHAR))"),
 		                      /*verify_vectors=*/true));
+	}
+	SECTION("fixed-size ARRAY values whose run under the NULL row alone holds an element a cast rejects") {
+		// the vector verifier does not read the elements of a NULL array row, a cast of the field does
+		const int32_t element_data[] = {1, 2, 1000, 1, 3, 4};
+		auto &elements = nodes.Add("i", "item", 6, {nullptr, element_data});
+		const int32_t run_ends[] = {1, 2, 3};
+		auto &field = RunEnds(nodes, "r", 3, run_ends, nodes.Add("+w:2", "values", 3, {nullptr}, {elements}));
+		auto &column = nodes.Add("+s", "d", 3, {validity}, {field}, 1);
+		ColumnStream stream(column.schema, column.array);
+		REQUIRE(StreamReadsRows(stream.stream,
+		                        "SELECT d.r::TINYINT[2] FROM (" +
+		                            RowsQuery({"{'r': [1, 2]}", "NULL", "{'r': [3, 4]}"}, "STRUCT(r INTEGER[2])") + ")",
+		                        /*verify_vectors=*/true, string(), "d.r::TINYINT[2]"));
 	}
 }
 
@@ -1724,4 +1771,15 @@ TEST_CASE("Arrow scan rejects run-end encoded arrays whose runs end before their
 		REQUIRE_THAT(ScanError(column.schema, column.array),
 		             Catch::Matchers::Contains("Arrow run-end encoded array is read past the end of its runs"));
 	}
+}
+
+TEST_CASE("Arrow scan of LIST values over an empty run-end encoded array at an offset", "[arrow]") {
+	// an array of length 0 needs no runs, whatever its offset
+	ArrowNodes nodes;
+	const int32_t no_runs[] = {0};
+	auto &elements = RunEnds(nodes, "item", 0, no_runs, nodes.Add("i", "values", 0, {nullptr, no_runs}), /*offset=*/2);
+	const int32_t offsets[] = {0, 0, 0, 0};
+	auto &column = nodes.Add("+l", "d", 3, {nullptr, offsets}, {elements});
+	REQUIRE(ScanReadsRows(column.schema, column.array, RowsQuery({"[]", "[]", "[]"}, "INTEGER[]"),
+	                      /*verify_vectors=*/true));
 }

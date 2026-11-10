@@ -389,10 +389,11 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 		if (!array_mask.CanHaveNull()) {
 			return;
 		}
+		auto &child_validity_mask = FlatVector::ValidityMutable(child_vector);
 		for (idx_t i = 0; i < size; i++) {
 			if (!array_mask.RowIsValid(i)) {
 				for (idx_t j = 0; j < array_size; j++) {
-					FlatVector::SetNull(child_vector, i * array_size + j, true);
+					child_validity_mask.SetInvalid(i * array_size + j);
 				}
 			}
 		}
@@ -412,11 +413,14 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 			                                                       child_count, child_type,
 			                                                       NumericCast<int64_t>(child_offset));
 		} else if (run_end_encoded) {
-			ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(child_vector, child_array, chunk_offset,
-			                                                          child_state, child_count, child_type,
-			                                                          NumericCast<int64_t>(child_offset));
-			// decoding sets the validity of every child row again
-			broadcast_validity();
+			// the decode can replace the child's validity, so it takes the broadcast NULLs as its parent mask
+			ValidityMask child_parent_mask;
+			if (array_mask.CanHaveNull()) {
+				child_parent_mask.Copy(FlatVector::Validity(child_vector), child_count);
+			}
+			ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(
+			    child_vector, child_array, chunk_offset, child_state, child_count, child_type,
+			    NumericCast<int64_t>(child_offset), array_mask.CanHaveNull() ? &child_parent_mask : nullptr);
 		} else {
 			// a nested list or array sets its validity again, so it takes the broadcast NULLs as its parent mask
 			ValidityMask child_parent_mask;
@@ -828,7 +832,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 		                                             array_state.GetChild(0), compressed_size, run_ends_type);
 		auto covered_end =
 		    compressed_size == 0 ? 0 : run_end_encoding.run_ends->GetValue(compressed_size - 1).GetValue<int64_t>();
-		if (covered_end < array.offset + array.length) {
+		if (array.length > 0 && covered_end < array.offset + array.length) {
 			throw InvalidInputException("Arrow run-end encoded array covers %d rows but has length %d",
 			                            MaxValue<int64_t>(covered_end - array.offset, 0), array.length);
 		}
@@ -848,8 +852,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 		default:
 			throw NotImplementedException("ArrowArrayPhysicalType not recognized");
 		}
-		// a nested part that is not flat (the elements of a list can be a dictionary) would otherwise be flattened in
-		// full again by every scan of the runs
+		// a nested part that is not flat would otherwise be flattened in full again by every scan of the runs
 		values.Flatten();
 	}
 
