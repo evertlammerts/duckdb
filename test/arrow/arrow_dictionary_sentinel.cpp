@@ -3,6 +3,7 @@
 #include "arrow/arrow_test_helper.hpp"
 #include "duckdb/common/adbc/single_batch_array_stream.hpp"
 #include "duckdb/common/enums/debug_verification_mode.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/config.hpp"
@@ -278,7 +279,7 @@ vector<Value> FirstColumn(QueryResult &result) {
 
 // Unlike ScanColumnMatches, compares the type and every row in order.
 bool StreamReadsRows(ArrowArrayStream &stream, const string &expected_query, bool verify_vectors,
-                     const string &select_list) {
+                     const string &filter = string(), const string &projection = string()) {
 	DuckDB db(nullptr);
 	Connection con(db);
 	VerificationModeRestorer restore_verification_mode;
@@ -286,8 +287,14 @@ bool StreamReadsRows(ArrowArrayStream &stream, const string &expected_query, boo
 	if (verify_vectors) {
 		REQUIRE_NO_FAIL(con.Query("SET debug_verification_mode='verify_vectors'"));
 	}
-	auto scan = con.TableFunction("arrow_scan", {}, {}, ArrowTestHelper::ConstructArrowScan(stream));
-	auto scanned = select_list.empty() ? scan->Execute() : scan->Project(select_list)->Execute();
+	auto relation = con.TableFunction("arrow_scan", {}, {}, ArrowTestHelper::ConstructArrowScan(stream));
+	if (!filter.empty()) {
+		relation = relation->Filter(filter);
+	}
+	if (!projection.empty()) {
+		relation = relation->Project(projection);
+	}
+	auto scanned = relation->Execute();
 	auto expected = con.Query(expected_query);
 	REQUIRE_NO_FAIL(*scanned);
 	REQUIRE_NO_FAIL(*expected);
@@ -315,7 +322,7 @@ bool StreamReadsRows(ArrowArrayStream &stream, const string &expected_query, boo
 bool ScanReadsRows(ArrowSchema &col_schema, ArrowArray &col_array, const string &expected_query,
                    bool verify_vectors = false, const string &select_list = string()) {
 	ColumnStream stream(col_schema, col_array);
-	return StreamReadsRows(stream.stream, expected_query, verify_vectors, select_list);
+	return StreamReadsRows(stream.stream, expected_query, verify_vectors, string(), select_list);
 }
 
 // Hands out one record batch per call, so one scan state converts them all and keeps its dictionary cache between
@@ -891,7 +898,7 @@ TEST_CASE("Arrow scan of a NULL fixed-size ARRAY row over dict-encoded VARCHAR k
 	BatchStream batches({RecordBatch(nodes, first_column), RecordBatch(nodes, second_column)});
 	REQUIRE(StreamReadsRows(
 	    batches.stream, "SELECT * FROM (VALUES ([5, 5]::TINYINT[2]), (NULL::TINYINT[2]), ([5, 5]::TINYINT[2])) t(d)",
-	    /*verify_vectors=*/true, cast));
+	    /*verify_vectors=*/true, string(), cast));
 }
 
 TEST_CASE("Arrow scan of dict-encoded LIST of dict-encoded VARCHAR with NULL sentinel", "[arrow]") {
@@ -1035,4 +1042,413 @@ TEST_CASE("Arrow scan of an empty dict-encoded fixed-size ARRAY dictionary of di
 	const uint8_t validity[] = {0x00};
 	auto &column = nodes.Dictionary("d", values, 1, validity, indices, 1);
 	REQUIRE(ScanReadsRows(column.schema, column.array, "SELECT NULL::VARCHAR[2] AS d", /*verify_vectors=*/true));
+}
+
+namespace {
+
+ArrowNodes::Node &RunEnds(ArrowNodes &nodes, const char *name, int64_t length, const int32_t *run_ends,
+                          ArrowNodes::Node &values, int64_t offset = 0) {
+	auto &ends = nodes.Add("i", "run_ends", values.array.length, {nullptr, run_ends});
+	ends.schema.flags = 0;
+	auto &node = nodes.Add("+r", name, length, {}, {ends, values}, 0, offset);
+	node.schema.flags = 0;
+	return node;
+}
+
+// VARCHAR values {'x', NULL, 'y'}.
+ArrowNodes::Node &NullableStrings(ArrowNodes &nodes, const char *name = nullptr) {
+	static const int32_t offsets[] = {0, 1, 1, 2};
+	static const uint8_t validity[] = {0x05};
+	return nodes.Add("u", name, 3, {validity, offsets, "xy"}, {}, 1);
+}
+
+// Run end encoded VARCHAR over int8 indices {2, NULL, 1, 0} into NullableStrings: 'y', 'y', NULL (index), NULL, NULL
+// (value), 'x'.
+const int32_t STRING_RUN_ENDS[] = {2, 3, 5, 6};
+const int8_t STRING_RUN_INDICES[] = {2, 0, 1, 0};
+const uint8_t STRING_RUN_INDICES_VALIDITY[] = {0x0D};
+
+ArrowNodes::Node &RunEndsOverStringDictionary(ArrowNodes &nodes, const char *name) {
+	auto &values =
+	    nodes.Dictionary("values", NullableStrings(nodes), 4, STRING_RUN_INDICES_VALIDITY, STRING_RUN_INDICES, 1);
+	return RunEnds(nodes, name, 6, STRING_RUN_ENDS, values);
+}
+
+const char *const STRING_RUN_ROWS = "SELECT * FROM (VALUES ('y'), ('y'), (NULL), (NULL), (NULL), ('x')) t(d)";
+
+// A stream of one record batch per column array, all with the schema of the first.
+class BatchesStream {
+public:
+	BatchesStream(ArrowSchema &col_schema, vector<reference<ArrowArray>> col_arrays) {
+		schema_children[0] = &col_schema;
+		record_schema.format = "+s";
+		record_schema.n_children = 1;
+		record_schema.children = schema_children;
+		record_schema.release = NoopReleaseSchema;
+		for (auto &col_array : col_arrays) {
+			batches.push_back(make_uniq<Batch>());
+			auto &batch = *batches.back();
+			batch.children[0] = &col_array.get();
+			batch.array.length = col_array.get().length;
+			batch.array.n_buffers = 1;
+			batch.array.buffers = batch.buffers;
+			batch.array.n_children = 1;
+			batch.array.children = batch.children;
+			batch.array.release = NoopReleaseArray;
+		}
+		stream.get_schema = GetSchema;
+		stream.get_next = GetNext;
+		stream.get_last_error = GetLastError;
+		stream.release = Release;
+		stream.private_data = this;
+	}
+	BatchesStream(const BatchesStream &) = delete;
+
+	ArrowArrayStream stream {};
+
+private:
+	struct Batch {
+		ArrowArray *children[1];
+		const void *buffers[1] = {nullptr};
+		ArrowArray array {};
+	};
+
+	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+		*out = static_cast<BatchesStream *>(stream->private_data)->record_schema;
+		return 0;
+	}
+	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
+		auto &self = *static_cast<BatchesStream *>(stream->private_data);
+		if (self.next == self.batches.size()) {
+			out->release = nullptr;
+			return 0;
+		}
+		*out = self.batches[self.next++]->array;
+		return 0;
+	}
+	static const char *GetLastError(ArrowArrayStream *) {
+		return nullptr;
+	}
+	static void Release(ArrowArrayStream *stream) {
+		stream->release = nullptr;
+	}
+
+	ArrowSchema *schema_children[1];
+	ArrowSchema record_schema {};
+	vector<unique_ptr<Batch>> batches;
+	idx_t next = 0;
+};
+
+// Run end encoded VARCHAR over int8 indices {0, 1, 0} into 'p', 'q': 'p', 'p', 'q', 'q', 'p', 'p'.
+ArrowNodes::Node &RunEndsOverPlainDictionary(ArrowNodes &nodes, const char *name) {
+	static const int32_t offsets[] = {0, 1, 2};
+	static const int8_t indices[] = {0, 1, 0};
+	static const int32_t run_ends[] = {2, 4, 6};
+	auto &strings = nodes.Add("u", nullptr, 2, {nullptr, offsets, "pq"});
+	return RunEnds(nodes, name, 6, run_ends, nodes.Dictionary("values", strings, 3, nullptr, indices, 0));
+}
+
+// The vector verifier rejects a value under a NULL struct row; the field read alone shows the value it would have.
+bool StructScanReadsRows(ArrowNodes::Node &column, const string &expected_query) {
+	ColumnStream rows(column.schema, column.array);
+	if (!StreamReadsRows(rows.stream, expected_query, /*verify_vectors=*/true)) {
+		return false;
+	}
+	ColumnStream fields(column.schema, column.array);
+	return StreamReadsRows(fields.stream, "SELECT d.r FROM (" + expected_query + ")", /*verify_vectors=*/false,
+	                       string(), "d.r");
+}
+
+string ScanBindError(ArrowSchema &col_schema, ArrowArray &col_array) {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ColumnStream stream(col_schema, col_array);
+	string error;
+	try {
+		auto result =
+		    con.TableFunction("arrow_scan", {}, {}, ArrowTestHelper::ConstructArrowScan(stream.stream))->Execute();
+		if (result->HasError()) {
+			error = result->GetError();
+		}
+	} catch (std::exception &ex) {
+		error = ErrorData(ex).Message();
+	}
+	// a failed bind reads only the schema, so no scan releases the stream
+	if (stream.stream.release) {
+		stream.stream.release(&stream.stream);
+	}
+	return error;
+}
+
+} // namespace
+
+TEST_CASE("Arrow scan of run-end encoded INTEGER over a dictionary reads the dictionary values", "[arrow]") {
+	ArrowNodes nodes;
+	const int8_t indices[] = {2, 0, 1};
+	auto &values =
+	    nodes.Dictionary("values", nodes.Add("i", nullptr, 3, {nullptr, INT_VALUES + 1}), 3, nullptr, indices, 0);
+	const int32_t run_ends[] = {2, 3, 5};
+	auto &column = RunEnds(nodes, "d", 5, run_ends, values);
+	REQUIRE(ScanReadsRows(column.schema, column.array, "SELECT * FROM (VALUES (3), (3), (1), (2), (2)) t(d)",
+	                      /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded VARCHAR over a dictionary with NULL indices and NULL values", "[arrow]") {
+	ArrowNodes nodes;
+	auto &column = RunEndsOverStringDictionary(nodes, "d");
+	REQUIRE(ScanReadsRows(column.schema, column.array, STRING_RUN_ROWS, /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values inside a STRUCT and a LIST", "[arrow]") {
+	ArrowNodes nodes;
+	SECTION("STRUCT") {
+		auto &field = RunEndsOverStringDictionary(nodes, "r");
+		auto &column = nodes.Add("+s", "d", 6, {nullptr}, {field});
+		REQUIRE(ScanReadsRows(column.schema, column.array,
+		                      "SELECT * FROM (VALUES ({'r': 'y'}), ({'r': 'y'}), ({'r': NULL}), ({'r': NULL}), "
+		                      "({'r': NULL}), ({'r': 'x'})) t(d)",
+		                      /*verify_vectors=*/true));
+	}
+	SECTION("LIST") {
+		auto &elements = RunEndsOverStringDictionary(nodes, "item");
+		const int32_t offsets[] = {1, 3, 3, 6};
+		auto &column = nodes.Add("+l", "d", 3, {nullptr, offsets}, {elements});
+		REQUIRE(ScanReadsRows(column.schema, column.array,
+		                      "SELECT * FROM (VALUES (['y', NULL]), ([]::VARCHAR[]), ([NULL, NULL, 'x'])) t(d)",
+		                      /*verify_vectors=*/true));
+	}
+}
+
+TEST_CASE("Arrow scan of run-end encoded values inside a STRUCT with NULL rows", "[arrow]") {
+	ArrowNodes nodes;
+	SECTION("over a dictionary") {
+		const uint8_t validity[] = {0x3D};
+		auto &column = nodes.Add("+s", "d", 6, {validity}, {RunEndsOverPlainDictionary(nodes, "r")}, 1);
+		REQUIRE(StructScanReadsRows(column, "SELECT * FROM (VALUES ({'r': 'p'}), (NULL), ({'r': 'q'}), ({'r': 'q'}), "
+		                                    "({'r': 'p'}), ({'r': 'p'})) t(d)"));
+	}
+	SECTION("over a dictionary whose runs hold NULLs") {
+		const uint8_t validity[] = {0x16};
+		auto &column = nodes.Add("+s", "d", 6, {validity}, {RunEndsOverStringDictionary(nodes, "r")}, 3);
+		REQUIRE(StructScanReadsRows(column, "SELECT * FROM (VALUES (NULL), ({'r': 'y'}), ({'r': NULL}), (NULL), "
+		                                    "({'r': NULL}), (NULL)) t(d)"));
+	}
+	SECTION("over plain values") {
+		// run ends {2, 3, 5} over 'x', NULL, 'y' decode to 'x', 'x', NULL, 'y', 'y'
+		const uint8_t validity[] = {0x0E};
+		auto &with_null = RunEnds(nodes, "r", 5, STRING_RUN_ENDS, NullableStrings(nodes, "values"));
+		auto &column = nodes.Add("+s", "d", 5, {validity}, {with_null}, 2);
+		REQUIRE(StructScanReadsRows(
+		    column, "SELECT * FROM (VALUES (NULL), ({'r': 'x'}), ({'r': NULL}), ({'r': 'y'}), (NULL)) t(d)"));
+
+		const int32_t values[] = {4, 8};
+		const int32_t run_ends[] = {3, 5};
+		auto &without_null = RunEnds(nodes, "r", 5, run_ends, nodes.Add("i", "values", 2, {nullptr, values}));
+		auto &int_column = nodes.Add("+s", "d", 5, {validity}, {without_null}, 2);
+		REQUIRE(StructScanReadsRows(int_column,
+		                            "SELECT * FROM (VALUES (NULL), ({'r': 4}), ({'r': 4}), ({'r': 8}), (NULL)) t(d)"));
+	}
+	SECTION("under a NULL fixed-size list row") {
+		const uint8_t struct_validity[] = {0x1F};
+		auto &structs = nodes.Add("+s", "item", 6, {struct_validity}, {RunEndsOverPlainDictionary(nodes, "r")}, 1);
+		const uint8_t list_validity[] = {0x05};
+		auto &column = nodes.Add("+w:2", "d", 3, {list_validity}, {structs}, 1);
+		REQUIRE(ScanReadsRows(column.schema, column.array,
+		                      "SELECT d::STRUCT(r VARCHAR)[2] AS d FROM (VALUES ([{'r': 'p'}, {'r': 'p'}]), (NULL), "
+		                      "([{'r': 'p'}, NULL])) t(d)",
+		                      /*verify_vectors=*/true));
+	}
+	SECTION("at an offset") {
+		// the struct and its field are read from row 3; the field decodes to 'p', 'q', 'q', 'p', 'p', 'p' there
+		const int8_t indices[] = {0, 1, 0};
+		const int32_t run_ends[] = {4, 6, 9};
+		static const int32_t offsets[] = {0, 1, 2};
+		auto &strings = nodes.Add("u", nullptr, 2, {nullptr, offsets, "pq"});
+		auto &field = RunEnds(nodes, "r", 9, run_ends, nodes.Dictionary("values", strings, 3, nullptr, indices, 0));
+		const uint8_t validity[] = {0x68, 0x01};
+		auto &column = nodes.Add("+s", "d", 6, {validity}, {field}, 2, /*offset=*/3);
+		REQUIRE(StructScanReadsRows(column, "SELECT * FROM (VALUES ({'r': 'p'}), (NULL), ({'r': 'q'}), ({'r': 'p'}), "
+		                                    "(NULL), ({'r': 'p'})) t(d)"));
+	}
+	SECTION("over more rows than a vector") {
+		constexpr idx_t ROW_COUNT = 3000;
+		vector<uint8_t> validity((ROW_COUNT + 7) / 8, 0);
+		int64_t null_count = 0;
+		for (idx_t row = 0; row < ROW_COUNT; row++) {
+			if (row % 7 == 3) {
+				null_count++;
+			} else {
+				validity[row / 8] |= NumericCast<uint8_t>(1 << (row % 8));
+			}
+		}
+		static const int32_t offsets[] = {0, 1, 2};
+		const int8_t indices[] = {0, 1};
+		const int32_t run_ends[] = {2100, 3000};
+		auto &strings = nodes.Add("u", nullptr, 2, {nullptr, offsets, "pq"});
+		auto &field =
+		    RunEnds(nodes, "r", ROW_COUNT, run_ends, nodes.Dictionary("values", strings, 2, nullptr, indices, 0));
+		auto &column = nodes.Add("+s", "d", ROW_COUNT, {validity.data()}, {field}, null_count);
+		const string rows = "CASE WHEN r % 7 = 3 THEN NULL ELSE {'r': CASE WHEN r < 2100 THEN 'p' ELSE 'q' END} END";
+		REQUIRE(StructScanReadsRows(column, "SELECT " + rows + " AS d FROM range(3000) t(r) ORDER BY r"));
+
+		// as the elements of one list, the struct and its field are converted as 3000 rows at once
+		const int32_t list_offsets[] = {0, NumericCast<int32_t>(ROW_COUNT)};
+		column.schema.name = "item";
+		auto &list = nodes.Add("+l", "d", 1, {nullptr, list_offsets}, {column});
+		REQUIRE(ScanReadsRows(list.schema, list.array,
+		                      "SELECT list(" + rows + " ORDER BY r) AS d FROM range(3000) t(r)",
+		                      /*verify_vectors=*/true));
+	}
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values under a NULL fixed-size list row", "[arrow]") {
+	ArrowNodes nodes;
+	const uint8_t validity[] = {0x06};
+	auto &column = nodes.Add("+w:2", "d", 3, {validity}, {RunEndsOverStringDictionary(nodes, "item")}, 1);
+	REQUIRE(ScanReadsRows(column.schema, column.array,
+	                      "SELECT d::VARCHAR[2] AS d FROM (VALUES (NULL), ([NULL, NULL]), ([NULL, 'x'])) t(d)",
+	                      /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of a dictionary over run-end encoded values", "[arrow]") {
+	ArrowNodes nodes;
+	const int8_t indices[] = {5, 0, 0, 2};
+	const uint8_t validity[] = {0x0D};
+	SECTION("over a dictionary") {
+		auto &column = nodes.Dictionary("d", RunEndsOverStringDictionary(nodes, nullptr), 4, validity, indices, 1);
+		REQUIRE(ScanReadsRows(column.schema, column.array, "SELECT * FROM (VALUES ('x'), (NULL), ('y'), (NULL)) t(d)",
+		                      /*verify_vectors=*/true));
+	}
+	SECTION("over plain values") {
+		// run ends {2, 3, 5} over 'x', NULL, 'y' decode to 'x', 'x', NULL, 'y', 'y'
+		const int8_t plain_indices[] = {4, 0, 0, 2};
+		auto &column =
+		    nodes.Dictionary("d", RunEnds(nodes, nullptr, 5, STRING_RUN_ENDS, NullableStrings(nodes, "values")), 4,
+		                     validity, plain_indices, 1);
+		REQUIRE(ScanReadsRows(column.schema, column.array, "SELECT * FROM (VALUES ('y'), (NULL), ('x'), (NULL)) t(d)",
+		                      /*verify_vectors=*/true));
+	}
+}
+
+TEST_CASE("Arrow scan of run-end encoded INTEGER over run-end encoded values", "[arrow]") {
+	ArrowNodes nodes;
+	// the inner array decodes to 5, 7, NULL, NULL and is read from row 1
+	const int32_t inner_values[] = {5, 7, 0};
+	const uint8_t inner_validity[] = {0x03};
+	const int32_t inner_run_ends[] = {1, 2, 4};
+	auto &inner = RunEnds(nodes, "values", 3, inner_run_ends,
+	                      nodes.Add("i", "values", 3, {inner_validity, inner_values}, {}, 1), /*offset=*/1);
+	const int32_t run_ends[] = {2, 3, 5};
+	auto &column = RunEnds(nodes, "d", 5, run_ends, inner);
+	REQUIRE(ScanReadsRows(column.schema, column.array, "SELECT * FROM (VALUES (7), (7), (NULL), (NULL), (NULL)) t(d)",
+	                      /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values with offsets", "[arrow]") {
+	ArrowNodes nodes;
+	// the indices of STRING_RUN_INDICES after one more valid index
+	const int8_t indices[] = {1, 2, 0, 1, 0};
+	const uint8_t validity[] = {0x1B};
+	auto &values = nodes.Dictionary("values", NullableStrings(nodes), 4, validity, indices, 1, /*offset=*/1);
+	auto &column = RunEnds(nodes, "d", 5, STRING_RUN_ENDS, values, /*offset=*/1);
+	REQUIRE(ScanReadsRows(column.schema, column.array,
+	                      "SELECT * FROM (VALUES ('y'), (NULL), (NULL), (NULL), ('x')) t(d)",
+	                      /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values over more rows than a vector", "[arrow]") {
+	ArrowNodes nodes;
+	const int32_t dictionary_values[] = {10, 20};
+	const int8_t indices[] = {1, 0, 0};
+	const uint8_t validity[] = {0x05};
+	auto &values =
+	    nodes.Dictionary("values", nodes.Add("i", nullptr, 2, {nullptr, dictionary_values}), 3, validity, indices, 1);
+	const int32_t run_ends[] = {1000, 3000, 5000};
+	auto &column = RunEnds(nodes, "d", 5000, run_ends, values);
+	REQUIRE(ScanReadsRows(column.schema, column.array,
+	                      "SELECT CASE WHEN r < 1000 THEN 20 WHEN r < 3000 THEN NULL ELSE 10 END::INTEGER AS d "
+	                      "FROM range(5000) t(r) ORDER BY r",
+	                      /*verify_vectors=*/true));
+}
+
+// Arrow requires dictionary indices and run ends to be plain integer arrays.
+TEST_CASE("Arrow scan rejects encoded dictionary indices and encoded run ends", "[arrow]") {
+	ArrowNodes nodes;
+	const int32_t run_ends[] = {1, 2};
+	SECTION("run-end encoded dictionary indices") {
+		const int8_t indices[] = {0, 1};
+		auto &column = RunEnds(nodes, "d", 2, run_ends, nodes.Add("c", "values", 2, {nullptr, indices}));
+		auto &strings = NullableStrings(nodes);
+		column.schema.dictionary = &strings.schema;
+		column.array.dictionary = &strings.array;
+		REQUIRE_THAT(ScanBindError(column.schema, column.array),
+		             Catch::Matchers::Contains("Arrow dictionary indices cannot be run-end encoded"));
+	}
+	SECTION("dictionary run ends") {
+		const int32_t run_end_indices[] = {0, 1};
+		auto &ends = nodes.Dictionary("run_ends", nodes.Add("i", nullptr, 2, {nullptr, run_ends}), 2, nullptr,
+		                              run_end_indices, 0, 0, "i");
+		ends.schema.flags = 0;
+		auto &values = nodes.Add("i", "values", 2, {nullptr, INT_VALUES + 1});
+		auto &column = nodes.Add("+r", "d", 2, {}, {ends, values});
+		column.schema.flags = 0;
+		REQUIRE_THAT(ScanBindError(column.schema, column.array),
+		             Catch::Matchers::Contains("Arrow run ends cannot be dictionary or run-end encoded"));
+	}
+	SECTION("run-end encoded run ends") {
+		const int32_t inner_run_ends[] = {2};
+		auto &ends =
+		    RunEnds(nodes, "run_ends", 2, inner_run_ends, nodes.Add("i", "values", 1, {nullptr, run_ends + 1}));
+		auto &values = nodes.Add("i", "values", 2, {nullptr, INT_VALUES + 1});
+		auto &column = nodes.Add("+r", "d", 2, {}, {ends, values});
+		column.schema.flags = 0;
+		REQUIRE_THAT(ScanBindError(column.schema, column.array),
+		             Catch::Matchers::Contains("Arrow run ends cannot be dictionary or run-end encoded"));
+	}
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values over more runs than a vector", "[arrow]") {
+	constexpr int64_t RUN_COUNT = 3000;
+	vector<int32_t> run_ends(RUN_COUNT);
+	vector<int16_t> indices(RUN_COUNT);
+	vector<uint8_t> validity((RUN_COUNT + 7) / 8, 0);
+	for (int64_t run = 0; run < RUN_COUNT; run++) {
+		run_ends[NumericCast<idx_t>(run)] = NumericCast<int32_t>(2 * (run + 1));
+		indices[NumericCast<idx_t>(run)] = NumericCast<int16_t>(run % 3);
+		if (run % 5 != 0) {
+			validity[NumericCast<idx_t>(run / 8)] |= NumericCast<uint8_t>(1 << (run % 8));
+		}
+	}
+	ArrowNodes nodes;
+	auto &values = nodes.Dictionary("values", NullableStrings(nodes), RUN_COUNT, validity.data(), indices.data(),
+	                                (RUN_COUNT + 4) / 5, 0, "s");
+	auto &column = RunEnds(nodes, "d", 2 * RUN_COUNT, run_ends.data(), values);
+	REQUIRE(
+	    ScanReadsRows(column.schema, column.array,
+	                  "SELECT CASE WHEN (r // 2) % 5 = 0 THEN NULL ELSE ['x', NULL, 'y'][(r // 2) % 3 + 1] END AS d "
+	                  "FROM range(6000) t(r) ORDER BY r",
+	                  /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values in batches with their own dictionaries", "[arrow]") {
+	ArrowNodes nodes;
+	auto &first = RunEndsOverStringDictionary(nodes, "d");
+	static const int32_t offsets[] = {0, 1, 2};
+	auto &strings = nodes.Add("u", nullptr, 2, {nullptr, offsets, "pq"});
+	const int8_t indices[] = {1, 0};
+	const int32_t run_ends[] = {2000, 2500};
+	auto &second = RunEnds(nodes, "d", 2500, run_ends, nodes.Dictionary("values", strings, 2, nullptr, indices, 0));
+	BatchesStream stream(first.schema, {first.array, second.array});
+	REQUIRE(StreamReadsRows(stream.stream,
+	                        "SELECT CASE WHEN r < 2 THEN 'y' WHEN r < 5 THEN NULL WHEN r = 5 THEN 'x' WHEN r < 2006 "
+	                        "THEN 'q' ELSE 'p' END AS d FROM range(2506) t(r) ORDER BY r",
+	                        /*verify_vectors=*/true));
+}
+
+TEST_CASE("Arrow scan of run-end encoded dictionary values under a filter", "[arrow]") {
+	ArrowNodes nodes;
+	auto &column = RunEndsOverStringDictionary(nodes, "d");
+	ColumnStream stream(column.schema, column.array);
+	REQUIRE(
+	    StreamReadsRows(stream.stream, "SELECT * FROM (VALUES ('y'), ('y')) t(d)", /*verify_vectors=*/true, "d = 'y'"));
 }
