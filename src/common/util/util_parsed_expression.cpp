@@ -1000,7 +1000,7 @@ bool TypeExpression::Equals(const ParsedExpression &other) const {
 		return false;
 	}
 	auto &other_p = other.Cast<TypeExpression>();
-	if (!ParsedExpression::ListEquals(children, other_p.children)) {
+	if (!ExpressionUtil::ListEqualsWithAliases(children, other_p.children)) {
 		return false;
 	}
 	if (qualified_name != other_p.qualified_name) {

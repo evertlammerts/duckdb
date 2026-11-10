@@ -97,9 +97,7 @@ void GroupBinder::ReplaceSelectRefs(Binder &binder, SelectNode &node, SelectBind
 		}
 	}
 
-	// a GROUP BY entry names the group of its class: a plain expression is the class of that expression, and so is a
-	// select reference whose entry equals a plain expression, as the select list reads such an entry as that group;
-	// any other select reference is the class of its entry
+	// the select list reads an entry equal to a plain expression as that group, so a reference to it joins that group
 	vector<unique_ptr<ParsedExpression>> groups;
 	vector<ProjectionIndex> group_of_entry;
 	parsed_expression_map_t<ProjectionIndex> expression_groups;
@@ -125,7 +123,7 @@ void GroupBinder::ReplaceSelectRefs(Binder &binder, SelectNode &node, SelectBind
 		} else {
 			auto &select_expr = *node.select_list[select_list_idx];
 			bool has_plain_class = plain_expressions.find(select_expr) != plain_expressions.end();
-			auto class_group = has_plain_class ? expression_groups.find(select_expr) : expression_groups.end();
+			auto class_group = expression_groups.find(select_expr);
 			if (class_group != expression_groups.end()) {
 				entry_group = class_group->second;
 				bind_state.replaced_select_expressions.push_back(std::move(node.select_list[select_list_idx]));
