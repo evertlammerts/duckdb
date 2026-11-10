@@ -97,15 +97,42 @@ static void SetVectorData(Vector &vector, data_ptr_t data, idx_t size) {
 	FlatVector::SetSize(vector, size);
 }
 
-static void GetValidityMask(ValidityMask &mask, ArrowArray &array, idx_t chunk_offset, idx_t size,
-                            int64_t parent_offset, int64_t nested_offset = -1, bool add_null = false) {
+static bool HasValidityBitmap(const ArrowArray &array) {
 	// In certain we don't need to or cannot copy arrow's validity mask to duckdb.
 	//
 	// The conditions where we do want to copy arrow's mask to duckdb are:
 	// 1. nulls exist
 	// 2. n_buffers > 0, meaning the array's arrow type is not `null`
 	// 3. the validity buffer (the first buffer) is not a nullptr
-	if (array.null_count != 0 && array.n_buffers > 0 && array.buffers && array.buffers[0]) {
+	return array.null_count != 0 && array.n_buffers > 0 && array.buffers && array.buffers[0];
+}
+
+static bool BitmapHasNullRow(const uint8_t *bitmap, idx_t bit_offset, idx_t count) {
+	const auto end = bit_offset + count;
+	auto bit = bit_offset;
+	for (; bit < end && bit % 8 != 0; bit++) {
+		if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
+			return true;
+		}
+	}
+	for (; bit + 64 <= end; bit += 64) {
+		uint64_t word;
+		memcpy(&word, bitmap + bit / 8, sizeof(word));
+		if (word != NumericLimits<uint64_t>::Maximum()) {
+			return true;
+		}
+	}
+	for (; bit < end; bit++) {
+		if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void GetValidityMask(ValidityMask &mask, ArrowArray &array, idx_t chunk_offset, idx_t size,
+                            int64_t parent_offset, int64_t nested_offset = -1, bool add_null = false) {
+	if (HasValidityBitmap(array)) {
 		auto bit_offset = GetEffectiveOffset(array, parent_offset, chunk_offset, nested_offset);
 		mask.EnsureWritable();
 #if STANDARD_VECTOR_SIZE > 64 && !DUCKDB_IS_BIG_ENDIAN
@@ -149,6 +176,26 @@ void ArrowToDuckDBConversion::SetValidityMask(Vector &vector, ArrowArray &array,
                                               int64_t parent_offset, int64_t nested_offset, bool add_null) {
 	auto &mask = FlatVector::ValidityMutable(vector);
 	GetValidityMask(mask, array, chunk_offset, size, parent_offset, nested_offset, add_null);
+}
+
+static void MergeNullRows(ValidityMask &mask, const ValidityMask &nulls, idx_t size) {
+	if (nulls.CannotHaveNull()) {
+		return;
+	}
+	const auto entry_count = ValidityMask::EntryCount(size);
+	const auto last_entry_bits = size % ValidityMask::BITS_PER_VALUE;
+	for (idx_t entry_idx = 0; entry_idx < entry_count; entry_idx++) {
+		auto entry = nulls.GetValidityEntryUnsafe(entry_idx);
+		if (entry_idx + 1 == entry_count && last_entry_bits != 0) {
+			// a bitmap copied from Arrow holds arbitrary bits past the last row
+			entry |= ~ValidityMask::EntryWithValidBits(last_entry_bits);
+		}
+		if (ValidityMask::AllValid(entry)) {
+			continue;
+		}
+		mask.EnsureWritable();
+		mask.GetData()[entry_idx] &= entry;
+	}
 }
 
 namespace {
@@ -817,6 +864,10 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 	default:
 		throw NotImplementedException("Type '%s' not implemented for RunEndEncoding", TypeIdToString(physical_type));
 	}
+	// decoding writes the validity of every row from the values
+	if (parent_mask) {
+		MergeNullRows(FlatVector::ValidityMutable(vector), *parent_mask, size);
+	}
 }
 template <class SRC>
 static void ConvertDecimal(Vector &vector, ArrowArray &array, idx_t size, idx_t offset) {
@@ -886,15 +937,7 @@ static void ColumnArrowToDuckDBStructChild(Vector &vector, ArrowArray &array, id
                                            uint64_t struct_offset) {
 	ArrowToDuckDBConversion::SetValidityMask(vector, array, chunk_offset, size, NumericCast<int64_t>(struct_offset),
 	                                         nested_offset);
-	// Merged first so that a nested struct, list or dictionary passes the NULL rows on.
-	if (struct_validity.CanHaveNull()) {
-		auto &validity = FlatVector::ValidityMutable(vector);
-		for (idx_t row = 0; row < size; row++) {
-			if (!struct_validity.RowIsValid(row)) {
-				validity.SetInvalid(row);
-			}
-		}
-	}
+	MergeNullRows(FlatVector::ValidityMutable(vector), struct_validity, size);
 	switch (arrow_type.GetPhysicalType()) {
 	case ArrowArrayPhysicalType::DICTIONARY_ENCODED:
 		ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(
@@ -910,14 +953,6 @@ static void ColumnArrowToDuckDBStructChild(Vector &vector, ArrowArray &array, id
 		break;
 	default:
 		throw NotImplementedException("ArrowArrayPhysicalType not recognized");
-	}
-	// Fixed size binary, run end encoded and union conversions rebuild the validity merged above.
-	if (struct_validity.CanHaveNull() && vector.GetVectorType() == VectorType::FLAT_VECTOR) {
-		for (idx_t row = 0; row < size; row++) {
-			if (!struct_validity.RowIsValid(row) && !FlatVector::IsNull(vector, row)) {
-				FlatVector::SetNull(vector, row, true);
-			}
-		}
 	}
 }
 
@@ -1026,7 +1061,6 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			break;
 		}
 		case ArrowVariableSizeType::FIXED_SIZE: {
-			SetValidityMask(vector, array, chunk_offset, size, NumericCast<int64_t>(parent_offset), nested_offset);
 			auto fixed_size = string_info.FixedSize();
 			// Have to check validity mask before setting this up
 			idx_t offset = GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset) *
@@ -1343,6 +1377,10 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 				throw InvalidInputException("Arrow union tag out of range: %d", tag);
 			}
 
+			if (parent_mask && !parent_mask->RowIsValid(row_idx)) {
+				vector.SetValue(row_idx, Value());
+				continue;
+			}
 			const Value &value = children[tag].GetValue(row_idx);
 			vector.SetValue(row_idx, value.IsNull() ? Value() : Value::UNION(members, tag, value));
 		}
@@ -1604,7 +1642,11 @@ ValidityMask ArrowToDuckDBConversion::GetRecordBatchValidity(ArrowArray &batch, 
 		throw InvalidInputException("Arrow record batch offset and length are out of range");
 	}
 	ValidityMask validity(size);
-	GetValidityMask(validity, batch, chunk_offset, size, 0);
+	// a mask without a buffer lets every column skip the merge of the batch's NULL rows
+	if (HasValidityBitmap(batch) &&
+	    BitmapHasNullRow(ArrowBufferData<uint8_t>(batch, 0), GetEffectiveOffset(batch, 0, chunk_offset), size)) {
+		GetValidityMask(validity, batch, chunk_offset, size, 0);
+	}
 	return validity;
 }
 

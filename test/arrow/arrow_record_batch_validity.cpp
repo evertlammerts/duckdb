@@ -516,6 +516,24 @@ TEST_CASE("Arrow record batch: NULL rows past the first vector of a sliced batch
 	RequireRows(*record, expected);
 }
 
+TEST_CASE("Arrow record batch: a NULL row that only a whole word of the batch's bitmap holds", "[arrow]") {
+	using namespace arrow_record_batch_validity_test;
+	constexpr idx_t SLOTS = 4096;
+	constexpr idx_t NULL_SLOT = 2148;
+	std::vector<int32_t> values;
+	for (idx_t slot = 0; slot < SLOTS; slot++) {
+		values.push_back(int32_t(slot));
+	}
+	std::vector<FieldPtr> columns;
+	columns.push_back(Int32("a", values, {}));
+	auto record = Record(std::move(columns), {NULL_SLOT}, 0);
+	std::vector<string> expected;
+	for (idx_t slot = 0; slot < SLOTS; slot++) {
+		expected.push_back(slot == NULL_SLOT ? "NULL" : to_string(slot));
+	}
+	RequireRows(*record, expected);
+}
+
 TEST_CASE("Arrow record batch: a dictionary column without its dictionary is rejected", "[arrow]") {
 	using namespace arrow_record_batch_validity_test;
 	std::vector<FieldPtr> columns;
