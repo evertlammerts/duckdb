@@ -360,8 +360,7 @@ FlattenDependentJoins::DecorrelateSubtreeInternal(unique_ptr<LogicalOperator> &p
 		FlattenDependentJoins child_flatten(binder, op.correlated_columns, op.perform_delim, op.any_join, this);
 		child_flatten.AddReplacementAliases(outer_state.replacement_graph);
 
-		// Phase 1 attaches the outer domain or a row number to the left side and must run once, so every leading CTE
-		// outside this join's domain is detached in one pass.
+		// Leading CTEs before the first one that needs this join's domain are evaluated once, above the join.
 		vector<unique_ptr<LogicalOperator>> detached_ctes;
 		while (plan->children[1]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 			auto &cte_ref = plan->children[1]->Cast<LogicalMaterializedCTE>();
