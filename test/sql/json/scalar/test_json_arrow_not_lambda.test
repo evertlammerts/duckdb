@@ -84,24 +84,6 @@ SELECT (SELECT max(list_transform(['{"a": 9}'::JSON], lambda j: j -> '$.a'))) FR
 [9]
 [9]
 
-# a macro whose body uses its parameter as a value takes no lambda there, so an arrow passed to it is the JSON operator
-
-statement ok
-CREATE MACRO idv(v) AS v;
-
-query I
-SELECT (SELECT max(idv(j -> '$.a'))) FROM jt;
-----
-3
-
-statement ok
-CREATE MACRO idv_f(k) AS idv(k -> 'f');
-
-query I
-SELECT idv_f('{"f": 5}'::JSON);
-----
-5
-
 # a macro body may apply the arrow to its parameter inside a function
 
 statement ok

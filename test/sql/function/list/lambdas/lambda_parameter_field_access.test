@@ -812,13 +812,13 @@ statement ok
 RESET lambda_syntax;
 
 # keyword lambdas stored before storage version v1.3.0 read back as arrow lambdas and keep their reading, also where
-# a stored view or macro passes one to a macro that forwards it to a lambda position
+# a stored view or macro passes one to a macro, read from another database
 
 statement ok
-ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db (STORAGE_VERSION 'v1.2.0');
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v100.db' AS db_v100 (STORAGE_VERSION 'v1.0.0');
 
 statement ok
-USE old_db;
+USE db_v100;
 
 statement ok
 CREATE TABLE t AS SELECT {'d': 99} AS p_, {'x': 98} AS x, 10 AS k;
@@ -838,20 +838,8 @@ CREATE VIEW vm_inner AS SELECT (SELECT max(apply_f([1], lambda k: k + 1)[1])) AS
 statement ok
 CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
 
-query II
-SELECT * FROM vw;
-----
-[1]	[1]
-
-query I
-SELECT * FROM vm;
-----
-[2, 3]
-
-query I
-SELECT count(*) FROM vm_inner;
-----
-3
+statement ok
+CREATE VIEW vk AS SELECT m_kw(5) AS r;
 
 query I
 SELECT m_kw(5);
@@ -862,28 +850,62 @@ statement ok
 USE memory;
 
 statement ok
-DETACH old_db;
+DETACH db_v100;
 
 statement ok
-ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS old_db;
-
-statement ok
-USE old_db;
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v100.db' AS db_v100;
 
 query II
-SELECT * FROM vw;
+SELECT * FROM db_v100.vw;
 ----
 [1]	[1]
 
 query I
-SELECT * FROM vm;
+SELECT r FROM db_v100.vm;
 ----
 [2, 3]
 
 query I
-SELECT count(*) FROM vm_inner;
+SELECT r FROM db_v100.vm_inner;
 ----
-3
+2
+2
+2
+
+query I
+SELECT r FROM db_v100.vk;
+----
+[2, 3]
+
+statement ok
+DETACH db_v100;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS db_v120 (STORAGE_VERSION 'v1.2.0');
+
+statement ok
+USE db_v120;
+
+statement ok
+CREATE TABLE t AS SELECT {'d': 99} AS p_, {'x': 98} AS x, 10 AS k;
+
+statement ok
+CREATE VIEW vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM t;
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE VIEW vm AS SELECT apply_f([1, 2], lambda k: k + 1) AS r FROM t;
+
+statement ok
+CREATE VIEW vm_inner AS SELECT (SELECT max(apply_f([1], lambda k: k + 1)[1])) AS r FROM range(3) r(k);
+
+statement ok
+CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vk AS SELECT m_kw(5) AS r;
 
 query I
 SELECT m_kw(5);
@@ -894,4 +916,32 @@ statement ok
 USE memory;
 
 statement ok
-DETACH old_db;
+DETACH db_v120;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS db_v120;
+
+query II
+SELECT * FROM db_v120.vw;
+----
+[1]	[1]
+
+query I
+SELECT r FROM db_v120.vm;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v120.vm_inner;
+----
+2
+2
+2
+
+query I
+SELECT r FROM db_v120.vk;
+----
+[2, 3]
+
+statement ok
+DETACH db_v120;

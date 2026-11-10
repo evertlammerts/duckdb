@@ -9,7 +9,6 @@
 #pragma once
 
 #include "duckdb/common/identifier.hpp"
-#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/enums/merge_action_type.hpp"
@@ -92,12 +91,6 @@ struct BoundCTEData;
 enum class CopyToType : uint8_t;
 template <class T, class INDEX_TYPE>
 class IndexVector;
-
-//! The written arguments of a call that bind as a lambda, by position and by the name of a named argument
-struct LambdaArguments {
-	unordered_set<idx_t> positions;
-	identifier_set_t names;
-};
 
 //! Table indexes of the top select node of a TRY subquery, recorded while planning that node, so that
 //! TRY can be lowered onto exactly that node's projection without crossing into other query levels
@@ -272,8 +265,6 @@ public:
 	optional_ptr<DummyBinding> macro_binding;
 	//! The intermediate lambda bindings to bind nested lambdas (if any)
 	optional_ptr<vector<DummyBinding>> lambda_bindings;
-	//! Per qualified name as written in a call, the written arguments that take a lambda (see ColumnQualifier)
-	unordered_map<string, LambdaArguments> lambda_arguments;
 
 	unordered_map<TableIndex, LogicalOperator *> recursive_ctes;
 

@@ -228,7 +228,7 @@ SELECT list_transform([{'path': 1}], s -> s.path) FROM sp;
 statement ok
 RESET lambda_syntax;
 
-# a macro takes a lambda at each parameter its body passes to a lambda position, directly or through another macro
+# an arrow passed to a macro is a lambda, since the macro places its arguments only when it expands
 
 statement ok
 CREATE MACRO apply_f(l, f) AS list_transform(l, f);
@@ -310,7 +310,7 @@ SELECT v FROM um;
 ----
 [2, 3]
 
-# a parameter the body passes to a lambda position and also uses as a value is read as a lambda, as main does
+# also where the macro body uses the parameter as a value too
 
 statement ok
 CREATE MACRO lambda_and_value(l, f) AS [list_transform(l, f)[1]::VARCHAR, f::VARCHAR];
@@ -319,6 +319,116 @@ query I
 SELECT lambda_and_value(['x'], k -> '$.f') FROM t;
 ----
 [$.f, '"bbbb"']
+
+# shapes a reading of the macro body ahead of expansion cannot see: a view in another schema, a table macro, one
+# overload calling another, the parameter as a dot call receiver, a named argument out of order, a subquery
+
+statement ok
+CREATE SCHEMA ms;
+
+statement ok
+SET schema = 'ms';
+
+statement ok
+CREATE MACRO forward_items(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO shadow_item(x) AS forward_items([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v AS SELECT shadow_item(100) AS r;
+
+statement ok
+SET schema = 'main';
+
+query I
+SELECT r FROM ms.v;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_table(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO apply_scalar(l, f) AS (SELECT r FROM apply_table(l, f));
+
+query I
+SELECT apply_scalar([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO dispatch_items(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE OR REPLACE MACRO dispatch_items (l, f) AS list_transform(l, f), (f, l, unused) AS dispatch_items(l, f);
+
+query I
+SELECT dispatch_items(x -> x + 1, [1, 2], 0) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO ma(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO mb(l, g) AS ma(l, g);
+
+statement ok
+CREATE OR REPLACE MACRO ma(l, f) AS list_transform(l, f), (l) AS mb(l, y -> y + 1);
+
+query I
+SELECT (SELECT max(ma([1], y -> y)[1] + mb([1], x -> x * 2)[1])) FROM range(3) t(x);
+----
+3
+3
+3
+
+query I
+SELECT (SELECT max(mb([1], x -> x * 2)[1] + ma([1], y -> y)[1])) FROM range(3) t(x);
+----
+3
+3
+3
+
+statement ok
+CREATE MACRO by_function(f, l) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO by_dot(l, f) AS f.by_function(l);
+
+query I
+SELECT by_dot([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT apply_f(f := x -> x + 1, l := [1, 2]) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_sub(l, f) AS (SELECT list_transform(l, f));
+
+query I
+SELECT apply_sub([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_rec(l, f) AS CASE WHEN len(l) = 0 THEN [] ELSE apply_rec(l[2:], f) END;
+
+statement error
+SELECT apply_rec([1], x -> x + 1);
+----
+Max expression depth limit
+
+# a scalar function reads its lambda argument by position, also when it is named
+
+query I
+SELECT list_transform([1, 2], "lambda" := x -> x + 1) FROM tm;
+----
+[2, 3]
 
 statement ok
 RESET lambda_syntax;

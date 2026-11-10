@@ -52,8 +52,6 @@ public:
 	//! Whether the reference is a parameter of one of the lambdas, or a field access on one. A table of this scope
 	//! that provides the reference wins, because that is the order in which the binder resolves it
 	bool IsLambdaParameterReference(const vector<identifier_set_t> &lambdas, const ColumnRefExpression &col_ref);
-	//! Whether argument index of the call is at a position that binds a lambda
-	static bool IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index);
 	//! Whether argument index of the call binds as a lambda, filling in the parameter names it declares
 	static bool TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
 	                                   identifier_set_t &parameters);
@@ -83,8 +81,8 @@ private:
 	                                      optional_ptr<ErrorData> error);
 
 	unique_ptr<ParsedExpression> QualifyColumnNameInternal(ColumnRefExpression &col_ref, ErrorData &error);
-	//! The arguments of the call as written that take a lambda, looked up once per function name and binder
-	static const LambdaArguments &GetLambdaArguments(Binder &binder, const FunctionExpression &function);
+	//! Whether an arrow at argument index of the call binds as a lambda
+	static bool IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index);
 	//! The function entry of the call; dot_call says it is written on a column, as in "x.lower()"
 	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function,
 	                                               const QualifiedName &name, bool &dot_call);
