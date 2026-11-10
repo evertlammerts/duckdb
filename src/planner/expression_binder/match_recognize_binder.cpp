@@ -263,7 +263,7 @@ static bool BoundByLambda(optional_ptr<vector<DummyBinding>> lambda_bindings, co
 
 //! A name an enclosing lambda binds is its parameter, so it is a pattern variable only where none does
 static MatchRecognizeIsSymbol VariablesInScope(optional_ptr<vector<DummyBinding>> lambda_bindings,
-                                               MatchRecognizeIsSymbol declared) {
+                                               const MatchRecognizeIsSymbol &declared) {
 	return [lambda_bindings, declared](const string &name) {
 		return declared(name) && !BoundByLambda(lambda_bindings, Identifier(name));
 	};
