@@ -753,3 +753,50 @@ statement error
 SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b + o.oa)) FROM t3 AS z) FROM o
 ----
 More than one row returned by a subquery
+
+# a field access that the parameter cannot provide is an error, never a column of an enclosing query
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z)) FROM (VALUES (99)) AS z(b)
+----
+Cannot extract field 'b' from expression "z"
+
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z))
+----
+Cannot extract field 'b' from expression "z"
+
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM range(1)) FROM (VALUES (99)) AS z(b)
+----
+Cannot extract field 'b' from expression "z"
+
+query I
+SELECT (SELECT list_transform([{'b': 5}], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z)) FROM (VALUES (99)) AS z(b)
+----
+[5]
+
+statement error
+SELECT (SELECT list_transform([[1]], lambda x: list_transform(x, lambda y: x.d))) FROM (VALUES (10)) x(d)
+----
+Cannot extract field 'd' from expression "x"
+
+query I
+SELECT (SELECT list_transform([{'d': 1}], lambda x: list_transform([2], lambda y: x.d + y))) FROM (VALUES (10)) x(d)
+----
+[[3]]
+
+statement error
+SELECT * FROM (VALUES (10)) x(d), unnest(list_transform([1], lambda x: x.d))
+----
+Cannot extract field 'd' from expression "x"
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement error
+SELECT (SELECT list_transform([1], x -> x.d)) FROM (VALUES (10), (20)) x(d)
+----
+Cannot extract field 'd' from expression "x"
+
+statement ok
+RESET lambda_syntax;

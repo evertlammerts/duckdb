@@ -72,6 +72,14 @@ BindResult ExpressionBinder::BindExpression(LambdaRefExpression &lambda_ref, idx
 	return (*lambda_bindings)[lambda_ref.LambdaIndex()].Bind(lambda_ref, depth);
 }
 
+static bool ReadsLambdaParameter(const ParsedExpression &expr) {
+	reference<const ParsedExpression> current(expr);
+	while (current.get().GetExpressionType() == ExpressionType::STRUCT_EXTRACT) {
+		current = *current.get().Cast<OperatorExpression>().GetChildren()[0];
+	}
+	return current.get().GetExpressionClass() == ExpressionClass::LAMBDA_REF;
+}
+
 unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnName(ColumnRefExpression &col_ref, ErrorData &error) {
 	ColumnQualifier qualifier(binder, lambda_bindings);
 	return qualifier.QualifyColumnName(col_ref, error);
@@ -111,9 +119,15 @@ BindResult ExpressionBinder::BindExpression(ColumnRefExpression &col_ref_p, idx_
 	// all of them are not column reference expressions, so we return here
 	if (expr->GetExpressionType() != ExpressionType::COLUMN_REF) {
 		auto alias = expr->GetAlias();
+		const auto reads_lambda_parameter = ReadsLambdaParameter(*expr);
 		auto result = BindExpression(expr, depth);
 		if (!result.HasError()) {
 			result.expression->SetAlias(std::move(alias));
+			return result;
+		}
+		if (reads_lambda_parameter) {
+			// a lambda parameter is the innermost name, so an enclosing scope must not read the reference instead
+			result.error.AddQueryLocation(col_ref_p);
 			return result;
 		}
 		// this scope reads the name as something other than a column, e.g a struct extract of one of its own columns,
