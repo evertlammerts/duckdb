@@ -465,7 +465,8 @@ public:
 		// An Arrow stream cannot be rewound, so a second scan would read only what the first one left.
 		if (stream_handed_out.exchange(true)) {
 			throw duckdb::InvalidInputException("The Arrow stream behind view \"%s\" can be read only once and was "
-			                                    "already read; copy it into a table to read it again",
+			                                    "already read; to read a stream more than once, copy it into a table "
+			                                    "with its first read",
 			                                    view_name);
 		}
 		auto result = duckdb::make_uniq<duckdb::ArrowArrayStreamWrapper>();
