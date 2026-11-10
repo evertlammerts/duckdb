@@ -30,6 +30,19 @@
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
+    defined(DUCKDB_THREAD_SANITIZER)
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(thread_sanitizer) ||       \
+    __has_feature(memory_sanitizer)
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#endif
+#endif
+#if !defined(DUCKDB_PLANNER_LARGE_STACK_FRAMES) && ((defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER))
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#endif
+
 namespace duckdb {
 
 Planner::Planner(ClientContext &context) : binder(Binder::CreateBinder(context)), context(context) {
@@ -110,9 +123,13 @@ static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 }
 
 void Planner::CheckStackSpace(const char *step) {
-	// a binding leaf takes about 14 KiB and one level of a planning walk at most about 4 KiB on a release build; the
-	// reserve holds that work below the last check and the throw, with room for a sanitizer's larger frames
+	// covers the work between two checks and the throw; frames are larger under the sanitizers and without
+	// optimization, and on Windows guard pages take part of the stack and a catch block runs on top of the throw
+#ifdef DUCKDB_PLANNER_LARGE_STACK_FRAMES
 	static constexpr idx_t MIN_STACK_RESERVE = idx_t(64) * 1024;
+#else
+	static constexpr idx_t MIN_STACK_RESERVE = idx_t(24) * 1024;
+#endif
 	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
 	idx_t stack_size;
 	idx_t remaining;
@@ -419,3 +436,5 @@ void Planner::VerifyPlan(ClientContext &context, unique_ptr<LogicalOperator> &op
 }
 
 } // namespace duckdb
+
+#undef DUCKDB_PLANNER_LARGE_STACK_FRAMES
