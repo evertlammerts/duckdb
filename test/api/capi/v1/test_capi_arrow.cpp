@@ -2,6 +2,7 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/json_document.hpp"
 #include "duckdb/common/types/arrow_string_view_type.hpp"
 
 using namespace duckdb;
@@ -646,6 +647,27 @@ duckdb::vector<ArrowArray> QueryToArrowBatches(CAPITester &tester, duckdb::vecto
 	return batches;
 }
 
+string PlanNodeProjections(const JSONValue &node, const string &name) {
+	string result;
+	if (node.IsArray()) {
+		node.IterateArray([&](JSONValue child) {
+			if (result.empty()) {
+				result = PlanNodeProjections(child, name);
+			}
+		});
+		return result;
+	}
+	if (!node.IsObject()) {
+		return string();
+	}
+	auto node_name = node.GetMember("name");
+	if (node_name.IsString() && node_name.GetString() == name) {
+		auto projections = node.GetMember("extra_info").GetMember("Projections");
+		return projections.IsValid() ? projections.ToString() : string();
+	}
+	return PlanNodeProjections(node.GetMember("children"), name);
+}
+
 void RequireMatchesNative(CAPITester &tester, const string &query) {
 	INFO(query);
 	auto scanned = tester.Query(query);
@@ -782,13 +804,13 @@ TEST_CASE("duckdb_arrow_scan reads the columns a query selects and keeps its fil
 	REQUIRE(StringUtil::Contains(plan_text, "Expression: a = 2"));
 	REQUIRE(!StringUtil::Contains(plan_text, "Filters:"));
 
-	// A plan renders several projected columns as a list, so a single string means the scan reads c alone.
+	// A projection operator above a scan that reads every column also lists c, so only the scan's own entry counts.
 	plan = tester.Query("EXPLAIN (FORMAT JSON) SELECT c FROM t");
 	REQUIRE_NO_FAIL(*plan);
 	plan_text = plan->Fetch<string>(1, 0);
 	INFO(plan_text);
-	REQUIRE(StringUtil::Contains(plan_text, "ARROW_SCAN_UNPROJECTED"));
-	REQUIRE(StringUtil::Contains(plan_text, "\"Projections\": \"c\""));
+	auto plan_json = JSONDocument::Parse(plan_text.c_str(), plan_text.size());
+	REQUIRE(PlanNodeProjections(plan_json->GetRoot(), "ARROW_SCAN_UNPROJECTED") == "\"c\"");
 }
 
 TEST_CASE("duckdb_arrow_array_scan reads the columns a query selects and keeps its filters", "[capi][arrow]") {
