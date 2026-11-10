@@ -63,6 +63,7 @@ blacklist = [
     "PipelineExternalInputCost",
     "PipelineExternalInputSupport",
     "PipelineSourceConsumption",
+    "PlanningStep",
     "ProducerState",
     "ProjectionMode",
     "ReaderWakeMode",

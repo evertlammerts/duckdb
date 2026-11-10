@@ -228,8 +228,8 @@ bool StackIsReported(Connection &con) {
 }
 
 // The sanitizers and builds without optimization take several times the stack per frame, and under AddressSanitizer
-// the join order optimizer, which does not check the stack, overflows 256 KiB planning TPC-H query 2. The engine keeps
-// a larger reserve for these builds and on Windows.
+// the join order optimizer needs more than 256 KiB planning TPC-H query 2. The engine keeps a larger reserve for these
+// builds and on Windows.
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
     defined(DUCKDB_THREAD_SANITIZER)
 constexpr idx_t STACK_FRAME_SCALE = 4;
@@ -490,8 +490,8 @@ TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[a
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
-	// under AddressSanitizer the join order optimizer, which does not check the stack, needs more of it per view than
-	// binding does, so a nest that just binds would overflow there
+	// under AddressSanitizer the join order optimizer needs more stack per view than binding does, so a nest that just
+	// binds would end in the planning error there
 	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_optimizer"));
 	if (!StackIsReported(con)) {
 		return;
