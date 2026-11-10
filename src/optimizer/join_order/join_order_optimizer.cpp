@@ -33,7 +33,7 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 		return plan;
 	}
 	// a nested optimizer starts for every operator it cannot reorder, with more stack per level than binding takes
-	Planner::CheckStackSpace("planning");
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 
 	// make sure query graph manager has not extracted a relation graph already
 	auto &op = *plan;

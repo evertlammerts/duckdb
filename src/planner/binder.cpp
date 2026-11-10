@@ -52,7 +52,7 @@ void Binder::IncreaseDepth() {
 		                      "increase the maximum expression depth.",
 		                      max_expression_depth);
 	}
-	Planner::CheckStackSpace("binding");
+	Planner::CheckStackSpace(PlanningStep::BINDING);
 }
 
 void Binder::ContinueDepth(const Binder &creator) {

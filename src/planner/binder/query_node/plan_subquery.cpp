@@ -727,7 +727,7 @@ void RecursiveDependentJoinPlanner::PlanJoinChildFilters(LogicalOperator &op) {
 
 BindingReplacementGraph RecursiveDependentJoinPlanner::PlanOperator(unique_ptr<LogicalOperator> &op_ptr) {
 	// one binder level can make several plan operators, so the checks of binding do not bound this walk
-	Planner::CheckStackSpace("planning");
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 	PlanJoinChildFilters(*op_ptr);
 	if (op_ptr->type == LogicalOperatorType::LOGICAL_ANY_JOIN &&
 	    op_ptr->Cast<LogicalAnyJoin>().condition->HasSubquery()) {

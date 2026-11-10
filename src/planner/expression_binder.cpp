@@ -47,7 +47,7 @@ StackChecker<ExpressionBinder> ExpressionBinder::StackCheck(const ParsedExpressi
 		                      "increase the maximum expression depth.",
 		                      max_expression_depth);
 	}
-	Planner::CheckStackSpace("binding");
+	Planner::CheckStackSpace(PlanningStep::BINDING);
 	return StackChecker<ExpressionBinder>(*this, extra_stack);
 }
 

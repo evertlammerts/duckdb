@@ -95,7 +95,7 @@ void Planner::Optimize() {
 // FlattenDependentJoins machinery can decorrelate the trigger body.
 static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 	// one binder level can make several plan operators, so the checks of binding do not bound this walk
-	Planner::CheckStackSpace("planning");
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 	for (auto &child : op.children) {
 		if (child) {
 			RewriteTriggersToDependent(binder, *child);
@@ -122,13 +122,15 @@ static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 	}
 }
 
-void Planner::CheckStackSpace(const char *step) {
-	// covers the work between two checks and the throw; frames are larger under the sanitizers and without
-	// optimization, and on Windows guard pages take part of the stack and a catch block runs on top of the throw
+void Planner::CheckStackSpace(PlanningStep step) {
+	// a floor covers its step's work below the last check and the throw; frames are larger under the sanitizers and
+	// without optimization, and on Windows guard pages and a catch block on top of the throw take more
 #ifdef DUCKDB_PLANNER_LARGE_STACK_FRAMES
-	static constexpr idx_t MIN_STACK_RESERVE = idx_t(64) * 1024;
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(64) * 1024;
+	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(64) * 1024;
 #else
-	static constexpr idx_t MIN_STACK_RESERVE = idx_t(24) * 1024;
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(24) * 1024;
+	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(16) * 1024;
 #endif
 	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
 	idx_t stack_size;
@@ -136,11 +138,14 @@ void Planner::CheckStackSpace(const char *step) {
 	if (!ThreadUtil::GetStackSpace(stack_size, remaining)) {
 		return;
 	}
-	auto reserve = MinValue(MaxValue(stack_size / 8, MIN_STACK_RESERVE), MAX_STACK_RESERVE);
+	auto binding = step == PlanningStep::BINDING;
+	auto min_reserve = binding ? BINDING_MIN_STACK_RESERVE : PLANNING_MIN_STACK_RESERVE;
+	// the eighth, not the floor, covers destroying a deep plan as a planning error unwinds, which grows with the plan
+	auto reserve = MinValue(MaxValue(stack_size / 8, min_reserve), MAX_STACK_RESERVE);
 	if (remaining < MinValue(reserve, stack_size / 2)) {
 		throw BinderException("Max expression depth exceeded: %s the query would overflow the %lld KiB stack of this "
 		                      "thread",
-		                      step, stack_size / 1024);
+		                      binding ? "binding" : "planning", stack_size / 1024);
 	}
 }
 

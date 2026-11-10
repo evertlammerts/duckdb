@@ -17,6 +17,8 @@ namespace duckdb {
 class ClientContext;
 class PreparedStatementData;
 
+enum class PlanningStep : uint8_t { BINDING, PLANNING };
+
 //! The planner creates a logical query plan from the parsed SQL statements
 //! using the Binder and LogicalPlanGenerator.
 class Planner {
@@ -43,8 +45,8 @@ public:
 	void Optimize();
 	static void VerifyPlan(ClientContext &context, unique_ptr<LogicalOperator> &op,
 	                       optional_ptr<bound_parameter_map_t> map = nullptr);
-	//! Throw the depth error when the stack of the calling thread is nearly used up, naming the step (as in "binding")
-	static void CheckStackSpace(const char *step);
+	//! Throw the depth error, naming the step, when less than the step's reserve is left on the calling thread's stack
+	static void CheckStackSpace(PlanningStep step);
 
 private:
 	void CreatePlan(SQLStatement &statement);

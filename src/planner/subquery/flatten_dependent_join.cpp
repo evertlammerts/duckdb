@@ -315,7 +315,7 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::DecorrelateSubtree(
                                                                                 bool propagate_null_values,
                                                                                 vector<ColumnBinding> state) {
 	// one binder level can make several plan operators, so the checks of binding do not bound this walk
-	Planner::CheckStackSpace("planning");
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 	auto result = DecorrelateSubtreeInternal(plan, propagate_null_values, std::move(state));
 	InvalidateAccessCache();
 	D_ASSERT(VerifyUnnestingState(*plan, result));
@@ -1636,7 +1636,7 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTERef(uniq
 FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCorrelatedNode(unique_ptr<LogicalOperator> &plan,
                                                                                     bool propagate_null_values,
                                                                                     vector<ColumnBinding> state) {
-	Planner::CheckStackSpace("planning");
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 	auto result = PushDownCorrelatedNodeInternal(plan, propagate_null_values, std::move(state));
 	InvalidateAccessCache();
 	D_ASSERT(VerifyUnnestingState(*plan, result));
