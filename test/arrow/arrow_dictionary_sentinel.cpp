@@ -320,9 +320,50 @@ bool StreamReadsRows(ArrowArrayStream &stream, const string &expected_query, boo
 }
 
 bool ScanReadsRows(ArrowSchema &col_schema, ArrowArray &col_array, const string &expected_query,
-                   bool verify_vectors = false) {
+                   bool verify_vectors = false, const string &select_list = string()) {
 	ColumnStream stream(col_schema, col_array);
-	return StreamReadsRows(stream.stream, expected_query, verify_vectors);
+	return StreamReadsRows(stream.stream, expected_query, verify_vectors, string(), select_list);
+}
+
+// Hands out one record batch per call, so one scan state converts them all and keeps its dictionary cache between
+// them.
+struct BatchStream {
+	explicit BatchStream(vector<reference<ArrowNodes::Node>> batches_p) : batches(std::move(batches_p)) {
+		stream.get_schema = GetSchema;
+		stream.get_next = GetNext;
+		stream.get_last_error = GetLastError;
+		stream.release = Release;
+		stream.private_data = this;
+	}
+	BatchStream(const BatchStream &) = delete;
+
+	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+		*out = static_cast<BatchStream *>(stream->private_data)->batches[0].get().schema;
+		return 0;
+	}
+	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
+		auto &self = *static_cast<BatchStream *>(stream->private_data);
+		if (self.next == self.batches.size()) {
+			out->release = nullptr;
+			return 0;
+		}
+		*out = self.batches[self.next++].get().array;
+		return 0;
+	}
+	static const char *GetLastError(ArrowArrayStream *) {
+		return nullptr;
+	}
+	static void Release(ArrowArrayStream *stream) {
+		stream->release = nullptr;
+	}
+
+	vector<reference<ArrowNodes::Node>> batches;
+	idx_t next = 0;
+	ArrowArrayStream stream {};
+};
+
+ArrowNodes::Node &RecordBatch(ArrowNodes &nodes, ArrowNodes::Node &column) {
+	return nodes.Add("+s", nullptr, column.array.length, {nullptr}, {column});
 }
 
 } // namespace
@@ -529,6 +570,29 @@ TEST_CASE("Arrow scan of dict-encoded LIST column with NULL sentinel", "[arrow]"
 	    ScanColumnMatches(schema, array,
 	                      "SELECT * FROM (VALUES (['a']), (['b', 'c']), ([]::VARCHAR[]), (NULL), (NULL), (['b', 'c']), "
 	                      "(['a'])) t(d)"));
+}
+
+TEST_CASE("Arrow scan of dict-encoded STRUCT batches that reuse and replace the dictionary", "[arrow]") {
+	ArrowNodes nodes;
+	auto &first_values = StructValues(nodes);
+	const int32_t seven_offsets[] = {0, 1, 2, 3, 4, 5, 6, 7};
+	auto &i = nodes.Add("i", "i", 7, {nullptr, INT_VALUES});
+	auto &s = nodes.Add("u", "s", 7, {nullptr, seven_offsets, "zabcdef"});
+	auto &seven_values = nodes.Add("+s", nullptr, 7, {nullptr}, {i, s});
+	const int8_t indices[] = {2, 1, 6, 0, 0};
+	const uint8_t validity[] = {0x05};
+
+	auto &first = NullIndexDictionary(nodes, first_values);
+	auto &reused = nodes.Dictionary("d", first_values, 2, nullptr, indices, 0);
+	auto &replaced = nodes.Dictionary("d", seven_values, 3, validity, indices + 2, 1);
+	auto &restored = nodes.Dictionary("d", first_values, 2, validity, indices + 3, 1);
+	BatchStream batches({RecordBatch(nodes, first), RecordBatch(nodes, reused), RecordBatch(nodes, replaced),
+	                     RecordBatch(nodes, restored)});
+	REQUIRE(StreamReadsRows(batches.stream,
+	                        "SELECT * FROM (VALUES ({'i': 1, 's': 'a'}), (NULL), ({'i': 3, 's': 'c'}), "
+	                        "({'i': 2, 's': 'b'}), ({'i': 1, 's': 'a'}), ({'i': 3, 's': 'c'}), ({'i': 2, 's': 'b'}), "
+	                        "({'i': 6, 's': 'f'}), (NULL), ({'i': 9, 's': 'z'}), ({'i': 1, 's': 'a'}), (NULL)) t(d)",
+	                        /*verify_vectors=*/true, string()));
 }
 
 TEST_CASE("Arrow scan of dict-encoded STRUCT column inside a STRUCT with NULL sentinel", "[arrow]") {
@@ -791,6 +855,52 @@ TEST_CASE("Arrow scan of fixed-size ARRAY of dict-encoded VARCHAR reads the dict
 	REQUIRE(ScanReadsRows(offset_column.schema, offset_column.array, expected, /*verify_vectors=*/true));
 }
 
+TEST_CASE("Arrow scan of a NULL fixed-size ARRAY row over dict-encoded VARCHAR keeps its elements NULL", "[arrow]") {
+	ArrowNodes nodes;
+	// a cast fails on '1000' unless the NULL rows hide it
+	const int32_t offsets[] = {0, 4, 5};
+	auto &strings = nodes.Add("u", nullptr, 2, {nullptr, offsets, "10005"});
+	const char *cast = "d::TINYINT[2] AS d";
+	const char *expected = "SELECT * FROM (VALUES (NULL::TINYINT[2]), ([NULL, 5]::TINYINT[2]), ([5, 5]::TINYINT[2])) "
+	                       "t(d)";
+
+	// a NULL array row, a NULL index in a valid row, and a valid row
+	const int8_t indices[] = {1, 1, 0, 0, 0, 1, 1, 1};
+	const uint8_t element_validity[] = {0x3B};
+	auto &elements = nodes.Dictionary("item", strings, 6, element_validity, indices + 2, 1);
+	const uint8_t validity[] = {0x06};
+	auto &column = nodes.Add("+w:2", "d", 3, {validity}, {elements}, 1);
+	REQUIRE(ScanReadsRows(column.schema, column.array, expected, /*verify_vectors=*/true, cast));
+
+	// the same rows after a valid row that only an ignored offset reads
+	const uint8_t offset_element_validity[] = {0xEF};
+	auto &offset_elements = nodes.Dictionary("item", strings, 8, offset_element_validity, indices, 1);
+	const uint8_t offset_validity[] = {0x0D};
+	auto &offset_column = nodes.Add("+w:2", "d", 3, {offset_validity}, {offset_elements}, 1, /*offset=*/1);
+	REQUIRE(ScanReadsRows(offset_column.schema, offset_column.array, expected, /*verify_vectors=*/true, cast));
+
+	// a NULL struct row reaches the elements through the array
+	auto &struct_elements = nodes.Dictionary("item", strings, 4, nullptr, indices + 4, 0);
+	auto &array = nodes.Add("+w:2", "a", 2, {nullptr}, {struct_elements});
+	const uint8_t struct_validity[] = {0x02};
+	auto &struct_column = nodes.Add("+s", "d", 2, {struct_validity}, {array}, 1);
+	REQUIRE(ScanReadsRows(struct_column.schema, struct_column.array,
+	                      "SELECT * FROM (VALUES (NULL::STRUCT(a TINYINT[2])), ({'a': [5, 5]}::STRUCT(a TINYINT[2]))) "
+	                      "t(d)",
+	                      /*verify_vectors=*/true, "d::STRUCT(a TINYINT[2]) AS d"));
+
+	// the second batch reuses the dictionary the first one cached without NULL rows
+	auto &first_elements = nodes.Dictionary("item", strings, 2, nullptr, indices, 0);
+	auto &first_column = nodes.Add("+w:2", "d", 1, {nullptr}, {first_elements});
+	auto &second_elements = nodes.Dictionary("item", strings, 4, nullptr, indices + 3, 0);
+	const uint8_t second_validity[] = {0x02};
+	auto &second_column = nodes.Add("+w:2", "d", 2, {second_validity}, {second_elements}, 1);
+	BatchStream batches({RecordBatch(nodes, first_column), RecordBatch(nodes, second_column)});
+	REQUIRE(StreamReadsRows(
+	    batches.stream, "SELECT * FROM (VALUES ([5, 5]::TINYINT[2]), (NULL::TINYINT[2]), ([5, 5]::TINYINT[2])) t(d)",
+	    /*verify_vectors=*/true, string(), cast));
+}
+
 TEST_CASE("Arrow scan of dict-encoded LIST of dict-encoded VARCHAR with NULL sentinel", "[arrow]") {
 	ArrowNodes nodes;
 	auto &strings = nodes.Add("u", nullptr, 3, {nullptr, STRING_OFFSETS + 1, STRING_DATA});
@@ -901,6 +1011,8 @@ TEST_CASE("Arrow scan binds run-end encoded nested columns", "[arrow]") {
 	ree_struct.schema.flags = 0;
 	const int8_t indices[] = {1, 0};
 	auto &dictionary_of_ree = nodes.Dictionary("d", ree_struct, 2, nullptr, indices, 0);
+	auto &plain_ree_struct = nodes.Add("+r", "d", 2, {}, {struct_ends, struct_values});
+	plain_ree_struct.schema.flags = 0;
 
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -911,9 +1023,14 @@ TEST_CASE("Arrow scan binds run-end encoded nested columns", "[arrow]") {
 	auto dictionary_scan =
 	    con.TableFunction("arrow_scan", {}, {}, ArrowTestHelper::ConstructArrowScan(dictionary_stream.stream));
 	REQUIRE(dictionary_scan->Columns()[0].Type() == LogicalType::STRUCT({{"a", LogicalType::INTEGER}}));
+	ColumnStream struct_stream(plain_ree_struct.schema, plain_ree_struct.array);
+	auto struct_scan =
+	    con.TableFunction("arrow_scan", {}, {}, ArrowTestHelper::ConstructArrowScan(struct_stream.stream));
+	REQUIRE(struct_scan->Columns()[0].Type() == LogicalType::STRUCT({{"a", LogicalType::INTEGER}}));
 	// binding only reads the schema, so no scan releases the streams
 	array_stream.stream.release(&array_stream.stream);
 	dictionary_stream.stream.release(&dictionary_stream.stream);
+	struct_stream.stream.release(&struct_stream.stream);
 }
 
 TEST_CASE("Arrow scan of an empty dict-encoded fixed-size ARRAY dictionary of dict-encoded VARCHAR", "[arrow]") {
