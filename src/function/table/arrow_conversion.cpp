@@ -495,11 +495,12 @@ static bool IsValidUTF8(const string_t &str) {
 	return Utf8Proc::Analyze(str.GetData(), str.GetSize()) != UnicodeType::INVALID;
 }
 
-//! Whether a value that is not inlined is ASCII, a word at a time
+//! Whether a value longer than string_t::INLINE_BYTES, so never inlined, is ASCII, a word at a time
 static bool IsASCIIOutOfLine(const string_t &str) {
-	// a value that is not inlined is longer than a word, so its last word may overlap the others
 	auto data = const_data_ptr_cast(str.GetData());
 	const auto size = str.GetSize();
+	// the last word may overlap the others, but must not start before the value
+	D_ASSERT(size >= SwarWord::SIZE);
 	auto word = Load<uint64_t>(data + size - SwarWord::SIZE);
 	for (idx_t i = 0; i + SwarWord::SIZE < size; i += SwarWord::SIZE) {
 		word |= Load<uint64_t>(data + i);
@@ -523,7 +524,7 @@ static void VerifyUTF8Strings(const Vector &vector, idx_t size, const ArrowArray
 	auto &validity = FlatVector::Validity(vector);
 	for (idx_t row_idx = 0; row_idx < size; row_idx++) {
 		auto &str = strings[row_idx];
-		if (!validity.RowIsValid(row_idx) || (!str.IsInlined() && IsASCIIOutOfLine(str))) {
+		if (!validity.RowIsValid(row_idx) || (str.GetSize() > string_t::INLINE_BYTES && IsASCIIOutOfLine(str))) {
 			continue;
 		}
 		if (!IsValidUTF8(str)) {

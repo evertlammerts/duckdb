@@ -576,6 +576,31 @@ TEST_CASE("Arrow scan of invalid UTF-8 among values longer than twelve bytes", "
 	}
 }
 
+// After a non ASCII byte the values in the next 1024 bytes are checked one by one, then the ASCII test resumes.
+TEST_CASE("Arrow scan of an invalid first byte of the value after the values checked one by one", "[arrow]") {
+	for (auto format : {"u", "U", "vu"}) {
+		// the accented value at offset 0 opens the window, which ends with the value ending at offset 1024
+		for (idx_t ascii_count : {idx_t(1021), idx_t(1022), idx_t(1023)}) {
+			INFO(format << " " << ascii_count);
+			std::vector<string> values(ascii_count, "a");
+			values.insert(values.begin(), "\xC3\xA9");
+			values.push_back("\x80z");
+			values.push_back("c");
+			StringColumn col(format, values);
+			RequireInvalid(col, "\\x80z");
+		}
+	}
+}
+
+// Only bytes that are all ASCII prove their values valid; bytes that are valid UTF-8 together prove nothing.
+TEST_CASE("Arrow scan of two invalid values whose bytes together are valid UTF-8", "[arrow]") {
+	for (auto format : {"u", "U", "vu"}) {
+		INFO(format);
+		StringColumn col(format, {"ok", "a\xC3", "\xA9z", "ok"});
+		RequireInvalid(col, "a\\xC3");
+	}
+}
+
 // A value that is not inlined is tested for ASCII a word at a time, with a last word that overlaps the others.
 TEST_CASE("Arrow scan of an invalid byte at each word boundary of a value longer than twelve bytes", "[arrow]") {
 	for (auto format : {"u", "U", "vu"}) {
