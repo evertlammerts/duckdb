@@ -1,0 +1,261 @@
+# name: test/sql/optimizer/test_struct_field_spelling_matching.test
+# description: Bound expressions whose struct or union field names differ only in case are not merged
+# group: [optimizer]
+
+statement ok
+CREATE TABLE t AS SELECT i AS x, i % 2 AS g FROM range(4) r(i) UNION ALL SELECT NULL, 0;
+
+query TT
+SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(a) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
+----
+{'A': 1}	{'a': 1}
+
+query TT
+SELECT (SELECT {'A': x}::VARCHAR FROM t WHERE x = 1) AS c, (SELECT {'a': x}::VARCHAR FROM t WHERE x = 1) AS d;
+----
+{'A': 1}	{'a': 1}
+
+query TTT
+SELECT {'A': x}::VARCHAR, {'a': x}::VARCHAR, {'A': x}::VARCHAR FROM t ORDER BY x NULLS LAST;
+----
+{'A': 0}	{'a': 0}	{'A': 0}
+{'A': 1}	{'a': 1}	{'A': 1}
+{'A': 2}	{'a': 2}	{'A': 2}
+{'A': 3}	{'a': 3}	{'A': 3}
+{'A': NULL}	{'a': NULL}	{'A': NULL}
+
+query TT
+SELECT {'s': {'A': x}}::VARCHAR, {'s': {'a': x}}::VARCHAR FROM t WHERE x = 1;
+----
+{'s': {'A': 1}}	{'s': {'a': 1}}
+
+query TT
+SELECT [{'A': x}]::VARCHAR, [{'a': x}]::VARCHAR FROM t WHERE x = 1;
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT array_value({'A': x})::VARCHAR, array_value({'a': x})::VARCHAR FROM t WHERE x = 1;
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT row({'A': x})::VARCHAR, row({'a': x})::VARCHAR FROM t WHERE x = 1;
+----
+({'A': 1},)	({'a': 1},)
+
+query TT
+SELECT union_value(k := {'A': x})::VARCHAR, union_value(k := {'a': x})::VARCHAR FROM t WHERE x = 1;
+----
+{'A': 1}	{'a': 1}
+
+query TT
+SELECT MAP {x: {'A': x}}::VARCHAR, MAP {x: {'a': x}}::VARCHAR FROM t WHERE x = 1;
+----
+{1={'A': 1}}	{1={'a': 1}}
+
+query TT
+SELECT MAP {{'A': x}: 1}::VARCHAR, MAP {{'a': x}: 1}::VARCHAR FROM t WHERE x = 1;
+----
+{{'A': 1}=1}	{{'a': 1}=1}
+
+# The TINYINT source keeps each cast, so only the nested field name in its target type differs.
+statement ok
+CREATE TABLE n AS SELECT {'a': 1::TINYINT} s, [{'a': 1::TINYINT}] l, {'s': {'a': 1::TINYINT}} ss;
+
+query TT
+SELECT ss::STRUCT(s STRUCT(A INTEGER))::VARCHAR, ss::STRUCT(s STRUCT(a INTEGER))::VARCHAR FROM n;
+----
+{'s': {'A': 1}}	{'s': {'a': 1}}
+
+query TT
+SELECT l::STRUCT(A INTEGER)[]::VARCHAR, l::STRUCT(a INTEGER)[]::VARCHAR FROM n;
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT MAP {1: s}::MAP(INTEGER, STRUCT(A INTEGER))::VARCHAR, MAP {1: s}::MAP(INTEGER, STRUCT(a INTEGER))::VARCHAR FROM n;
+----
+{1={'A': 1}}	{1={'a': 1}}
+
+query TT
+SELECT l::STRUCT(A INTEGER)[1]::VARCHAR, l::STRUCT(a INTEGER)[1]::VARCHAR FROM n;
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT (SELECT [{'A': x}]::VARCHAR FROM t WHERE x = 1), (SELECT [{'a': x}]::VARCHAR FROM t WHERE x = 1);
+----
+[{'A': 1}]	[{'a': 1}]
+
+query TT
+SELECT (SELECT union_value(k := {'A': x})::VARCHAR FROM t WHERE x = 1), (SELECT union_value(k := {'a': x})::VARCHAR FROM t WHERE x = 1);
+----
+{'A': 1}	{'a': 1}
+
+query ITT
+SELECT g, first({'A': x} ORDER BY x)::VARCHAR, first({'a': x} ORDER BY x)::VARCHAR FROM t GROUP BY g ORDER BY g;
+----
+0	{'A': 0}	{'a': 0}
+1	{'A': 1}	{'a': 1}
+
+query ITT
+SELECT g, {'A': g}::VARCHAR, {'a': g}::VARCHAR FROM t GROUP BY g ORDER BY g;
+----
+0	{'A': 0}	{'a': 0}
+1	{'A': 1}	{'a': 1}
+
+# The binder deduplicates aggregates before any optimizer runs.
+statement ok
+PRAGMA disable_optimizer
+
+query TT
+SELECT first({'A': x} ORDER BY x)::VARCHAR, first({'a': x} ORDER BY x)::VARCHAR FROM t;
+----
+{'A': 0}	{'a': 0}
+
+query II
+SELECT count(*) FILTER (WHERE {'A': x}::VARCHAR LIKE '%A%'), count(*) FILTER (WHERE {'a': x}::VARCHAR LIKE '%A%') FROM t;
+----
+5	0
+
+query I
+SELECT count(*) FROM (SELECT g FROM t GROUP BY g HAVING first({'A': x})::VARCHAR LIKE '%A%' AND first({'a': x})::VARCHAR LIKE '%a%');
+----
+2
+
+statement ok
+PRAGMA enable_optimizer
+
+query ITT
+SELECT x, list({'A': x}) OVER (PARTITION BY g ORDER BY x)::VARCHAR, list({'a': x}) OVER (PARTITION BY g ORDER BY x)::VARCHAR FROM t ORDER BY x NULLS LAST;
+----
+0	[{'A': 0}]	[{'a': 0}]
+1	[{'A': 1}]	[{'a': 1}]
+2	[{'A': 0}, {'A': 2}]	[{'a': 0}, {'a': 2}]
+3	[{'A': 1}, {'A': 3}]	[{'a': 1}, {'a': 3}]
+NULL	[{'A': 0}, {'A': 2}, {'A': NULL}]	[{'a': 0}, {'a': 2}, {'a': NULL}]
+
+# A DISTINCT aggregate orders only by its arguments, and a spelling that differs only in case is a different name.
+statement error
+SELECT list(DISTINCT {'A': x} ORDER BY {'a': x}) FROM t;
+----
+In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list
+
+statement error
+SELECT list(DISTINCT {'A': x} ORDER BY {'B': x}) FROM t;
+----
+In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list
+
+query T
+SELECT list(DISTINCT {'A': x} ORDER BY {'A': x})::VARCHAR FROM t;
+----
+[{'A': 0}, {'A': 1}, {'A': 2}, {'A': 3}, {'A': NULL}]
+
+# Plans that never merge the two expressions keep both spellings.
+query TT
+SELECT (SELECT MAP {x: {'A': x}}::VARCHAR FROM t WHERE x = 1), (SELECT MAP {x: {'a': x}}::VARCHAR FROM t WHERE x = 1);
+----
+{1={'A': 1}}	{1={'a': 1}}
+
+query TT
+SELECT (SELECT first({'A': g} ORDER BY g)::VARCHAR FROM t GROUP BY g ORDER BY g LIMIT 1), (SELECT first({'a': g} ORDER BY g)::VARCHAR FROM t GROUP BY g ORDER BY g LIMIT 1);
+----
+{'A': 0}	{'a': 0}
+
+query TT
+SELECT first({'A': x} ORDER BY x) OVER ()::VARCHAR, first({'a': x} ORDER BY x) OVER ()::VARCHAR FROM t LIMIT 1;
+----
+{'A': 0}	{'a': 0}
+
+query TT
+WITH a AS MATERIALIZED (SELECT {'A': 1} s), b AS MATERIALIZED (SELECT {'a': 1} s) SELECT a.s::VARCHAR, b.s::VARCHAR FROM a, b;
+----
+{'A': 1}	{'a': 1}
+
+# Subqueries that are the same plan still share one common subplan.
+query TT
+SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
+----
+{'A': 1}	{'A': 1}
+
+statement ok
+SET explain_output='optimized_only';
+
+# Type pushdown shares one reader type between casts of a column only when their targets are spelled alike.
+statement ok
+COPY (SELECT '{}' AS j) TO '{TEST_DIR}/struct_field_spelling.csv' (HEADER);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<!REGEX>:.*"Expressions": "j".*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(B INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(A INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": "j".*
+
+statement ok
+SET disabled_optimizers='common_subexpressions';
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(a INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"p",\s*"q"\s*\].*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT j::STRUCT(A INTEGER) AS p, j::STRUCT(A INTEGER) AS q FROM read_csv('{TEST_DIR}/struct_field_spelling.csv', header = true, all_varchar = true);
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"j",\s*"j"\s*\].*
+
+statement ok
+RESET disabled_optimizers;
+
+
+query II
+EXPLAIN (FORMAT JSON) SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
+----
+logical_opt	<REGEX>:.*"CTE".*CTE_SCAN.*CTE_SCAN.*__common_subplan_.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT (SELECT {'A': x}::VARCHAR FROM t WHERE x = 1), (SELECT {'A': x}::VARCHAR FROM t WHERE x = 1);
+----
+logical_opt	<REGEX>:.*"CTE".*CTE_SCAN.*CTE_SCAN.*__common_subplan_.*
+
+# A spelling that differs only in case is planned like a different name.
+query II
+EXPLAIN (FORMAT JSON) SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(a) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
+----
+logical_opt	<!REGEX>:.*__common_subplan_.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT (WITH q(A) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS c, (WITH q(B) AS (SELECT 1) SELECT q::VARCHAR FROM q) AS d;
+----
+logical_opt	<!REGEX>:.*__common_subplan_.*
+
+# The same aggregate written twice is still computed once.
+query II
+EXPLAIN (FORMAT JSON) SELECT max({'A': x})::VARCHAR, max({'A': x})::VARCHAR FROM t;
+----
+logical_opt	<REGEX>:.*"Expressions": "max\(struct_pack\(A\)\).*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT max({'A': x})::VARCHAR, max({'a': x})::VARCHAR FROM t;
+----
+logical_opt	<REGEX>:.*"Expressions": \[\s*"max\(struct_pack\(A\)\)[^"]*",\s*"max\(struct_pack\(a\)\).*
+
+query TT
+SELECT max({'A': x})::VARCHAR, max({'a': x})::VARCHAR FROM t;
+----
+{'A': NULL}	{'a': NULL}

@@ -1,4 +1,5 @@
 #include "duckdb/common/logical_type_info.hpp"
+#include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/logical_type_info/enum_type_info.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/enum_util.hpp"
@@ -103,13 +104,17 @@ void LogicalTypeInfo::CopyBaseInfo(LogicalTypeInfo &target) const {
 	}
 }
 
+static bool ChildTypesEqual(const LogicalType &lhs, const LogicalType &rhs, bool exact_field_names) {
+	return exact_field_names ? lhs.EqualsIncludingFieldSpelling(rhs) : lhs == rhs;
+}
+
 //! Infos that carry no parameters that affect equality - collations do not affect equality
 static bool HasNoEqualityParameters(LogicalTypeInfoType type) {
 	return type == LogicalTypeInfoType::INVALID_TYPE_INFO || type == LogicalTypeInfoType::STRING_TYPE_INFO ||
 	       type == LogicalTypeInfoType::GENERIC_TYPE_INFO;
 }
 
-bool LogicalTypeInfo::Equals(const LogicalTypeInfo &other) const {
+bool LogicalTypeInfo::Equals(const LogicalTypeInfo &other, bool exact_field_names) const {
 	if (alias != other.alias) {
 		return false;
 	}
@@ -122,10 +127,10 @@ bool LogicalTypeInfo::Equals(const LogicalTypeInfo &other) const {
 	if (type != other.type) {
 		return false;
 	}
-	return EqualsInternal(&other);
+	return EqualsInternal(&other, exact_field_names);
 }
 
-bool LogicalTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool LogicalTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	// Do nothing
 	return true;
 }
@@ -141,7 +146,7 @@ DecimalTypeInfo::DecimalTypeInfo(uint32_t width_p, uint32_t scale_p)
 	D_ASSERT(width_p >= scale_p);
 }
 
-bool DecimalTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool DecimalTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<DecimalTypeInfo>();
 	return width == other.width && scale == other.scale;
 }
@@ -160,7 +165,7 @@ StringTypeInfo::StringTypeInfo(string collation_p)
     : LogicalTypeInfo(LogicalTypeInfoType::STRING_TYPE_INFO), collation(std::move(collation_p)) {
 }
 
-bool StringTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool StringTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	// collation info has no impact on equality
 	return true;
 }
@@ -179,9 +184,9 @@ ListTypeInfo::ListTypeInfo(LogicalType child_type_p)
     : LogicalTypeInfo(LogicalTypeInfoType::LIST_TYPE_INFO), child_type(std::move(child_type_p)) {
 }
 
-bool ListTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool ListTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<ListTypeInfo>();
-	return child_type == other.child_type;
+	return ChildTypesEqual(child_type, other.child_type, exact_field_names);
 }
 
 unique_ptr<LogicalTypeInfo> ListTypeInfo::Copy() const {
@@ -198,9 +203,16 @@ StructTypeInfo::StructTypeInfo(child_list_t<LogicalType> child_types_p)
     : LogicalTypeInfo(LogicalTypeInfoType::STRUCT_TYPE_INFO), child_types(std::move(child_types_p)) {
 }
 
-bool StructTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool StructTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<StructTypeInfo>();
-	return child_types == other.child_types;
+	if (!exact_field_names) {
+		return child_types == other.child_types;
+	}
+	return std::equal(child_types.begin(), child_types.end(), other.child_types.begin(), other.child_types.end(),
+	                  [](const pair<Identifier, LogicalType> &lhs, const pair<Identifier, LogicalType> &rhs) {
+		                  return lhs.first.GetIdentifierName() == rhs.first.GetIdentifierName() &&
+		                         lhs.second.EqualsIncludingFieldSpelling(rhs.second);
+	                  });
 }
 
 unique_ptr<LogicalTypeInfo> StructTypeInfo::Copy() const {
@@ -281,7 +293,7 @@ LegacyAggregateStateTypeInfo::LegacyAggregateStateTypeInfo()
 	throw InternalException("LegacyAggregateStateTypeInfo should no longer be getting constructed");
 }
 
-bool LegacyAggregateStateTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool LegacyAggregateStateTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	throw InternalException("LegacyAggregateStateTypeInfo should no longer be getting constructed");
 }
 
@@ -401,7 +413,7 @@ unique_ptr<LogicalTypeInfo> EnumTypeInfo::Deserialize(Deserializer &deserializer
 }
 
 // Equalities are only used in enums with different catalog entries
-bool EnumTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool EnumTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<EnumTypeInfo>();
 	if (dict_type != other.dict_type) {
 		return false;
@@ -448,9 +460,9 @@ ArrayTypeInfo::ArrayTypeInfo(LogicalType child_type_p, uint32_t size_p)
     : LogicalTypeInfo(LogicalTypeInfoType::ARRAY_TYPE_INFO), child_type(std::move(child_type_p)), size(size_p) {
 }
 
-bool ArrayTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool ArrayTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<ArrayTypeInfo>();
-	return child_type == other.child_type && size == other.size;
+	return ChildTypesEqual(child_type, other.child_type, exact_field_names) && size == other.size;
 }
 
 unique_ptr<LogicalTypeInfo> ArrayTypeInfo::Copy() const {
@@ -468,9 +480,9 @@ AnyTypeInfo::AnyTypeInfo(LogicalType target_type_p, idx_t cast_score_p)
       cast_score(cast_score_p) {
 }
 
-bool AnyTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool AnyTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<AnyTypeInfo>();
-	return target_type == other.target_type && cast_score == other.cast_score;
+	return ChildTypesEqual(target_type, other.target_type, exact_field_names) && cast_score == other.cast_score;
 }
 
 unique_ptr<LogicalTypeInfo> AnyTypeInfo::Copy() const {
@@ -490,7 +502,7 @@ IntegerLiteralTypeInfo::IntegerLiteralTypeInfo(Value constant_value_p)
 	}
 }
 
-bool IntegerLiteralTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool IntegerLiteralTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<IntegerLiteralTypeInfo>();
 	return constant_value == other.constant_value;
 }
@@ -509,7 +521,7 @@ TemplateTypeInfo::TemplateTypeInfo(string name_p)
     : LogicalTypeInfo(LogicalTypeInfoType::TEMPLATE_TYPE_INFO), name(std::move(name_p)) {
 }
 
-bool TemplateTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool TemplateTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<TemplateTypeInfo>();
 	return name == other.name;
 }
@@ -524,7 +536,7 @@ unique_ptr<LogicalTypeInfo> TemplateTypeInfo::Copy() const {
 GeoTypeInfo::GeoTypeInfo() : LogicalTypeInfo(LogicalTypeInfoType::GEO_TYPE_INFO) {
 }
 
-bool GeoTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool GeoTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	// No additional info to compare
 	const auto &other = other_p->Cast<GeoTypeInfo>();
 	return other.crs.Equals(crs);
@@ -544,7 +556,7 @@ UnboundTypeInfo::UnboundTypeInfo(unique_ptr<ParsedExpression> expr_p)
     : LogicalTypeInfo(LogicalTypeInfoType::UNBOUND_TYPE_INFO), expr(std::move(expr_p)) {
 }
 
-bool UnboundTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p) const {
+bool UnboundTypeInfo::EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const {
 	auto &other = other_p->Cast<UnboundTypeInfo>();
 	if (!expr->Equals(*other.expr)) {
 		return false;

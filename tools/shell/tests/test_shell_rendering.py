@@ -90,6 +90,19 @@ def test_mode_json_null(shell):
     result = test.run()
     result.check_stdout("null")
 
+def test_mode_json_struct_field_spelling_of_two_casts_of_one_column(shell, tmp_path):
+    # The renderer reads the types of the result vectors, which a cast pushed down into the reader decides.
+    csv = tmp_path / "j.csv"
+    csv.write_text("j\n{}\n")
+    test = (
+        ShellTest(shell)
+        .statement(".mode jsonlines")
+        .statement(f"select j::STRUCT(A INTEGER) as p, j::STRUCT(a INTEGER) as q from read_csv('{csv.as_posix()}', header = true, all_varchar = true);")
+    )
+
+    result = test.run()
+    result.check_stdout('{"p":{"A":null},"q":{"a":null}}')
+
 def test_mode_json_escapes(shell):
     test = (
         ShellTest(shell)

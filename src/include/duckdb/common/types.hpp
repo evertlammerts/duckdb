@@ -330,7 +330,7 @@ public:
 		}
 	}
 
-	bool Equals(const LogicalTypeInfo &other) const;
+	bool Equals(const LogicalTypeInfo &other, bool exact_field_names) const;
 
 	virtual void Serialize(Serializer &serializer) const;
 	static unique_ptr<LogicalTypeInfo> Deserialize(Deserializer &source);
@@ -352,7 +352,7 @@ public:
 	}
 
 protected:
-	virtual bool EqualsInternal(const LogicalTypeInfo *other_p) const;
+	virtual bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const;
 };
 
 struct LogicalType {
@@ -409,7 +409,7 @@ struct LogicalType {
 	//! Copies the logical type, making a new (unshared) LogicalTypeInfo
 	LogicalType Copy() const;
 
-	bool EqualTypeInfo(const LogicalType &rhs) const;
+	bool EqualTypeInfo(const LogicalType &rhs, bool exact_field_names) const;
 
 	// copy assignment
 	inline LogicalType &operator=(const LogicalType &other) {
@@ -427,6 +427,8 @@ struct LogicalType {
 	DUCKDB_API bool operator==(const LogicalType &rhs) const;
 	//! Logical type equality including collations in this type and its children.
 	DUCKDB_API bool EqualsIncludingCollation(const LogicalType &rhs) const;
+	//! Logical type equality including the spelling of struct and union field names in this type and its children.
+	DUCKDB_API bool EqualsIncludingFieldSpelling(const LogicalType &rhs) const;
 	inline bool operator!=(const LogicalType &rhs) const {
 		return !(*this == rhs);
 	}

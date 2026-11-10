@@ -2186,11 +2186,11 @@ LogicalType UnboundType::TryDefaultBind(const ParsedExpression &type_expr) {
 // Logical Type
 //===--------------------------------------------------------------------===//
 
-bool LogicalType::EqualTypeInfo(const LogicalType &rhs) const {
+bool LogicalType::EqualTypeInfo(const LogicalType &rhs, bool exact_field_names) const {
 	if (RefersToSameObject(type_info_, rhs.type_info_)) {
 		return true;
 	}
-	return type_info_.get().Equals(rhs.type_info_.get());
+	return type_info_.get().Equals(rhs.type_info_.get(), exact_field_names);
 }
 
 bool LogicalType::EqualsIncludingCollation(const LogicalType &rhs) const {
@@ -2219,6 +2219,16 @@ bool LogicalType::EqualsIncludingCollation(const LogicalType &rhs) const {
 	return !mismatch && index == collations.size();
 }
 
+bool LogicalType::EqualsIncludingFieldSpelling(const LogicalType &rhs) const {
+	if (RefersToSameObject(type_info_, rhs.type_info_)) {
+		return true;
+	}
+	if (id() != rhs.id()) {
+		return false;
+	}
+	return EqualTypeInfo(rhs, true);
+}
+
 bool LogicalType::operator==(const LogicalType &rhs) const {
 	if (RefersToSameObject(type_info_, rhs.type_info_)) {
 		return true;
@@ -2226,7 +2236,7 @@ bool LogicalType::operator==(const LogicalType &rhs) const {
 	if (id() != rhs.id()) {
 		return false;
 	}
-	return EqualTypeInfo(rhs);
+	return EqualTypeInfo(rhs, false);
 }
 
 } // namespace duckdb

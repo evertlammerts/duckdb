@@ -29,7 +29,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	DecimalTypeInfo();
@@ -46,7 +46,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	StringTypeInfo();
@@ -63,7 +63,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	ListTypeInfo();
@@ -80,7 +80,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	StructTypeInfo();
@@ -95,7 +95,7 @@ public:
 	static unique_ptr<LogicalTypeInfo> LegacyDeserialize();
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	LegacyAggregateStateTypeInfo();
@@ -127,7 +127,7 @@ public:
 
 protected:
 	// Equalities are only used in enums with different catalog entries
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 	Vector values_insert_order;
 
@@ -147,7 +147,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 };
 
 struct AnyTypeInfo : public LogicalTypeInfo {
@@ -162,7 +162,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	AnyTypeInfo();
@@ -179,7 +179,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	IntegerLiteralTypeInfo();
@@ -198,7 +198,7 @@ public:
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 	TemplateTypeInfo();
 };
 
@@ -214,7 +214,7 @@ public:
 	CoordinateReferenceSystem crs;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 };
 
 struct UnboundTypeInfo : public LogicalTypeInfo {
@@ -227,7 +227,7 @@ struct UnboundTypeInfo : public LogicalTypeInfo {
 	unique_ptr<LogicalTypeInfo> Copy() const override;
 
 protected:
-	bool EqualsInternal(const LogicalTypeInfo *other_p) const override;
+	bool EqualsInternal(const LogicalTypeInfo *other_p, bool exact_field_names) const override;
 
 private:
 	UnboundTypeInfo();
