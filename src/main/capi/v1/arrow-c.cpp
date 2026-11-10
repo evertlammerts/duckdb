@@ -460,7 +460,8 @@ public:
 		// An Arrow stream cannot be rewound, so a second scan would read only what the first one left.
 		if (stream_handed_out.exchange(true)) {
 			throw duckdb::InvalidInputException("The Arrow stream behind view \"%s\" can be read only once and was "
-			                                    "already read; copy it into a table to read it again",
+			                                    "already read; to read a stream more than once, copy it into a table "
+			                                    "with its first read",
 			                                    view_name);
 		}
 		auto result = duckdb::make_uniq<duckdb::ArrowArrayStreamWrapper>();
@@ -534,8 +535,8 @@ duckdb_state Ingest(duckdb_connection connection, const char *table_name,
                     duckdb::shared_ptr<duckdb::ArrowScanFactory> factory) {
 	try {
 		auto cconn = reinterpret_cast<duckdb::Connection *>(connection);
-		// The factories hand out the caller's data unchanged, so neither projections nor filters can be pushed into it
-		cconn->TableFunction("arrow_scan_dumb", {}, {}, std::move(factory))
+		// The factory hands out the caller's batches unchanged, so it can neither project nor filter them
+		cconn->TableFunction("arrow_scan_unprojected", {}, {}, std::move(factory))
 		    ->CreateView(duckdb::Identifier(table_name), true, true);
 	} catch (...) {
 		return DuckDBError;
