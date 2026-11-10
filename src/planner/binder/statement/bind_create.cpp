@@ -813,6 +813,9 @@ SchemaCatalogEntry &Binder::BindCreateTriggerInfo(CreateTriggerInfo &create_trig
 		    "Mixing FOR EACH STATEMENT and FOR EACH ROW triggers on the same table is not yet supported");
 	}
 
+	VerifyTriggerBodyHasNoReturning(*create_trigger_info.trigger_action, create_trigger_info.GetTriggerName(),
+	                                table.name);
+
 	// Validate the trigger body using an isolated binder (own GlobalBinderState).
 	// Set up trigger_expanded_tables to match runtime behavior.
 	// Set up trigger_creation_table to detect recursive triggers during the validation.

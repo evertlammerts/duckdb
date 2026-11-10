@@ -585,7 +585,7 @@ SELECT id FROM a12;
 ----
 12
 
-# Reached triggers of every kind: BEFORE, with transition tables, with an OLD capture, with RETURNING
+# Reached triggers of every kind: BEFORE, with transition tables, with an OLD capture
 statement ok
 CREATE TABLE a14(id INTEGER, n INTEGER);
 
@@ -602,12 +602,6 @@ statement ok
 CREATE TABLE log14_old(id INTEGER);
 
 statement ok
-CREATE TABLE log14_ret(id INTEGER);
-
-statement ok
-CREATE MACRO g14(x) AS x * 2;
-
-statement ok
 CREATE TRIGGER sa14_before BEFORE INSERT ON a14 FOR EACH STATEMENT INSERT INTO log14_before VALUES (1);
 
 statement ok
@@ -617,9 +611,6 @@ CREATE TRIGGER sa14_new AFTER INSERT ON a14 REFERENCING NEW TABLE AS new_rows FO
 statement ok
 CREATE TRIGGER sa14_old AFTER UPDATE ON a14 REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT
 	INSERT INTO log14_old SELECT n FROM old_rows;
-
-statement ok
-CREATE TRIGGER sa14_ret AFTER INSERT ON a14 FOR EACH STATEMENT INSERT INTO log14_ret VALUES (0) RETURNING g14(id);
 
 statement ok
 CREATE TRIGGER sb14 AFTER INSERT ON b14 FOR EACH STATEMENT INSERT INTO a14 SELECT id, 0 FROM b14;
@@ -645,16 +636,10 @@ INSERT INTO b14 VALUES (5);
 statement ok
 DELETE FROM b14;
 
-query IIII
-SELECT (SELECT count(*) FROM log14_before), (SELECT list(id) FROM log14_new), (SELECT list(id) FROM log14_old), (SELECT count(*) FROM log14_ret);
+query III
+SELECT (SELECT count(*) FROM log14_before), (SELECT list(id) FROM log14_new), (SELECT list(id) FROM log14_old);
 ----
-1	[5]	[0]	1
-
-statement ok
-DROP TRIGGER sa14_ret ON a14;
-
-statement ok
-DROP MACRO g14;
+1	[5]	[0]
 
 # A generated column of the written table adds nothing to the writer when the table has a trigger, in both orders
 statement ok
