@@ -12,6 +12,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 using namespace duckdb;
 
@@ -134,6 +138,27 @@ void RequireValue(Connection &con, const string &sql, const string &expected, id
 	REQUIRE(query.value == expected);
 }
 
+// The platforms on which the engine asks for the bounds of a thread's stack (QueryStackBounds in thread_util.cpp),
+// where not getting them is a defect: Windows, and Linux, Apple platforms and FreeBSD in builds with threads.
+// Elsewhere, such as WebAssembly, only max_expression_depth applies.
+#if defined(_WIN32) ||                                                                                                 \
+    (!defined(DUCKDB_NO_THREADS) && (defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)))
+constexpr bool STACK_BOUNDS_EXPECTED = true;
+#else
+constexpr bool STACK_BOUNDS_EXPECTED = false;
+#endif
+
+bool StackIsReported(Connection &con) {
+	auto stack_reported = QueryOnSmallStack(con, "SELECT 42", SMALL_STACK_SIZE).stack_reported;
+	if (STACK_BOUNDS_EXPECTED) {
+		REQUIRE(stack_reported);
+	} else if (!stack_reported) {
+		// without the stack bounds only max_expression_depth applies, and the nests of these tests would overflow
+		WARN("The platform does not report the stack of a thread");
+	}
+	return stack_reported;
+}
+
 // Each object first reads a constant and is then replaced from the top down, so no CREATE binds the whole nest.
 void CreateChain(Connection &con, const string &object, const string &constant_body, const string &chained_body,
                  idx_t count) {
@@ -143,6 +168,16 @@ void CreateChain(Connection &con, const string &object, const string &constant_b
 	for (idx_t i = count; i > 0; i -= 1) {
 		REQUIRE_NO_FAIL(con.Query(StringUtil::Format("CREATE OR REPLACE " + object + chained_body, i, i - 1)));
 	}
+}
+
+// VALUES binds its expressions without first walking each of them whole, so only binding recurses through the nest,
+// one expression level per call and no binder level at all.
+string NestedCallsInValues(idx_t count) {
+	string expression = "42";
+	for (idx_t i = 0; i < count; i++) {
+		expression = StringUtil::Format("abs(%s)", expression);
+	}
+	return StringUtil::Format("VALUES (%s)", expression);
 }
 
 string NestedCTEs(idx_t count) {
@@ -159,9 +194,7 @@ TEST_CASE("A nest deeper than the thread's stack raises the depth error", "[api]
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
-	if (!QueryOnSmallStack(con, "SELECT 42", SMALL_STACK_SIZE).stack_reported) {
-		// without the stack bounds only max_expression_depth applies, and the nests below would overflow
-		WARN("The platform does not report the stack of a thread");
+	if (!StackIsReported(con)) {
 		return;
 	}
 
@@ -189,6 +222,81 @@ TEST_CASE("A nest deeper than the thread's stack raises the depth error", "[api]
 	auto result = con.Query("SELECT 42");
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 }
+
+TEST_CASE("A deep expression raises the depth error on a small stack", "[api]") {
+	// under max_expression_depth, and binding the nest takes about 300 KiB of stack on a release build
+	constexpr idx_t DEEP_EXPRESSION_NEST = 200;
+	// small, so that the nest that overflows it is shallow and destroying it takes little stack
+	constexpr idx_t EXPRESSION_STACK_SIZE = 192 * 1024;
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	if (!StackIsReported(con)) {
+		return;
+	}
+	RequireStackError(con, NestedCallsInValues(DEEP_EXPRESSION_NEST), EXPRESSION_STACK_SIZE);
+	RequireValue(con, NestedCallsInValues(SHALLOW_NEST), "42", EXPRESSION_STACK_SIZE);
+	RequireValue(con, NestedCallsInValues(DEEP_EXPRESSION_NEST), "42", LARGE_STACK_SIZE);
+}
+
+#if defined(__linux__) && !defined(DUCKDB_NO_THREADS)
+namespace {
+
+struct SoftStackLimit {
+	explicit SoftStackLimit(const struct rlimit &original) : original(original) {
+	}
+	~SoftStackLimit() {
+		setrlimit(RLIMIT_STACK, &original);
+	}
+	void Set(rlim_t soft_limit) {
+		struct rlimit limit = original;
+		limit.rlim_cur = soft_limit;
+		REQUIRE(setrlimit(RLIMIT_STACK, &limit) == 0);
+	}
+
+	struct rlimit original;
+};
+
+} // namespace
+
+// The main thread of a Linux process grows its stack on demand up to the soft stack limit, which can change while the
+// process runs.
+TEST_CASE("The main thread of a Linux process follows a change of its stack limit", "[api]") {
+	constexpr rlim_t LOWERED_STACK_LIMIT = 256 * 1024;
+	constexpr rlim_t RAISED_STACK_LIMIT = 8 * 1024 * 1024;
+	// binding the nest takes about 1 MiB of stack on a release build
+	constexpr idx_t MAIN_THREAD_NEST = 150;
+	if (getpid() != static_cast<pid_t>(syscall(SYS_gettid))) {
+		WARN("The test does not run on the main thread");
+		return;
+	}
+	struct rlimit original;
+	REQUIRE(getrlimit(RLIMIT_STACK, &original) == 0);
+	if (original.rlim_max != RLIM_INFINITY && original.rlim_max < RAISED_STACK_LIMIT) {
+		WARN("The hard stack limit is below " + to_string(RAISED_STACK_LIMIT) + " bytes");
+		return;
+	}
+	SoftStackLimit stack_limit(original);
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	CreateChain(con, "VIEW v%d AS ", "SELECT 42 AS a", "SELECT * FROM v%d", MAIN_THREAD_NEST);
+	const auto deep = StringUtil::Format("SELECT * FROM v%d", MAIN_THREAD_NEST);
+
+	stack_limit.Set(LOWERED_STACK_LIMIT);
+	auto result = con.Query(deep);
+	INFO(result->ToString());
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(),
+	                             "Binder Error: Max expression depth exceeded: binding the query would overflow the"));
+	result = con.Query(StringUtil::Format("SELECT * FROM v%d", SHALLOW_NEST));
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	stack_limit.Set(RAISED_STACK_LIMIT);
+	result = con.Query(deep);
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
+#endif
 
 TEST_CASE("A macro cycle through a USING KEY aggregate reaches the depth limit", "[api]") {
 	DuckDB db(nullptr);
