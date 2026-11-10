@@ -1077,6 +1077,7 @@ namespace {
 
 struct NullNameImportObserved {
 	std::vector<std::string> fields;
+	DUCKDB_V2_ERROR format_code = DUCKDB_V2_ERROR_NONE;
 	std::string format_error;
 };
 NullNameImportObserved null_name_import_observed;
@@ -1142,7 +1143,8 @@ void NullNameImportExec(duckdb_v2_scalar_function_exec_info_handle info, duckdb_
 
 	unnamed_child.format = nullptr;
 	duckdb_v2_error_info_handle format_err = nullptr;
-	if (duckdb_v2_arrow_importer_create(context, &record, 0, &importer, &format_err) == DUCKDB_V2_ERROR_NONE) {
+	observed.format_code = duckdb_v2_arrow_importer_create(context, &record, 0, &importer, &format_err);
+	if (observed.format_code == DUCKDB_V2_ERROR_NONE) {
 		duckdb_v2_arrow_importer_destroy(&importer);
 	} else {
 		const char *text = nullptr;
@@ -1174,6 +1176,7 @@ TEST_CASE("V2 arrow: an importer reads a NULL field name as an unnamed field", "
 	// an unnamed column is named after its position, an unnamed struct child stays unnamed
 	REQUIRE(null_name_import_observed.fields ==
 	        std::vector<std::string> {"v0 INTEGER", "v1 STRUCT(\"\" INTEGER, b INTEGER)"});
+	REQUIRE(null_name_import_observed.format_code == DUCKDB_V2_ERROR_INPUT_INVALID);
 	REQUIRE(null_name_import_observed.format_error == "Arrow schema of field \"\" has no format string");
 }
 

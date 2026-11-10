@@ -160,7 +160,11 @@ string RenderValue(const Value &value) {
 	return value.ToString();
 }
 
-// The column names and types the scan reports, the names it asks the producer for and the rows, or the error.
+string RenderError(const ErrorData &error) {
+	return "error: " + Exception::ExceptionTypeToString(error.Type()) + ": " + error.RawMessage();
+}
+
+// The column names and types the scan reports, the names it asks the producer for and the rows, or the typed error.
 string ScanShape(Field &record) {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -170,7 +174,7 @@ string ScanShape(Field &record) {
 	try {
 		auto result = con.TableFunction("arrow_scan", {}, {}, factory)->Execute();
 		if (result->HasError()) {
-			return "error: " + result->GetError();
+			return RenderError(result->GetErrorObject());
 		}
 		auto names = IdentifiersToStrings(result->GetNames());
 		for (idx_t i = 0; i < names.size(); i++) {
@@ -190,8 +194,7 @@ string ScanShape(Field &record) {
 			}
 		}
 	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		return "error: " + error.RawMessage();
+		return RenderError(ErrorData(ex));
 	}
 	return shape;
 }
@@ -363,8 +366,8 @@ TEST_CASE("Arrow scan of a variant whose storage fields have NULL names", "[arro
 		return Record(std::move(columns));
 	});
 	// the storage fields are found by name, so an unnamed one is neither metadata nor value
-	REQUIRE(shape == "error: arrow.parquet.variant column has an unexpected or duplicate field '' (expected 'metadata' "
-	                 "and 'value')");
+	REQUIRE(shape == "error: Invalid Input: arrow.parquet.variant column has an unexpected or duplicate field '' "
+	                 "(expected 'metadata' and 'value')");
 }
 
 TEST_CASE("Arrow scan of duplicate field names", "[arrow]") {
@@ -417,7 +420,7 @@ TEST_CASE("Arrow scan of a field with a NULL format", "[arrow]") {
 		columns.push_back(Int32("a", {1, 2}));
 		columns[0]->schema.format = nullptr;
 		auto record = Record(std::move(columns));
-		REQUIRE(ScanShape(*record) == "error: Arrow schema of field \"a\" has no format string");
+		REQUIRE(ScanShape(*record) == "error: Invalid Input: Arrow schema of field \"a\" has no format string");
 	}
 	SECTION("an unnamed struct child") {
 		std::vector<FieldPtr> children;
@@ -426,14 +429,14 @@ TEST_CASE("Arrow scan of a field with a NULL format", "[arrow]") {
 		std::vector<FieldPtr> columns;
 		columns.push_back(Struct("s", std::move(children)));
 		auto record = Record(std::move(columns));
-		REQUIRE(ScanShape(*record) == "error: Arrow schema of field \"\" has no format string");
+		REQUIRE(ScanShape(*record) == "error: Invalid Input: Arrow schema of field \"\" has no format string");
 	}
 	SECTION("a dictionary value type") {
 		std::vector<FieldPtr> columns;
 		columns.push_back(Dictionary("d", {0}, Int32(nullptr, {10})));
 		columns[0]->dictionary->schema.format = nullptr;
 		auto record = Record(std::move(columns));
-		REQUIRE(ScanShape(*record) == "error: Arrow schema of field \"\" has no format string");
+		REQUIRE(ScanShape(*record) == "error: Invalid Input: Arrow schema of field \"\" has no format string");
 	}
 }
 
