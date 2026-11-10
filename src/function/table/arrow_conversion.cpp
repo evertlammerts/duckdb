@@ -151,6 +151,26 @@ void ArrowToDuckDBConversion::SetValidityMask(Vector &vector, ArrowArray &array,
 	GetValidityMask(mask, array, chunk_offset, size, parent_offset, nested_offset, add_null);
 }
 
+static void MergeNullRows(ValidityMask &mask, const ValidityMask &nulls, idx_t size) {
+	if (nulls.CannotHaveNull()) {
+		return;
+	}
+	const auto entry_count = ValidityMask::EntryCount(size);
+	const auto last_entry_bits = size % ValidityMask::BITS_PER_VALUE;
+	for (idx_t entry_idx = 0; entry_idx < entry_count; entry_idx++) {
+		auto entry = nulls.GetValidityEntryUnsafe(entry_idx);
+		if (entry_idx + 1 == entry_count && last_entry_bits != 0) {
+			// a bitmap copied from Arrow holds arbitrary bits past the last row
+			entry |= ~ValidityMask::EntryWithValidBits(last_entry_bits);
+		}
+		if (ValidityMask::AllValid(entry)) {
+			continue;
+		}
+		mask.EnsureWritable();
+		mask.GetData()[entry_idx] &= entry;
+	}
+}
+
 namespace {
 
 struct ArrowListOffsetData {
@@ -827,6 +847,10 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 		break;
 	default:
 		throw NotImplementedException("Type '%s' not implemented for RunEndEncoding", TypeIdToString(physical_type));
+	}
+	// decoding writes the validity of every row from the values
+	if (parent_mask) {
+		MergeNullRows(FlatVector::ValidityMutable(vector), *parent_mask, size);
 	}
 }
 template <class SRC>
