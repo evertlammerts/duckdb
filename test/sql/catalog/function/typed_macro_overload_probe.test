@@ -1,0 +1,577 @@
+# name: test/sql/catalog/function/typed_macro_overload_probe.test
+# description: A typed macro picks its overload by the type of each argument read where the caller wrote it, with the select list rules for aggregates and window functions
+# group: [function]
+
+# a macro with typed parameters binds a copy of each argument, the probe, to read its type before it picks an overload
+
+statement ok
+CREATE TABLE src(g INTEGER, k INTEGER);
+
+statement ok
+INSERT INTO src VALUES (1, -1), (1, 2), (2, 5);
+
+statement ok
+CREATE MACRO ms_t(x BIGINT) AS 'bigint ' || x, (x VARCHAR) AS 'varchar ' || x;
+
+statement ok
+CREATE MACRO b(x BIGINT) AS x;
+
+statement ok
+CREATE MACRO mt_c1(x VARCHAR) AS TABLE (SELECT 'varchar ' || x AS v FROM (SELECT 'body' AS k));
+
+statement ok
+CREATE MACRO mt_t(x BIGINT) AS TABLE (SELECT 'bigint ' || x AS v), (x VARCHAR) AS TABLE (SELECT 'varchar ' || x AS v);
+
+# an aggregate of the caller's own level is typed by the probe
+
+query TT
+SELECT ms_t(sum(abs(k))::VARCHAR), ms_t(sum(abs(k))::BIGINT) FROM src;
+----
+varchar 8	bigint 8
+
+query TT
+SELECT ms_t(count(*)), ms_t(string_agg(k::VARCHAR, ',' ORDER BY k)) FROM src;
+----
+bigint 3	varchar -1,2,5
+
+query IT
+SELECT g, ms_t(sum(k)::VARCHAR) FROM src GROUP BY g ORDER BY g;
+----
+1	varchar 1
+2	varchar 5
+
+query IT
+SELECT g, ms_t(g) FROM src GROUP BY g ORDER BY g;
+----
+1	bigint 1
+2	bigint 2
+
+query I
+SELECT g FROM src GROUP BY g HAVING ms_t(sum(k)::VARCHAR) = 'varchar 5';
+----
+2
+
+query T
+SELECT ms_t(sum(k.abs())::VARCHAR) FROM src;
+----
+varchar 8
+
+query T
+SELECT ms_t(sum(k) FILTER (WHERE k > 0)::BIGINT) FROM src;
+----
+bigint 7
+
+# inside a lambda, an aggregate, a nested typed macro and a correlated subquery
+
+query T
+SELECT list_transform([1, 2], lambda y: ms_t(y));
+----
+[bigint 1, bigint 2]
+
+query I
+SELECT sum(b(k)) FROM src;
+----
+6
+
+statement ok
+CREATE MACRO outer_t(x BIGINT) AS ms_t(x), (x VARCHAR) AS ms_t(x || '!');
+
+query TT
+SELECT outer_t(sum(k)::BIGINT), outer_t(max(k)::VARCHAR) FROM src;
+----
+bigint 6	varchar 5!
+
+query IT
+SELECT k, (SELECT ms_t(k)) FROM src ORDER BY k;
+----
+-1	bigint -1
+2	bigint 2
+5	bigint 5
+
+# a window function and UNNEST are typed too
+
+query IT
+SELECT k, ms_t(row_number() OVER (ORDER BY k)) FROM src ORDER BY k;
+----
+-1	bigint 1
+2	bigint 2
+5	bigint 3
+
+query T
+SELECT ms_t(unnest(['a', 'b']));
+----
+varchar a
+varchar b
+
+query I
+SELECT count(*) FROM src GROUP BY ms_t(unnest([1, 2])) ORDER BY ALL;
+----
+3
+3
+
+query T
+SELECT ms_t(list_transform([1], lambda y: y + sum(k)::BIGINT)[1]) FROM src;
+----
+bigint 7
+
+# a table macro's argument binds as a select list item of the body
+
+query T
+SELECT * FROM mt_t(sum(1)::VARCHAR);
+----
+varchar 1
+
+query T
+SELECT * FROM mt_t(count(*));
+----
+bigint 1
+
+# an aggregate over a column of the enclosing query, in a call inside a subquery
+
+query T
+SELECT (SELECT ms_t(sum(k)::VARCHAR)) FROM src;
+----
+varchar 6
+
+query T
+SELECT (SELECT v FROM mt_t(sum(k)::VARCHAR)) FROM src;
+----
+varchar 6
+
+# the probe leaves nothing in the caller's level, also when the chosen body drops the argument
+
+statement ok
+CREATE MACRO drop_t(x BIGINT) AS 'dropped', (x VARCHAR) AS 'dropped varchar';
+
+statement ok
+CREATE MACRO drop_u(x) AS 'dropped';
+
+query T
+SELECT drop_t(sum(k)::BIGINT) FROM src;
+----
+dropped
+dropped
+dropped
+
+query T
+SELECT drop_u(sum(k)::BIGINT) FROM src;
+----
+dropped
+dropped
+dropped
+
+query T
+SELECT drop_t(unnest([1, 2, 3, 4]));
+----
+dropped
+
+query T
+SELECT drop_u(unnest([1, 2, 3, 4]));
+----
+dropped
+
+query T
+SELECT drop_t(row_number() OVER ()) FROM src;
+----
+dropped
+dropped
+dropped
+
+query T
+SELECT drop_u(row_number() OVER ()) FROM src;
+----
+dropped
+dropped
+dropped
+
+query T
+SELECT drop_t((SELECT sum(k)::VARCHAR)) FROM src;
+----
+dropped varchar
+dropped varchar
+dropped varchar
+
+query T
+SELECT drop_u((SELECT sum(k)::VARCHAR)) FROM src;
+----
+dropped
+dropped
+dropped
+
+query T
+SELECT ms_t((SELECT sum(k)::VARCHAR)) FROM src;
+----
+varchar 6
+
+query IT
+SELECT sum(k), drop_t(k) FROM src;
+----
+6	dropped
+
+query IT
+SELECT sum(k), drop_u(k) FROM src;
+----
+6	dropped
+
+# a typed aggregate meets the implicit cast rules: sum of an INTEGER is a HUGEINT, which BIGINT does not accept implicitly
+
+statement error
+SELECT b(sum(k)) FROM src;
+----
+Macro b() does not support the supplied arguments
+
+statement error
+SELECT b(1::HUGEINT);
+----
+Macro b() does not support the supplied arguments
+
+statement ok
+CREATE MACRO f(x INTEGER) AS x + 1;
+
+statement ok
+CREATE MACRO fd(x DECIMAL(10, 2)) AS x;
+
+statement ok
+CREATE MACRO m2(x BIGINT, y INTEGER) AS 'a', (x VARCHAR, y VARCHAR) AS 'b';
+
+statement error
+SELECT f(count(*)) FROM src;
+----
+Macro f() does not support the supplied arguments
+
+statement error
+SELECT f(c) FROM (SELECT count(*) AS c FROM src);
+----
+Macro f() does not support the supplied arguments
+
+statement error
+SELECT f(row_number() OVER ()) FROM src;
+----
+Macro f() does not support the supplied arguments
+
+statement error
+SELECT f(avg(k)) FROM src;
+----
+Macro f() does not support the supplied arguments
+
+statement error
+SELECT fd(avg(k)) FROM src;
+----
+Macro fd() does not support the supplied arguments
+
+# the lenient path cast explicitly: 2.0.0 returned 3 here for an average of 1.5 and failed an out of range sum at execution
+statement error
+SELECT f(avg(k) + 0.5) FROM src;
+----
+Macro f() does not support the supplied arguments
+
+statement error
+SELECT b(sum(k)) FROM (SELECT 9223372036854775807::HUGEINT AS k UNION ALL SELECT 10);
+----
+Macro b() does not support the supplied arguments
+
+statement error
+SELECT m2(sum(k), 1) FROM src;
+----
+Macro m2() does not support the supplied arguments
+
+query IIT
+SELECT f(count(*)::INTEGER), fd(avg(k)::DECIMAL(10, 2)), m2(sum(k)::BIGINT, 1) FROM src;
+----
+4	2.00	a
+
+query I
+SELECT b(sum(k)::BIGINT) FROM src;
+----
+6
+
+query I
+SELECT b(count(*)) FROM src;
+----
+3
+
+# an argument that does not bind decides nothing; with more than one overload left, the error says why it has no type
+
+statement error
+SELECT * FROM mt_t(abs(nope)::BIGINT);
+----
+The type of argument 1 could not be determined: Referenced column "nope"
+
+statement error
+SELECT ms_t(abs(nope)::BIGINT);
+----
+The type of argument 1 could not be determined: Referenced column "nope"
+
+statement error
+SELECT ms_t(abs(nope)::BIGINT) FROM src;
+----
+The type of argument 1 could not be determined: Referenced column "nope" not found in FROM clause
+
+statement error
+SELECT ms_t(row_number() OVER (ORDER BY nope)) FROM src;
+----
+The type of argument 1 could not be determined: Referenced column "nope" not found in FROM clause
+
+# the message names the first argument without a type whose parameter the matching overloads declare differently
+
+statement ok
+CREATE MACRO two_args(x, y BIGINT) AS 'b', (x, y VARCHAR) AS 'v';
+
+statement error
+SELECT two_args(nope1, nope2);
+----
+The type of argument 2 could not be determined: Referenced column "nope2"
+
+statement ok
+CREATE MACRO pq(x BIGINT, y BIGINT) AS 'bb', (x BIGINT, y VARCHAR) AS 'bv';
+
+statement error
+PREPARE p_pq AS SELECT pq(nope, ?);
+----
+Macro pq() has multiple overloads that match the supplied arguments
+
+statement error
+PREPARE p_pq AS SELECT pq(nope, ?);
+----
+<!REGEX>:.*could not be determined.*
+
+# once one overload is chosen, the body binds the argument and reports its own error
+
+statement error
+SELECT b(nope) FROM src;
+----
+Referenced column "nope"
+
+statement error
+SELECT * FROM mt_c1(nope);
+----
+Referenced column "nope" not found in FROM clause
+
+statement error
+SELECT k FROM src WHERE ms_t(sum(k)::VARCHAR) = 'x';
+----
+WHERE clause cannot contain aggregates
+
+# a NULL argument binds and takes the cheapest cast; an untyped prepared parameter binds without a type, so the
+# overloads stay ambiguous
+
+query T
+SELECT ms_t(NULL);
+----
+NULL
+
+statement error
+PREPARE p_untyped AS SELECT ms_t(?);
+----
+Macro ms_t() has multiple overloads that match the supplied arguments
+
+statement ok
+PREPARE p_typed AS SELECT ms_t(?::BIGINT), ms_t(sum(?::BIGINT)::VARCHAR);
+
+query TT
+EXECUTE p_typed(4, 5);
+----
+bigint 4	varchar 5
+
+# named arguments and default parameter values
+
+statement ok
+CREATE MACRO dflt(x BIGINT, y BIGINT := 7) AS 'bigint ' || (x + y), (x VARCHAR, y VARCHAR := 'v') AS 'varchar ' || x || y;
+
+query TTT
+SELECT dflt(sum(k)::BIGINT), dflt(sum(k)::VARCHAR), dflt(1, y := sum(k)::BIGINT) FROM src;
+----
+bigint 13	varchar 6v	bigint 7
+
+statement error
+SELECT dflt(nope);
+----
+The type of argument 1 could not be determined: Referenced column "nope"
+
+statement error
+SELECT dflt(x := nope);
+----
+The type of argument x could not be determined: Referenced column "nope"
+
+# the positional argument picks the overload, so the body reports the named one
+
+statement error
+SELECT dflt(1, y := nope);
+----
+Referenced column "nope"
+
+# a subquery and a lambda inside an argument
+
+query TT
+SELECT ms_t((SELECT 1)), ms_t((SELECT max(k)::VARCHAR FROM src));
+----
+bigint 1	varchar 5
+
+query T
+SELECT ms_t(list_transform([1], lambda y: y + k)[1]) FROM src ORDER BY k;
+----
+bigint 0
+bigint 3
+bigint 6
+
+query T
+SELECT ms_t(list_aggregate(list(k), 'sum')::VARCHAR) FROM src;
+----
+varchar 6
+
+statement error
+SELECT ms_t(lambda y: y);
+----
+The type of argument 1 could not be determined: invalid lambda expression
+
+# a table macro's argument is read where the caller wrote it, the scope every overload shares; a column of the body's
+# FROM that shares its name still captures it in the body, so here the caller's INTEGER k picks BIGINT and the body's
+# text k fails the cast
+
+statement ok
+CREATE MACRO mt_c(x VARCHAR) AS TABLE (SELECT 'varchar ' || x AS v FROM (SELECT 'body' AS k)), (x BIGINT) AS TABLE (SELECT 'bigint ' || x AS v FROM (SELECT 'body' AS k));
+
+statement error
+SELECT * FROM src, mt_c(k);
+----
+Could not convert string 'body' to INT64
+
+# without a caller column k the argument has no type: one overload binds the body's k, two report it
+
+statement error
+SELECT * FROM mt_c(k);
+----
+The type of argument 1 could not be determined: Referenced column "k"
+
+query T
+SELECT * FROM mt_c1(upper(k));
+----
+varchar BODY
+
+# beside a caller INTEGER column k the argument fails where it is written, and that thrown error ends the call
+
+statement error
+SELECT * FROM src, mt_c1(upper(k));
+----
+No function matches the given name and argument types 'upper(INTEGER)'
+
+query IIT
+SELECT * FROM src, mt_c1(upper(k::VARCHAR)) ORDER BY ALL;
+----
+1	-1	varchar BODY
+1	2	varchar BODY
+2	5	varchar BODY
+
+# the probe's level does not see the caller's select aliases or groups: with one overload the body binds them, with more
+# than one the error names the argument
+
+query II
+SELECT k + 1 AS a, b(a) FROM src ORDER BY a;
+----
+0	0
+3	3
+6	6
+
+statement error
+SELECT k + 1 AS a, ms_t(a) FROM src;
+----
+The type of argument 1 could not be determined: Referenced column "a" not found
+
+query II
+SELECT g, b(GROUPING(g)) FROM src GROUP BY g ORDER BY g;
+----
+1	0
+2	0
+
+statement error
+SELECT g, ms_t(GROUPING(g)) FROM src GROUP BY g;
+----
+The type of argument 1 could not be determined: GROUPING statement cannot be used without groups
+
+# an error the binder throws while it types an argument ends the call, also when the chosen body drops the argument
+
+statement ok
+CREATE MACRO drop1(x BIGINT) AS 'dropped';
+
+statement error
+SELECT drop1(sum(sum(k))) FROM src;
+----
+aggregate function calls cannot be nested
+
+statement error
+SELECT drop1(try(sum(k))) FROM src;
+----
+aggregates are not allowed inside the TRY expression
+
+statement error
+SELECT drop1(sum(k) FILTER (WHERE sum(k) > 0)) FROM src;
+----
+aggregate functions are not allowed in FILTER
+
+statement error
+SELECT drop1(sum(row_number() OVER ())) FROM src;
+----
+aggregate function calls cannot contain window function calls
+
+statement error
+SELECT drop1(row_number() OVER (PARTITION BY random())) FROM src;
+----
+PARTITION BY window expressions cannot be volatile
+
+statement error
+SELECT drop1(nope_function(k)) FROM src;
+----
+Scalar Function with name nope_function does not exist
+
+statement error
+SELECT ms_t(sum(sum(k))) FROM src;
+----
+aggregate function calls cannot be nested
+
+statement error
+SELECT (SELECT drop1(sum(sum(k)))) FROM src;
+----
+aggregate function calls cannot be nested
+
+statement error
+WITH c AS (SELECT nope) SELECT drop1((SELECT * FROM c));
+----
+Referenced column "nope"
+
+query T
+SELECT drop_u(sum(sum(k))) FROM src;
+----
+dropped
+dropped
+dropped
+
+# a parameter whose type the probe needs postpones the bind to EXECUTE, where the value gives the type
+
+statement ok
+PREPARE p_unnest AS SELECT ms_t(unnest(?));
+
+query T
+EXECUTE p_unnest(['a', 'b']);
+----
+varchar a
+varchar b
+
+# a typed macro inside a lambda types every argument with the lambda's parameters in scope
+
+statement ok
+CREATE MACRO pair(x BIGINT, y BIGINT) AS 'bb', (x BIGINT, y VARCHAR) AS 'bv';
+
+query TT
+SELECT list_transform([1, 2], lambda x: pair(b(x), x)), list_transform([1, 2], lambda x: pair(x, x)) FROM (VALUES ('outer')) t(x);
+----
+[bb, bb]	[bb, bb]
+
+query T
+SELECT pair(list_transform([1], lambda y: b(y))[1], (SELECT i)) FROM (VALUES (1)) t(i);
+----
+bb
+
+query T
+SELECT pair(abs(list_transform([1], lambda y: b(y))[1]), list_transform([1], lambda z: z)[1]);
+----
+bb

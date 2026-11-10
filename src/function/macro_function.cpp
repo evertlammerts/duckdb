@@ -1,6 +1,8 @@
 #include "duckdb/function/macro_function.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/planner/expression_binder/select_binder.hpp"
+#include "duckdb/planner/query_node/bound_select_node.hpp"
 
 #include "duckdb/common/sql_identifier.hpp"
 
@@ -46,12 +48,37 @@ string FormatMacroFunction(const MacroFunction &function, const Identifier &name
 	return result;
 }
 
+namespace {
+
+struct UntypedArgument {
+	//! the parameter name of a named argument, empty for a positional one
+	Identifier name;
+	idx_t position;
+	ErrorData error;
+};
+
+LogicalType ParameterType(const MacroFunction &function, const UntypedArgument &argument) {
+	for (idx_t param_idx = 0; param_idx < function.parameters.size() && param_idx < function.types.size();
+	     param_idx++) {
+		const auto &param_name = function.parameters[param_idx]->Cast<ColumnRefExpression>().GetColumnName();
+		if (argument.name.empty() ? param_idx == argument.position : param_name == argument.name) {
+			return function.types[param_idx];
+		}
+	}
+	return LogicalType::UNKNOWN;
+}
+
+} // namespace
+
 MacroBindResult MacroFunction::BindMacroFunction(
     Binder &binder, const vector<unique_ptr<MacroFunction>> &functions, const Identifier &name,
     FunctionExpression &function_expr, vector<unique_ptr<ParsedExpression>> &positional_arguments,
     InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> &named_arguments,
     idx_t depth) {
-	ExpressionBinder expr_binder(binder, binder.context);
+	// arguments bind as select list items of a level of their own, so an aggregate or window function of the caller's
+	// level is typed and registered in this node instead of the caller's
+	BoundSelectNode probe_node;
+	SelectBinder expr_binder(binder, binder.context, probe_node);
 	expr_binder.lambda_bindings = binder.lambda_bindings;
 
 	// Figure out whether we even need to bind arguments
@@ -74,13 +101,20 @@ MacroBindResult MacroFunction::BindMacroFunction(
 	// the speculative binds below may register correlated columns referenced by the arguments: restore the binder's
 	// correlated columns afterwards, binding the expanded macro body re-registers those that are actually used
 	auto saved_correlated_columns = binder.correlated_columns;
+	// an argument that does not bind has an unknown type, which every overload accepts, so it decides nothing
+	vector<UntypedArgument> untyped_arguments;
 	for (auto &arg : function_expr.GetArgumentsMutable()) {
 		auto arg_copy = arg.GetExpression().Copy();
 		LogicalType arg_type = LogicalType::UNKNOWN;
 		if (requires_bind) {
 			// bind at the same scope depth as the macro call: "depth" counts subquery scopes, not expression nesting
-			const auto arg_bind_result = expr_binder.BindExpression(arg_copy, depth);
-			arg_type = arg_bind_result.HasError() ? LogicalType::UNKNOWN : arg_bind_result.expression->GetReturnType();
+			auto arg_bind_result = expr_binder.Bind(arg_copy, depth);
+			if (arg_bind_result.HasError()) {
+				untyped_arguments.push_back(
+				    UntypedArgument {arg.GetName(), positional_arguments.size(), std::move(arg_bind_result.error)});
+			} else {
+				arg_type = arg_bind_result.expression->GetReturnType();
+			}
 		}
 		if (arg.HasName()) {
 			// Default argument
@@ -218,6 +252,21 @@ MacroBindResult MacroFunction::BindMacroFunction(
 			error += "Candidate macros:";
 			for (const auto &result_idx : result_indices) {
 				error += "\n\t" + FormatMacroFunction(*functions[result_idx], name);
+			}
+			// an argument that every matching overload types alike cannot decide between them
+			for (auto &argument : untyped_arguments) {
+				const auto first_type = ParameterType(*functions[result_indices[0]], argument);
+				bool decides = false;
+				for (const auto &result_idx : result_indices) {
+					decides = decides || ParameterType(*functions[result_idx], argument) != first_type;
+				}
+				if (decides) {
+					auto label =
+					    argument.name.empty() ? to_string(argument.position + 1) : argument.name.GetIdentifierName();
+					error += StringUtil::Format("\nThe type of argument %s could not be determined: %s", label,
+					                            argument.error.RawMessage());
+					break;
+				}
 			}
 		}
 
