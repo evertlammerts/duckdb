@@ -159,6 +159,27 @@ bool StackIsReported(Connection &con) {
 	return stack_reported;
 }
 
+// The sanitizers and builds without optimization take several times the stack per frame, and under AddressSanitizer
+// the join order optimizer, which does not check the stack, overflows 256 KiB planning TPC-H query 2. The engine keeps
+// a larger reserve for these builds and for MSVC.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
+    defined(DUCKDB_THREAD_SANITIZER)
+constexpr idx_t STACK_FRAME_SCALE = 4;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(thread_sanitizer) ||       \
+    __has_feature(memory_sanitizer)
+constexpr idx_t STACK_FRAME_SCALE = 4;
+#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER)
+constexpr idx_t STACK_FRAME_SCALE = 4;
+#else
+constexpr idx_t STACK_FRAME_SCALE = 1;
+#endif
+#elif (defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_MSC_VER)
+constexpr idx_t STACK_FRAME_SCALE = 4;
+#else
+constexpr idx_t STACK_FRAME_SCALE = 1;
+#endif
+
 // Each object first reads a constant and is then replaced from the top down, so no CREATE binds the whole nest.
 void CreateChain(Connection &con, const string &object, const string &constant_body, const string &chained_body,
                  idx_t count) {
@@ -297,6 +318,102 @@ TEST_CASE("The main thread of a Linux process follows a change of its stack limi
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 }
 #endif
+
+TEST_CASE("Ordinary queries bind on a small stack", "[api]") {
+	// the TPC-H tables with the types of dbgen, empty, so each query binds and plans in full and reads nothing
+	const string schema = "CREATE TABLE part (p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, "
+	                      "p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL(15,2), "
+	                      "p_comment VARCHAR);"
+	                      "CREATE TABLE supplier (s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, "
+	                      "s_nationkey INTEGER, s_phone VARCHAR, s_acctbal DECIMAL(15,2), s_comment VARCHAR);"
+	                      "CREATE TABLE partsupp (ps_partkey BIGINT, ps_suppkey BIGINT, ps_availqty BIGINT, "
+	                      "ps_supplycost DECIMAL(15,2), ps_comment VARCHAR);"
+	                      "CREATE TABLE customer (c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, "
+	                      "c_nationkey INTEGER, c_phone VARCHAR, c_acctbal DECIMAL(15,2), c_mktsegment VARCHAR, "
+	                      "c_comment VARCHAR);"
+	                      "CREATE TABLE orders (o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, "
+	                      "o_totalprice DECIMAL(15,2), o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, "
+	                      "o_shippriority INTEGER, o_comment VARCHAR);"
+	                      "CREATE TABLE lineitem (l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, "
+	                      "l_linenumber BIGINT, l_quantity DECIMAL(15,2), l_extendedprice DECIMAL(15,2), "
+	                      "l_discount DECIMAL(15,2), l_tax DECIMAL(15,2), l_returnflag VARCHAR, l_linestatus VARCHAR, "
+	                      "l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, "
+	                      "l_shipmode VARCHAR, l_comment VARCHAR);"
+	                      "CREATE TABLE nation (n_nationkey INTEGER, n_name VARCHAR, n_regionkey INTEGER, "
+	                      "n_comment VARCHAR);"
+	                      "CREATE TABLE region (r_regionkey INTEGER, r_name VARCHAR, r_comment VARCHAR);";
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	if (!StackIsReported(con)) {
+		return;
+	}
+	REQUIRE_NO_FAIL(con.Query(schema));
+	CreateChain(con, "VIEW v%d AS ", "SELECT 42 AS a", "SELECT * FROM v%d", DEEP_NEST);
+	vector<string> tpch_queries;
+	for (idx_t i = 1; i <= 22; i++) {
+		auto file =
+		    con.Query(StringUtil::Format("SELECT content FROM read_text('extension/tpch/dbgen/queries/q%02d.sql')", i));
+		REQUIRE_NO_FAIL(*file);
+		auto query = file->Collection().GetValue(0, 0).ToString();
+		StringUtil::Trim(query);
+		StringUtil::RTrim(query, ";");
+		// on empty tables a query returns no row, or one where it aggregates without groups
+		tpch_queries.push_back("SELECT count(*) < 2 FROM (" + query + ")");
+	}
+
+	for (idx_t stack_size : {idx_t(128) * 1024, idx_t(256) * 1024}) {
+		stack_size *= STACK_FRAME_SCALE;
+		INFO(stack_size);
+		RequireValue(con, StringUtil::Format("SELECT * FROM v%d", SHALLOW_NEST), "42", stack_size);
+		for (auto &query : tpch_queries) {
+			RequireValue(con, query, "true", stack_size);
+		}
+		RequireStackError(con, StringUtil::Format("SELECT * FROM v%d", DEEP_NEST), stack_size);
+	}
+}
+
+// Each depth puts the last check at another point of the stack, so a reserve too small for some leaf crashes at one.
+TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	// under AddressSanitizer the join order optimizer, which does not check the stack, needs more of it per view than
+	// binding does, so a nest that just binds would overflow there
+	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_optimizer"));
+	if (!StackIsReported(con)) {
+		return;
+	}
+	const string table_function_leaf = "SELECT count(*) AS a FROM read_csv('data/csv/test/test.csv')";
+	auto leaf_result = con.Query(table_function_leaf);
+	REQUIRE_NO_FAIL(*leaf_result);
+	const auto table_function_value = leaf_result->Collection().GetValue(0, 0).ToString();
+	CreateChain(con, "VIEW v%d AS ", "SELECT 42 AS a", "SELECT * FROM v%d", DEEP_NEST);
+	CreateChain(con, "VIEW w%d AS ", table_function_leaf, "SELECT * FROM w%d", DEEP_NEST);
+	const vector<std::pair<string, string>> chains {{"v", "42"}, {"w", table_function_value}};
+
+	for (idx_t stack_size : {idx_t(128) * 1024, idx_t(192) * 1024}) {
+		stack_size *= STACK_FRAME_SCALE;
+		for (auto &chain : chains) {
+			bool refused = false;
+			for (idx_t depth = 0; depth <= DEEP_NEST && !refused; depth++) {
+				auto query =
+				    QueryOnSmallStack(con, StringUtil::Format("SELECT * FROM %s%d", chain.first, depth), stack_size);
+				INFO(stack_size);
+				INFO(depth);
+				INFO(query.error);
+				if (query.has_error) {
+					REQUIRE(StringUtil::Contains(query.error,
+					                             "Max expression depth exceeded: binding the query would overflow"));
+					refused = true;
+				} else {
+					REQUIRE(query.value == chain.second);
+				}
+			}
+			REQUIRE(refused);
+		}
+	}
+}
 
 TEST_CASE("A macro cycle through a USING KEY aggregate reaches the depth limit", "[api]") {
 	DuckDB db(nullptr);

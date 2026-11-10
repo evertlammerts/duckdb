@@ -115,14 +115,14 @@ bool FindInitialStackTop(uintptr_t high, uintptr_t &top) {
 	if (getpid() != static_cast<pid_t>(syscall(SYS_gettid))) {
 		return false;
 	}
-	// other stacks are mapped at least 128 MiB below it
+	// thread stacks are mappings, which usually lie far below the initial stack; one this close is taken for it
 	static constexpr uintptr_t MAX_DISTANCE = uintptr_t(64) * 1024 * 1024;
 	auto name = reinterpret_cast<const char *>(getauxval(AT_EXECFN));
 	if (!name) {
 		return false;
 	}
 	auto name_end = reinterpret_cast<uintptr_t>(name) + strlen(name) + 1;
-	// glibc and bionic report the end of the initial stack, just above the name, musl a point below the arguments
+	// glibc and musl report a top below the argument and environment strings, and the kernel puts the name above them
 	if (name_end <= high ? high - name_end > MAX_DISTANCE : name_end - high > MAX_DISTANCE) {
 		return false;
 	}

@@ -100,3 +100,26 @@ query I
 SELECT plain();
 ----
 7
+
+# the aggregates of the USING KEY clause see only the recursive CTE, not the scopes of the query around it
+statement error
+SELECT (
+	WITH RECURSIVE r(k, v) USING KEY (k, max(x.a) AS v) AS (
+		VALUES (1, 1)
+		UNION
+		SELECT k, v FROM r WHERE false)
+	SELECT max(v) FROM r)
+FROM (SELECT 5 AS a) x;
+----
+Binder Error: Referenced table "x" not found!
+
+statement error
+SELECT (
+	WITH RECURSIVE r(k, v) USING KEY (k, max(a) AS v) AS (
+		VALUES (1, 1)
+		UNION
+		SELECT k, v FROM r WHERE false)
+	SELECT max(v) FROM r)
+FROM (SELECT 5 AS a) x;
+----
+Binder Error: Referenced column "a" not found
