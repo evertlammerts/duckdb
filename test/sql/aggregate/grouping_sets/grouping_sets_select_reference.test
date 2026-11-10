@@ -512,3 +512,101 @@ SELECT (WITH q AS MATERIALIZED (SELECT nextval('seq2') AS v) SELECT a.v = b.v FR
 ----
 true	0
 NULL	1
+
+# struct casts and struct keys that differ in a field name or its spelling are different expressions, never one group
+query I
+SELECT (row(1, s)::STRUCT(x BIGINT, y BIGINT)).x AS c FROM t GROUP BY (row(1, s)::STRUCT(y BIGINT, x BIGINT)).x, 1 ORDER BY ALL;
+----
+1
+1
+1
+
+query II
+SELECT (row(1, s)::STRUCT(x BIGINT, y BIGINT)).x AS c, count(*) FROM t GROUP BY c, (row(1, s)::STRUCT(y BIGINT, x BIGINT)).x ORDER BY ALL;
+----
+1	1
+1	1
+1	1
+
+query III
+SELECT (row(1, s)::STRUCT(x BIGINT, y BIGINT)).x AS c, GROUPING(c) AS g, count(*) FROM t GROUP BY GROUPING SETS ((c), ((row(1, s)::STRUCT(y BIGINT, x BIGINT)).x)) ORDER BY ALL;
+----
+1	0	3
+NULL	1	1
+NULL	1	1
+NULL	1	1
+
+query I
+SELECT row(s)::STRUCT(x BIGINT) AS c FROM t GROUP BY row(s)::STRUCT(y BIGINT), c ORDER BY ALL;
+----
+{'x': 1}
+{'x': 2}
+{'x': 3}
+
+query I
+SELECT row(s)::STRUCT(X BIGINT) AS c FROM t GROUP BY row(s)::STRUCT(x BIGINT), c ORDER BY ALL;
+----
+{'X': 1}
+{'X': 2}
+{'X': 3}
+
+query II
+SELECT c, typeof(c) FROM (SELECT {'A': s} AS c FROM t GROUP BY {'a': s}, c) ORDER BY ALL;
+----
+{'A': 1}	STRUCT(A BIGINT)
+{'A': 2}	STRUCT(A BIGINT)
+{'A': 3}	STRUCT(A BIGINT)
+
+query II
+SELECT c, typeof(c) FROM (SELECT struct_pack(A := s) AS c FROM t GROUP BY struct_pack(a := s), c) ORDER BY ALL;
+----
+{'A': 1}	STRUCT(A BIGINT)
+{'A': 2}	STRUCT(A BIGINT)
+{'A': 3}	STRUCT(A BIGINT)
+
+# an equal struct cast is still the entry's group
+query II
+SELECT row(s)::STRUCT(x BIGINT) AS c, GROUPING(c) AS g FROM t GROUP BY GROUPING SETS ((row(s)::STRUCT(x BIGINT)), (c)) ORDER BY ALL;
+----
+{'x': 1}	0
+{'x': 1}	0
+{'x': 2}	0
+{'x': 2}	0
+{'x': 3}	0
+{'x': 3}	0
+
+# a select list alias that differs only in case names a different column, so the subqueries are different
+query I
+SELECT (SELECT COLUMNS('^[a-z]+$') FROM (SELECT 1 AS a, 2 AS B)) AS c GROUP BY (SELECT COLUMNS('^[a-z]+$') FROM (SELECT 1 AS A, 2 AS b)), c;
+----
+1
+
+statement error
+SELECT (SELECT s AS A) FROM t GROUP BY (SELECT s AS a);
+----
+must appear in the GROUP BY clause
+
+# a select entry that differs from the group in a struct field name or the spelling of a key is not that group
+statement error
+SELECT (row(1, s)::STRUCT(x BIGINT, y BIGINT)).x AS c FROM t GROUP BY (row(1, s)::STRUCT(y BIGINT, x BIGINT)).x;
+----
+must appear in the GROUP BY clause
+
+statement error
+SELECT {'A': s} AS c FROM t GROUP BY {'a': s};
+----
+must appear in the GROUP BY clause
+
+# a named argument compares by spelling, also where it names a macro parameter, so these twins are refused
+statement ok
+CREATE MACRO m(a, b := 1) AS a + b;
+
+statement error
+SELECT m(s, B := 2) FROM t GROUP BY m(s, b := 2);
+----
+must appear in the GROUP BY clause
+
+statement error
+SELECT ({'a': s}).a AS v FROM t GROUP BY {'A': s};
+----
+must appear in the GROUP BY clause

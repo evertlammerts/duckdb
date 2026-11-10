@@ -34,6 +34,109 @@ SELECT count(*) FROM (SELECT s * 0 + nextval('q') AS b, s * 0 + nextval('q') AS 
 ----
 0
 
+# an alias reads the group of its entry, which need not sit at the entry's position in the select list
+query IIII
+SELECT s + 1 AS c, s * 10 AS d, c AS c2, d AS d2 FROM t GROUP BY 2, 1 ORDER BY ALL;
+----
+2	10	2	10
+3	20	3	20
+4	30	4	30
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY 2, 1 HAVING c = 2;
+----
+2	10
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY 2, 1 HAVING alias.d = 30;
+----
+4	30
+
+query III
+SELECT s + 1 AS c, s * -10 AS d, row_number() OVER (ORDER BY d) AS n FROM t GROUP BY 2, 1 QUALIFY c = 4;
+----
+4	-30	1
+
+query III
+SELECT s + 1 AS c, s * 10 AS d, sum(c) OVER () AS w FROM t GROUP BY 2, 1 ORDER BY ALL;
+----
+2	10	9
+3	20	9
+4	30	9
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY 2, 1 ORDER BY c = 3 DESC, d LIMIT 1;
+----
+3	20
+
+query III
+SELECT s + 1 AS c, s * 10 AS d, (SELECT c) AS e FROM t GROUP BY 2, 1 ORDER BY ALL;
+----
+2	10	2
+3	20	3
+4	30	4
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY d, c HAVING alias.c = 2;
+----
+2	10
+
+# the entry's group comes after a group that is not a select reference
+query I
+SELECT s + 1 AS c FROM t GROUP BY s, 1 HAVING c = 2;
+----
+2
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY s, s * 100, 2, 1 HAVING c = 2 AND d = 10;
+----
+2	10
+
+# an aggregate entry sits between the grouped entries, so the third entry, d, is the first of two groups
+query III
+SELECT s + 1 AS c, count(*) AS n, s * 10 AS d FROM t GROUP BY 3, 1 HAVING d = 10;
+----
+2	1	10
+
+# grouping sets that list the entries out of order
+query III
+SELECT s + 1 AS c, s * 10 AS d, c IS NULL AS e FROM t GROUP BY GROUPING SETS ((2), (1)) ORDER BY ALL;
+----
+2	NULL	false
+3	NULL	false
+4	NULL	false
+NULL	10	true
+NULL	20	true
+NULL	30	true
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY ROLLUP (2, 1) HAVING c IS NULL AND d IS NOT NULL ORDER BY ALL;
+----
+NULL	10
+NULL	20
+NULL	30
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY CUBE (2, 1) HAVING c IS NOT NULL AND d IS NULL ORDER BY ALL;
+----
+2	NULL
+3	NULL
+4	NULL
+
+# three entries with equal expressions are three groups, and the alias a reads the second group, the one its entry became
+query IIII
+SELECT s + 1 AS a, s + 1 AS b, s + 1 AS c2, a IS NULL AS e FROM t GROUP BY GROUPING SETS ((3), (1), (2)) ORDER BY ALL;
+----
+2	NULL	NULL	false
+3	NULL	NULL	false
+4	NULL	NULL	false
+NULL	2	NULL	true
+NULL	3	NULL	true
+NULL	4	NULL	true
+NULL	NULL	2	true
+NULL	NULL	3	true
+NULL	NULL	4	true
+
 # the same entries grouped by alias, read through alias.b
 query I
 SELECT count(*) FROM (SELECT s * 0 + nextval('q') AS b, s * 0 + nextval('q') AS c FROM t GROUP BY b, c HAVING b = c);
@@ -185,6 +288,11 @@ query II
 SELECT s + 1 AS c, s AS d FROM t GROUP BY 1, d, c HAVING c > 2 AND d < 3 ORDER BY 1;
 ----
 3	2
+
+query II
+SELECT s + 1 AS c, s * 10 AS d FROM t GROUP BY 2, 1, c HAVING c = 2;
+----
+2	10
 
 query II
 SELECT s + 1 AS c, row_number() OVER (ORDER BY c DESC) AS n FROM t GROUP BY 1, c QUALIFY c > 2 ORDER BY 1;
