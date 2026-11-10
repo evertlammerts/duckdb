@@ -14,6 +14,7 @@
 #include "duckdb/main/extension_load_options.hpp"
 #include "duckdb/main/settings.hpp"
 
+#include <functional>
 #include <string>
 
 namespace duckdb {
@@ -99,7 +100,8 @@ struct ExtensionInstallOptions {
 
 class ExtensionHelper {
 public:
-	static void LoadAllExtensions(DuckDB &db);
+	//! Loads every linked extension in registration order, calling after_each once each has loaded
+	static void LoadAllExtensions(DuckDB &db, const std::function<void()> &after_each = nullptr);
 	static ExtensionLoadResult LoadExtension(DuckDB &db, const std::string &extension);
 	//! Publishes the extensions linked into this binary, as collected by LinkedExtensionRegistry, onto the config
 	static void RegisterLinkedExtensions(DBConfig &config);
@@ -132,6 +134,8 @@ public:
 	//! extension is linked into the binary
 	static void AutoInstallExtension(ClientContext &context, const string &extension_name);
 	static void AutoInstallExtension(DatabaseInstance &db, FileSystem &fs, const string &extension_name);
+	//! Whether a bare extension name resolves to one of the database's linked extensions, which LoadAllExtensions loads
+	static bool IsLinkedExtension(DatabaseInstance &db, const string &extension_name);
 
 	//! Autoload an extension, only if available locally
 	DUCKDB_API static bool TryAutoLoadAvailableExtension(DatabaseInstance &instance,

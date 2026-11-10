@@ -67,13 +67,16 @@ ExtensionLoadResult ExtensionHelper::LoadExtension(DuckDB &db, const std::string
 	return ExtensionLoadResult::LOADED_EXTENSION;
 }
 
-void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
+void ExtensionHelper::LoadAllExtensions(DuckDB &db, const std::function<void()> &after_each) {
 	// registration order, so a binary loads its extensions the same way on every run
 	auto &config = DBConfig::GetConfig(*db.instance);
 	auto linked = config.linked_extensions;
 	for (auto &entry : linked) {
 		if (entry.load) {
 			entry.load(db);
+			if (after_each) {
+				after_each();
+			}
 		}
 	}
 }
@@ -196,6 +199,10 @@ static ExtensionLoadOptions AutoLoadOptions(const string &extension_name) {
 	ExtensionLoadOptions options(extension_name);
 	options.core_only = true;
 	return options;
+}
+
+bool ExtensionHelper::IsLinkedExtension(DatabaseInstance &db, const string &extension_name) {
+	return FindLinkedExtensionToLoad(db, AutoLoadOptions(extension_name)) != nullptr;
 }
 
 bool ExtensionHelper::TryAutoLoadExtension(ClientContext &context, const string &extension_name) noexcept {
