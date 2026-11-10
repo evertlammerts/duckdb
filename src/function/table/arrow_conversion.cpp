@@ -409,9 +409,14 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 		                                             child_type, -1);
 	} else {
 		if (child_array.dictionary) {
-			ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(child_vector, child_array, chunk_offset, child_state,
-			                                                       child_count, child_type,
-			                                                       NumericCast<int64_t>(child_offset));
+			// slicing the dictionary replaces the child's validity, so it takes the broadcast NULLs as its parent mask
+			ValidityMask child_parent_mask;
+			if (array_mask.CanHaveNull()) {
+				child_parent_mask.Copy(FlatVector::Validity(child_vector), child_count);
+			}
+			ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(
+			    child_vector, child_array, chunk_offset, child_state, child_count, child_type,
+			    NumericCast<int64_t>(child_offset), array_mask.CanHaveNull() ? &child_parent_mask : nullptr);
 		} else if (run_end_encoded) {
 			// the decode can replace the child's validity, so it takes the broadcast NULLs as its parent mask
 			ValidityMask child_parent_mask;
