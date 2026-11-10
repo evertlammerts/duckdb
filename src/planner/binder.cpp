@@ -30,25 +30,13 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_sample.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/query_node/list.hpp"
 #include "duckdb/planner/tableref/list.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/types/uuid.hpp"
 
 #include <algorithm>
-
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
-    defined(DUCKDB_THREAD_SANITIZER)
-#define DUCKDB_BINDER_LARGE_STACK_FRAMES
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(thread_sanitizer) ||       \
-    __has_feature(memory_sanitizer)
-#define DUCKDB_BINDER_LARGE_STACK_FRAMES
-#endif
-#endif
-#if !defined(DUCKDB_BINDER_LARGE_STACK_FRAMES) && ((defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_WIN32))
-#define DUCKDB_BINDER_LARGE_STACK_FRAMES
-#endif
 
 namespace duckdb {
 
@@ -64,35 +52,12 @@ void Binder::IncreaseDepth() {
 		                      "increase the maximum expression depth.",
 		                      max_expression_depth);
 	}
-	CheckStackSpace();
+	Planner::CheckStackSpace(PlanningStep::BINDING);
 }
 
 void Binder::ContinueDepth(const Binder &creator) {
 	depth = creator.GetBinderDepth();
 	IncreaseDepth();
-}
-
-void Binder::CheckStackSpace() {
-	// covers the binding between two checks, a table function's bind among it, and the throw; frames are larger under
-	// the sanitizers and without optimization, and on Windows guard pages take part of the stack and a catch block runs
-	// on top of the throw
-#ifdef DUCKDB_BINDER_LARGE_STACK_FRAMES
-	static constexpr idx_t MIN_STACK_RESERVE = idx_t(104) * 1024;
-#else
-	static constexpr idx_t MIN_STACK_RESERVE = idx_t(40) * 1024;
-#endif
-	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
-	idx_t stack_size;
-	idx_t remaining;
-	if (!ThreadUtil::GetStackSpace(stack_size, remaining)) {
-		return;
-	}
-	auto reserve = MinValue(MaxValue(stack_size / 8, MIN_STACK_RESERVE), MAX_STACK_RESERVE);
-	if (remaining < MinValue(reserve, stack_size / 2)) {
-		throw BinderException("Max expression depth exceeded: binding the query would overflow the %lld KiB stack of "
-		                      "this thread",
-		                      stack_size / 1024);
-	}
 }
 
 shared_ptr<Binder> Binder::CreateBinder(ClientContext &context, optional_ptr<Binder> parent, BinderType binder_type) {
@@ -734,5 +699,3 @@ shared_ptr<Binder> Binder::CreateBinderWithSearchPath(const Identifier &catalog_
 }
 
 } // namespace duckdb
-
-#undef DUCKDB_BINDER_LARGE_STACK_FRAMES

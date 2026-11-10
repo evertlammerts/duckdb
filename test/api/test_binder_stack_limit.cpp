@@ -33,6 +33,24 @@ constexpr idx_t DEEP_MACRO_NEST = 190;
 constexpr idx_t SHALLOW_NEST = 3;
 // Enough for a macro cycle to reach a lowered max_expression_depth on any build.
 constexpr idx_t LARGE_STACK_SIZE = 16 * 1024 * 1024;
+// Planning makes three operators per EXCEPT, and walks them with more stack than binding the chain takes.
+constexpr idx_t DEEP_EXCEPT_CHAIN = 150;
+// Five plan operators per level: deep enough for planning to run out before binding on x86, arm64 and under ASan.
+constexpr idx_t DEEP_DENSE_NEST = 150;
+// About two nested join order optimizers per EXCEPT ALL, so the chain reaches the cutoff of 128.
+constexpr idx_t CORRELATED_EXCEPT_ALL_CHAIN = 100;
+// A level that joins makes the parsed statement deeper still, and its destruction overflows 512 KiB under a sanitizer
+// at 200 levels.
+constexpr idx_t DEEP_JOIN_NEST = 100;
+// Below this the binder's error for a nest of 200 can still overflow while the parsed statement is destroyed, under
+// a sanitizer.
+constexpr idx_t SWEEP_MIN_STACK_SIZE = 512 * 1024;
+constexpr idx_t SWEEP_MAX_STACK_SIZE = 2048 * 1024;
+constexpr idx_t SWEEP_STEP = 128 * 1024;
+constexpr idx_t NARROW_SWEEP_MIN_STACK_SIZE = 384 * 1024;
+constexpr idx_t NARROW_SWEEP_MAX_STACK_SIZE = 1024 * 1024;
+constexpr idx_t NARROW_SWEEP_STEP = 32 * 1024;
+constexpr idx_t FINE_SWEEP_STEP = 8 * 1024;
 
 struct SmallStackQuery {
 	Connection &con;
@@ -130,13 +148,48 @@ SmallStackQuery QueryOnSmallStack(Connection &con, const string &sql, idx_t stac
 	return query;
 }
 
+bool IsStackError(const string &error, const string &step) {
+	return StringUtil::Contains(error, "Binder Error: Max expression depth exceeded: " + step +
+	                                       " the query would overflow the");
+}
+
 void RequireStackError(Connection &con, const string &sql, idx_t stack_size = SMALL_STACK_SIZE) {
 	auto query = QueryOnSmallStack(con, sql, stack_size);
 	INFO(query.value);
 	INFO(query.error);
 	REQUIRE(query.has_error);
-	REQUIRE(StringUtil::Contains(query.error,
-	                             "Binder Error: Max expression depth exceeded: binding the query would overflow the"));
+	REQUIRE(IsStackError(query.error, "binding"));
+}
+
+// Which step runs out of stack first depends on the compiler and the build: binding a FROM subquery takes about 3.8 KiB
+// on arm64 with GCC 11 and 1 KiB on x86 with GCC 13, planning it about the same on both. So the nest is planned on a
+// range of stacks, from small to large, each of which must give the value or one of the two errors, up to the first
+// that gives the value. Returns whether planning ran out.
+bool RequireValueOrStackError(Connection &con, const string &sql, const string &expected,
+                              idx_t min_stack_size = SWEEP_MIN_STACK_SIZE, idx_t max_stack_size = SWEEP_MAX_STACK_SIZE,
+                              idx_t step = SWEEP_STEP) {
+	bool planning_error = false;
+	idx_t previous_size = 0;
+	for (idx_t stack_size = min_stack_size; stack_size <= max_stack_size; stack_size += step) {
+		// with pages, or an allocation granularity, larger than the step several steps round to the same stack
+		auto rounded_size = PageMultiple(stack_size);
+		if (rounded_size == previous_size) {
+			continue;
+		}
+		previous_size = rounded_size;
+		auto query = QueryOnSmallStack(con, sql, rounded_size);
+		INFO(query.stack_size);
+		INFO(query.error);
+		if (query.has_error) {
+			auto planning = IsStackError(query.error, "planning");
+			REQUIRE((planning || IsStackError(query.error, "binding")));
+			planning_error = planning_error || planning;
+		} else {
+			REQUIRE(query.value == expected);
+			break;
+		}
+	}
+	return planning_error;
 }
 
 void RequireDepthError(Connection &con, const string &sql, const string &expected) {
@@ -175,8 +228,8 @@ bool StackIsReported(Connection &con) {
 }
 
 // The sanitizers and builds without optimization take several times the stack per frame, and under AddressSanitizer
-// the join order optimizer, which does not check the stack, overflows 256 KiB planning TPC-H query 2. The engine keeps
-// a larger reserve for these builds and on Windows.
+// the join order optimizer needs more than 256 KiB planning TPC-H query 2. The engine keeps a larger reserve for these
+// builds and on Windows.
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
     defined(DUCKDB_THREAD_SANITIZER)
 constexpr idx_t STACK_FRAME_SCALE = 4;
@@ -222,6 +275,48 @@ string NestedCTEs(idx_t count) {
 		query = StringUtil::Format("WITH c%d AS (%s) SELECT * FROM c%d", i, query, i);
 	}
 	return query;
+}
+
+string NestedFromSubqueries(idx_t count) {
+	string query = "SELECT 42 AS a";
+	for (idx_t i = 0; i < count; i++) {
+		query = StringUtil::Format("SELECT * FROM (%s)", query);
+	}
+	return query;
+}
+
+string NestedFromJoins(idx_t count) {
+	string query = "SELECT 42 AS a";
+	for (idx_t i = 0; i < count; i++) {
+		query = StringUtil::Format("SELECT t%d.a FROM (%s) t%d JOIN (SELECT 42 AS a) u%d USING (a)", i, query, i, i);
+	}
+	return query;
+}
+
+// Each level makes five plan operators: a projection, a filter, a distinct, an order and a limit.
+string NestedDenseSubqueries(idx_t count) {
+	string query = "SELECT 42 AS a";
+	for (idx_t i = 0; i < count; i++) {
+		query = StringUtil::Format("SELECT DISTINCT a FROM (%s) WHERE a > 0 ORDER BY a LIMIT 10", query);
+	}
+	return query;
+}
+
+string ExceptChain(idx_t count) {
+	string query = "SELECT 42";
+	for (idx_t i = 0; i < count; i++) {
+		query += StringUtil::Format(" EXCEPT SELECT %d", 100 + i);
+	}
+	return query;
+}
+
+// The chain reads the outer query's column, so decorrelation walks it as the body of a correlated subquery.
+string CorrelatedExceptChain(idx_t count, const string &except = "EXCEPT") {
+	string chain = "SELECT t.a";
+	for (idx_t i = 0; i < count; i++) {
+		chain += StringUtil::Format(" %s SELECT %d", except, 100 + i);
+	}
+	return StringUtil::Format("SELECT (%s) FROM (SELECT 42 AS a) t", chain);
 }
 
 } // namespace
@@ -395,8 +490,8 @@ TEST_CASE("A nest bound one level deeper at a time ends in the stack error", "[a
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
-	// under AddressSanitizer the join order optimizer, which does not check the stack, needs more of it per view than
-	// binding does, so a nest that just binds would overflow there
+	// under AddressSanitizer the join order optimizer needs more stack per view than binding does, so a nest that just
+	// binds would end in the planning error there
 	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_optimizer"));
 	if (!StackIsReported(con)) {
 		return;
@@ -463,4 +558,56 @@ TEST_CASE("A macro cycle through a USING KEY aggregate reaches the depth limit",
 		REQUIRE_NO_FAIL(con.Query("SET search_path='main'"));
 		RequireDepthError(con, "SELECT n()", "Max expression depth limit of 100 exceeded");
 	}
+}
+
+TEST_CASE("Join ordering and subquery planning raise the stack error before the stack runs out", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='4GB'"));
+	// these passes do not check the stack and need more of it per level than the checked walks for some nests below
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='window_self_join,projection_placement,unused_columns,"
+	                          "top_n_window_elimination,filter_pushdown'"));
+	if (!StackIsReported(con)) {
+		return;
+	}
+
+	SECTION("FROM subqueries") {
+		RequireValueOrStackError(con, NestedFromSubqueries(DEEP_STATEMENT_NEST), "42");
+		RequireValue(con, NestedFromSubqueries(SHALLOW_NEST), "42");
+	}
+	SECTION("FROM subqueries with joins") {
+		// planning a nest of joins takes seconds once it fits, so it runs on one stack only
+		RequireValueOrStackError(con, NestedFromJoins(DEEP_JOIN_NEST), "42", SMALL_STACK_SIZE, SMALL_STACK_SIZE);
+		RequireValue(con, NestedFromJoins(SHALLOW_NEST), "42");
+	}
+	SECTION("subqueries with five plan operators per level") {
+		// pins the checks of the trigger rewrite, the subquery planner and decorrelation
+		REQUIRE(RequireValueOrStackError(con, NestedDenseSubqueries(DEEP_DENSE_NEST), "42"));
+		RequireValue(con, NestedDenseSubqueries(SHALLOW_NEST), "42");
+	}
+	SECTION("set operations") {
+		// pins the check of decorrelation
+		REQUIRE(RequireValueOrStackError(con, ExceptChain(DEEP_EXCEPT_CHAIN), "42"));
+		RequireValue(con, ExceptChain(SHALLOW_NEST), "42");
+	}
+	SECTION("EXCEPT ALL in a correlated subquery") {
+		// pins the check of the join order optimizer; binding runs out first under a sanitizer, so no error is required
+		RequireValueOrStackError(con, CorrelatedExceptChain(CORRELATED_EXCEPT_ALL_CHAIN, "EXCEPT ALL"), "42",
+		                         NARROW_SWEEP_MIN_STACK_SIZE, NARROW_SWEEP_MAX_STACK_SIZE, NARROW_SWEEP_STEP);
+		// a sanitizer's frames make even this short chain's nested join order optimizers take most of 512 KiB
+		RequireValue(con, CorrelatedExceptChain(SHALLOW_NEST, "EXCEPT ALL"), "42", NARROW_SWEEP_MAX_STACK_SIZE);
+	}
+	SECTION("a longer EXCEPT ALL chain in a correlated subquery") {
+		// pins the checks of the subquery planner and the correlated push down, on bands narrower than the other steps
+		RequireValueOrStackError(con, CorrelatedExceptChain(DEEP_EXCEPT_CHAIN, "EXCEPT ALL"), "42",
+		                         NARROW_SWEEP_MIN_STACK_SIZE, NARROW_SWEEP_MAX_STACK_SIZE, FINE_SWEEP_STEP);
+	}
+	SECTION("set operations in a correlated subquery") {
+		// pins the checks of the subquery planner and the correlated push down; binding runs out first under a
+		// sanitizer
+		RequireValueOrStackError(con, CorrelatedExceptChain(DEEP_EXCEPT_CHAIN), "42", NARROW_SWEEP_MIN_STACK_SIZE,
+		                         NARROW_SWEEP_MAX_STACK_SIZE, NARROW_SWEEP_STEP);
+		RequireValue(con, CorrelatedExceptChain(SHALLOW_NEST), "42");
+	}
+	RequireValue(con, "SELECT 42", "42");
 }

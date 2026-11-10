@@ -7,6 +7,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
@@ -46,7 +47,7 @@ StackChecker<ExpressionBinder> ExpressionBinder::StackCheck(const ParsedExpressi
 		                      "increase the maximum expression depth.",
 		                      max_expression_depth);
 	}
-	Binder::CheckStackSpace();
+	Planner::CheckStackSpace(PlanningStep::BINDING);
 	return StackChecker<ExpressionBinder>(*this, extra_stack);
 }
 

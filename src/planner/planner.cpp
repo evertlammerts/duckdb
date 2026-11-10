@@ -3,6 +3,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/thread.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -28,6 +29,19 @@
 #include "duckdb/planner/logical_plan_verifier.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__) ||                \
+    defined(DUCKDB_THREAD_SANITIZER)
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(thread_sanitizer) ||       \
+    __has_feature(memory_sanitizer)
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#endif
+#endif
+#if !defined(DUCKDB_PLANNER_LARGE_STACK_FRAMES) && ((defined(__GNUC__) && !defined(__OPTIMIZE__)) || defined(_WIN32))
+#define DUCKDB_PLANNER_LARGE_STACK_FRAMES
+#endif
 
 namespace duckdb {
 
@@ -80,6 +94,8 @@ void Planner::Optimize() {
 // Pre-decorrelation pass: replace LogicalTrigger with LogicalDependentJoin so the standard
 // FlattenDependentJoins machinery can decorrelate the trigger body.
 static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
+	// one binder level can make several plan operators, so the checks of binding do not bound this walk
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 	for (auto &child : op.children) {
 		if (child) {
 			RewriteTriggersToDependent(binder, *child);
@@ -103,6 +119,33 @@ static void RewriteTriggersToDependent(Binder &binder, LogicalOperator &op) {
 		dep_join->children.push_back(std::move(trig.children[0]));
 		dep_join->children.push_back(std::move(trig.children[1]));
 		op.children[i] = std::move(dep_join);
+	}
+}
+
+void Planner::CheckStackSpace(PlanningStep step) {
+	// a floor covers its step's work below the last check and the throw; frames are larger under the sanitizers and
+	// without optimization, and on Windows guard pages and a catch block on top of the throw take more
+#ifdef DUCKDB_PLANNER_LARGE_STACK_FRAMES
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(104) * 1024;
+	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(104) * 1024;
+#else
+	static constexpr idx_t BINDING_MIN_STACK_RESERVE = idx_t(40) * 1024;
+	static constexpr idx_t PLANNING_MIN_STACK_RESERVE = idx_t(16) * 1024;
+#endif
+	static constexpr idx_t MAX_STACK_RESERVE = idx_t(256) * 1024;
+	idx_t stack_size;
+	idx_t remaining;
+	if (!ThreadUtil::GetStackSpace(stack_size, remaining)) {
+		return;
+	}
+	auto binding = step == PlanningStep::BINDING;
+	auto min_reserve = binding ? BINDING_MIN_STACK_RESERVE : PLANNING_MIN_STACK_RESERVE;
+	// the eighth, not the floor, covers destroying a deep plan as a planning error unwinds, which grows with the plan
+	auto reserve = MinValue(MaxValue(stack_size / 8, min_reserve), MAX_STACK_RESERVE);
+	if (remaining < MinValue(reserve, stack_size / 2)) {
+		throw BinderException("Max expression depth exceeded: %s the query would overflow the %lld KiB stack of this "
+		                      "thread",
+		                      binding ? "binding" : "planning", stack_size / 1024);
 	}
 }
 
@@ -398,3 +441,5 @@ void Planner::VerifyPlan(ClientContext &context, unique_ptr<LogicalOperator> &op
 }
 
 } // namespace duckdb
+
+#undef DUCKDB_PLANNER_LARGE_STACK_FRAMES

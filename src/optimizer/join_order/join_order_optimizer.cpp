@@ -8,6 +8,7 @@
 #include "duckdb/optimizer/join_order/plan_enumerator.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/operator/list.hpp"
+#include "duckdb/planner/planner.hpp"
 
 namespace duckdb {
 
@@ -31,6 +32,8 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 		// Returning the current plan is always a valid choice
 		return plan;
 	}
+	// a nested optimizer starts for every operator it cannot reorder, with more stack per level than binding takes
+	Planner::CheckStackSpace(PlanningStep::PLANNING);
 
 	// make sure query graph manager has not extracted a relation graph already
 	auto &op = *plan;
