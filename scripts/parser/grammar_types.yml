@@ -830,6 +830,8 @@ QualifiedName:
     - SchemaReservedIndex
     - CatalogReservedSchemaIndex
     - FunctionIdentifier
+    - MacroName
+    - MacroFunctionName
     - FunctionNameAsQualifiedName
     - SchemaReservedFunctionName
     - CatalogReservedSchemaFunctionName
