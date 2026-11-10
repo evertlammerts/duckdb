@@ -179,62 +179,60 @@ ColumnResolution ExpressionBinder::ResolveColumn(ColumnRefExpression &colref, id
 //! they bind in a chain of their own, so a column inside one says nothing about this expression.
 //! Lambda parameters are skipped for the same reason: they are bound by the lambda rather than by any
 //! scope, so a parameter that happens to share a name with an outer column must not pull the
-//! expression out to that scope. The parameter names are read exactly as `ColumnQualifier` reads them,
-//! so the resolver sees the same names a real bind would.
-static void CollectResolvableColumns(ParsedExpression &expr, vector<identifier_set_t> &lambda_params,
+//! expression out to that scope. A field access on a parameter is skipped too, unless a table of the
+//! query the lambda is written in provides the reference, which then is that table's column.
+static void CollectResolvableColumns(Binder &binder, ParsedExpression &expr, ColumnQualifier &qualifier,
+                                     vector<identifier_set_t> &lambda_params,
                                      vector<reference<ColumnRefExpression>> &result) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::SUBQUERY:
 		return;
 	case ExpressionClass::COLUMN_REF: {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
-		// a lambda parameter is always a bare name, so a qualified reference is a column even when its
-		// last component happens to match one - `t.x` inside `lambda x: ...` names the table's column
-		if (!col_ref.IsQualified() && LambdaExpression::IsLambdaParameter(lambda_params, col_ref.GetColumnName())) {
+		if (qualifier.IsLambdaParameterReference(lambda_params, col_ref)) {
 			return;
 		}
 		result.push_back(col_ref);
 		return;
 	}
-	case ExpressionClass::LAMBDA: {
-		auto &lambda = expr.Cast<LambdaExpression>();
-		string error_message;
-		auto parameters = lambda.ExtractColumnRefExpressions(error_message);
-		if (!error_message.empty()) {
-			// the LHS is not a parameter list, so this is the JSON arrow operator: both sides are
-			// ordinary expressions and nothing is bound by the lambda
-			CollectResolvableColumns(*lambda.LeftMutable(), lambda_params, result);
-			CollectResolvableColumns(*lambda.RightMutable(), lambda_params, result);
-			return;
+	case ExpressionClass::FUNCTION: {
+		auto &function = expr.Cast<FunctionExpression>();
+		if (!function.IsLambdaFunction()) {
+			break;
 		}
-		lambda_params.emplace_back();
-		for (auto &parameter : parameters) {
-			lambda_params.back().emplace(parameter.get().Cast<ColumnRefExpression>().GetName());
-		}
-		// only the body can reference anything outside the lambda
-		CollectResolvableColumns(*lambda.RightMutable(), lambda_params, result);
-		lambda_params.pop_back();
+		ColumnQualifier::EnumerateCallChildren(
+		    binder, function,
+		    [&](unique_ptr<ParsedExpression> &child) {
+			    CollectResolvableColumns(binder, *child, qualifier, lambda_params, result);
+		    },
+		    [&](LambdaExpression &lambda, identifier_set_t &parameters) {
+			    lambda_params.push_back(std::move(parameters));
+			    CollectResolvableColumns(binder, *lambda.RightMutable(), qualifier, lambda_params, result);
+			    lambda_params.pop_back();
+		    });
 		return;
 	}
 	default:
 		break;
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](ParsedExpression &child) { CollectResolvableColumns(child, lambda_params, result); });
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) {
+		CollectResolvableColumns(binder, child, qualifier, lambda_params, result);
+	});
 }
 
 optional_idx ExpressionBinder::ResolveAggregateOwner(FunctionExpression &aggregate, idx_t start) {
 	vector<reference<ColumnRefExpression>> columns;
+	ColumnQualifier qualifier(binder);
 	vector<identifier_set_t> lambda_params;
 	for (auto &child : aggregate.GetArgumentsMutable()) {
-		CollectResolvableColumns(*child.GetExpressionMutable(), lambda_params, columns);
+		CollectResolvableColumns(binder, *child.GetExpressionMutable(), qualifier, lambda_params, columns);
 	}
 	if (aggregate.Filter()) {
-		CollectResolvableColumns(*aggregate.FilterMutable(), lambda_params, columns);
+		CollectResolvableColumns(binder, *aggregate.FilterMutable(), qualifier, lambda_params, columns);
 	}
 	if (aggregate.OrderBy()) {
 		for (auto &order : aggregate.OrderByMutable()->orders) {
-			CollectResolvableColumns(*order.expression, lambda_params, columns);
+			CollectResolvableColumns(binder, *order.expression, qualifier, lambda_params, columns);
 		}
 	}
 	return ResolveOwner(columns, start);
@@ -242,8 +240,9 @@ optional_idx ExpressionBinder::ResolveAggregateOwner(FunctionExpression &aggrega
 
 optional_idx ExpressionBinder::ResolveExpressionOwner(ParsedExpression &expr, idx_t start) {
 	vector<reference<ColumnRefExpression>> columns;
+	ColumnQualifier qualifier(binder);
 	vector<identifier_set_t> lambda_params;
-	CollectResolvableColumns(expr, lambda_params, columns);
+	CollectResolvableColumns(binder, expr, qualifier, lambda_params, columns);
 	return ResolveOwner(columns, start);
 }
 

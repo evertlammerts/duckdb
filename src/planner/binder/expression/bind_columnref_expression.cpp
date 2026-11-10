@@ -36,8 +36,7 @@ unique_ptr<ParsedExpression> ExpressionBinder::CreateStructPack(ColumnRefExpress
 void ExpressionBinder::QualifyColumnNames(Binder &binder, unique_ptr<ParsedExpression> &expr,
                                           optional_ptr<ColumnAliasBinder> alias_binder) {
 	ColumnQualifier qualifier(binder, nullptr, alias_binder);
-	vector<identifier_set_t> lambda_params;
-	qualifier.QualifyColumnNames(expr, lambda_params);
+	qualifier.QualifyColumnNames(expr);
 }
 
 unique_ptr<ColumnQualifier> ExpressionBinder::CreateColumnQualifier() {
@@ -62,8 +61,7 @@ bool ExpressionBinder::ClaimsAlias(ColumnRefExpression &colref) {
 
 void ExpressionBinder::QualifyColumnNames(ExpressionBinder &expression_binder, unique_ptr<ParsedExpression> &expr) {
 	ColumnQualifier qualifier(expression_binder.binder, expression_binder.lambda_bindings);
-	vector<identifier_set_t> lambda_params;
-	qualifier.QualifyColumnNames(expr, lambda_params);
+	qualifier.QualifyColumnNames(expr);
 }
 
 BindResult ExpressionBinder::BindExpression(LambdaRefExpression &lambda_ref, idx_t depth) {
@@ -72,6 +70,14 @@ BindResult ExpressionBinder::BindExpression(LambdaRefExpression &lambda_ref, idx
 		throw BinderException(lambda_ref, "aggregate functions cannot reference lambda parameters");
 	}
 	return (*lambda_bindings)[lambda_ref.LambdaIndex()].Bind(lambda_ref, depth);
+}
+
+static bool ReadsLambdaParameter(const ParsedExpression &expr) {
+	reference<const ParsedExpression> current(expr);
+	while (current.get().GetExpressionType() == ExpressionType::STRUCT_EXTRACT) {
+		current = *current.get().Cast<OperatorExpression>().GetChildren()[0];
+	}
+	return current.get().GetExpressionClass() == ExpressionClass::LAMBDA_REF;
 }
 
 unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnName(ColumnRefExpression &col_ref, ErrorData &error) {
@@ -113,9 +119,15 @@ BindResult ExpressionBinder::BindExpression(ColumnRefExpression &col_ref_p, idx_
 	// all of them are not column reference expressions, so we return here
 	if (expr->GetExpressionType() != ExpressionType::COLUMN_REF) {
 		auto alias = expr->GetAlias();
+		const auto reads_lambda_parameter = ReadsLambdaParameter(*expr);
 		auto result = BindExpression(expr, depth);
 		if (!result.HasError()) {
 			result.expression->SetAlias(std::move(alias));
+			return result;
+		}
+		if (reads_lambda_parameter) {
+			// a lambda parameter is the innermost name, so an enclosing scope must not read the reference instead
+			result.error.AddQueryLocation(col_ref_p);
 			return result;
 		}
 		// this scope reads the name as something other than a column, e.g a struct extract of one of its own columns,
