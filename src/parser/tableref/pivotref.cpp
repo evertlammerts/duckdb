@@ -82,6 +82,9 @@ bool PivotColumnEntry::Equals(const PivotColumnEntry &other) const {
 	if (alias != other.alias) {
 		return false;
 	}
+	if (!ParsedExpression::Equals(expr, other.expr)) {
+		return false;
+	}
 	if (values.size() != other.values.size()) {
 		return false;
 	}
