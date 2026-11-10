@@ -6,6 +6,10 @@
 #include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+
+#include <atomic>
+#include <thread>
 
 using namespace duckdb;
 
@@ -138,6 +142,34 @@ TEST_CASE("INSERT ToString of a SELECT source and DEFAULT VALUES", "[api][parser
 	RequireRoundTrip("INSERT INTO t (SELECT a FROM s UNION ALL SELECT b FROM s) ORDER BY 1 LIMIT 1",
 	                 "INSERT INTO t (SELECT a FROM s) UNION ALL (SELECT b FROM s) ORDER BY 1 LIMIT 1");
 	RequireRoundTrip("INSERT INTO t DEFAULT VALUES RETURNING a AS b", "INSERT INTO t DEFAULT VALUES RETURNING a AS b");
+}
+
+TEST_CASE("Printing one INSERT from several threads leaves its VALUES list unchanged", "[api][parser][interquery]") {
+	auto parsed = ParseOne("INSERT INTO t VALUES (3), (1), (2) ORDER BY 1 LIMIT 1");
+	const auto &statement = parsed->Cast<InsertStatement>();
+	REQUIRE(statement.GetValuesList());
+	const auto snapshot = statement.Copy();
+	const auto alias = statement.GetValuesList()->alias;
+	const auto expected = statement.ToString();
+
+	// Printing must not write into the node, and only concurrent prints can see a write that is undone afterwards.
+	std::atomic<idx_t> mismatches {0};
+	vector<std::thread> threads;
+	for (idx_t thread_idx = 0; thread_idx < 8; thread_idx++) {
+		threads.emplace_back([&]() {
+			for (idx_t print_idx = 0; print_idx < 2000; print_idx++) {
+				if (statement.ToString() != expected) {
+					mismatches++;
+				}
+			}
+		});
+	}
+	for (auto &thread : threads) {
+		thread.join();
+	}
+	REQUIRE(mismatches == 0);
+	REQUIRE(statement.GetValuesList()->alias == alias);
+	REQUIRE(StatementNode(statement).Equals(&StatementNode(*snapshot)));
 }
 
 static void RequireSameRows(Connection &con, const string &table, const string &sql, const vector<Value> &expected) {
