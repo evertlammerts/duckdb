@@ -10,6 +10,7 @@
 
 #include "json_common.hpp"
 #include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "json_enums.hpp"
 #include "duckdb/common/types/type_map.hpp"
@@ -21,23 +22,42 @@ struct DateFormatMap {
 	friend class MutableDateFormatMap;
 
 public:
-	explicit DateFormatMap(type_id_map_t<vector<StrpTimeFormat>> candidate_formats_p)
-	    : candidate_formats(std::move(candidate_formats_p)) {
+	DateFormatMap(type_id_map_t<vector<StrpTimeFormat>> candidate_formats_p, type_id_set_t cast_candidates_p)
+	    : candidate_formats(std::move(candidate_formats_p)), cast_candidates(std::move(cast_candidates_p)) {
 	}
 
 	bool HasFormats(LogicalTypeId type) const {
 		return HasFormats(candidate_formats, type);
 	}
 
-	const StrpTimeFormat &GetFormat(LogicalTypeId type) const {
-		D_ASSERT(candidate_formats.find(type) != candidate_formats.end());
-		return candidate_formats.find(type)->second.back();
-	}
-
 	const vector<StrpTimeFormat> &GetFormats(LogicalTypeId type) const {
 		D_ASSERT(candidate_formats.find(type) != candidate_formats.end());
 		return candidate_formats.find(type)->second;
 	}
+
+	//! Whether the plain cast is a candidate for type too
+	bool CastIsCandidate(LogicalTypeId type) const {
+		return cast_candidates.find(type) != cast_candidates.end();
+	}
+
+	//! The format at format_index, or nullptr for the plain cast when format_index is invalid
+	optional_ptr<const StrpTimeFormat> GetCandidate(LogicalTypeId type, optional_idx format_index) const {
+		if (!format_index.IsValid()) {
+			return nullptr;
+		}
+		return &GetFormats(type)[format_index.GetIndex()];
+	}
+
+	//! Whether the candidate of type, a format or the plain cast when format is nullptr, reads input
+	bool CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, date_t &result,
+	                    optional_ptr<string> error_message) const;
+	bool CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, timestamp_t &result,
+	                    optional_ptr<string> error_message) const;
+
+private:
+	bool HasTwoDigitYear(LogicalTypeId type, const string_t &input) const;
+	bool FourDigitYearReads(LogicalTypeId type, optional_ptr<const StrpTimeFormat> format, const string_t &input,
+	                        optional_ptr<string> error_message) const;
 
 public:
 	static void AddFormat(type_id_map_t<vector<StrpTimeFormat>> &candidate_formats, LogicalTypeId type,
@@ -58,6 +78,7 @@ public:
 
 private:
 	type_id_map_t<vector<StrpTimeFormat>> candidate_formats;
+	type_id_set_t cast_candidates;
 };
 
 class MutableDateFormatMap {
@@ -75,14 +96,14 @@ public:
 		return date_format_map.candidate_formats.at(type).size();
 	}
 
-	bool GetFormatAtIndex(LogicalTypeId type, idx_t index, StrpTimeFormat &format) {
+	bool CastIsCandidate(LogicalTypeId type) {
 		lock_guard<mutex> lock(format_lock);
-		auto &formats = date_format_map.candidate_formats.at(type);
-		if (index >= formats.size()) {
-			return false;
-		}
-		format = formats[index];
-		return true;
+		return date_format_map.CastIsCandidate(type);
+	}
+
+	//! The formats do not change once InitializeFormats built them, so matching values needs no lock
+	const DateFormatMap &GetDateFormatMap() const {
+		return date_format_map;
 	}
 
 private:

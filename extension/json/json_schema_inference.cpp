@@ -1,6 +1,9 @@
 #include "json_schema_inference.hpp"
 
+#include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/types/date.hpp"
 #include "json_geojson.hpp"
 #include "json_scan.hpp"
 #include "json_transform.hpp"
@@ -110,6 +113,18 @@ bool JSONStructureNode::ContainsVarchar() const {
 	}
 
 	return false;
+}
+
+optional_ptr<const JSONStructureNode> JSONStructureNode::GetField(const string &field_key) const {
+	if (descriptions.size() != 1 || descriptions[0].type != LogicalTypeId::STRUCT) {
+		return nullptr;
+	}
+	const auto &desc = descriptions[0];
+	const auto it = desc.key_map.find({field_key.c_str(), field_key.size()});
+	if (it == desc.key_map.end()) {
+		return nullptr;
+	}
+	return &desc.children[it->second];
 }
 
 void JSONStructureNode::InitializeCandidateTypes(const idx_t max_depth, const bool convert_strings_to_integers,
@@ -226,6 +241,8 @@ void JSONStructureNode::RefineCandidateTypesObject(yyjson_val *vals[], const idx
 	}
 
 	const auto found_keys = reinterpret_cast<bool *>(allocator.AllocateAligned(sizeof(bool) * child_count));
+	// A struct reads the first of duplicate keys and a map reads them all, so the sample refines on every one
+	vector<vector<yyjson_val *>> duplicate_vals(child_count);
 
 	const auto &key_map = desc.key_map;
 	size_t idx, max;
@@ -243,8 +260,12 @@ void JSONStructureNode::RefineCandidateTypesObject(yyjson_val *vals[], const idx
 				auto it = key_map.find({key_ptr, key_len});
 				D_ASSERT(it != key_map.end());
 				const auto child_idx = it->second;
+				if (found_keys[child_idx]) {
+					duplicate_vals[child_idx].push_back(child_val);
+					continue;
+				}
 				child_vals[child_idx][i] = child_val;
-				found_key_count += !found_keys[child_idx];
+				found_key_count++;
 				found_keys[child_idx] = true;
 			}
 
@@ -264,8 +285,17 @@ void JSONStructureNode::RefineCandidateTypesObject(yyjson_val *vals[], const idx
 	}
 
 	for (idx_t child_idx = 0; child_idx < child_count; child_idx++) {
-		desc.children[child_idx].RefineCandidateTypes(child_vals[child_idx], val_count, string_vector, allocator,
-		                                              date_format_map, user_specified_timestamp_format);
+		const auto &duplicates = duplicate_vals[child_idx];
+		auto refine_vals = child_vals[child_idx];
+		if (!duplicates.empty()) {
+			// One call, so that a type that takes over from a ruled out one is tried on all of these values
+			refine_vals = reinterpret_cast<yyjson_val **>(
+			    allocator.AllocateAligned((val_count + duplicates.size()) * sizeof(yyjson_val *)));
+			memcpy(refine_vals, child_vals[child_idx], val_count * sizeof(yyjson_val *));
+			memcpy(refine_vals + val_count, duplicates.data(), duplicates.size() * sizeof(yyjson_val *));
+		}
+		desc.children[child_idx].RefineCandidateTypes(refine_vals, val_count + duplicates.size(), string_vector,
+		                                              allocator, date_format_map, user_specified_timestamp_format);
 	}
 }
 
@@ -357,6 +387,109 @@ static void UpdateTimestampOffsetState(JSONStructureDescription &description, co
 	}
 }
 
+bool DateFormatMap::HasTwoDigitYear(const LogicalTypeId type, const string_t &input) const {
+	for (const auto &format : GetFormats(type)) {
+		StrpTimeFormat::ParseResult parse_result;
+		if ((format.HasFormatSpecifier(StrTimeSpecifier::YEAR_WITHOUT_CENTURY) ||
+		     format.HasFormatSpecifier(StrTimeSpecifier::YEAR_WITHOUT_CENTURY_PADDED)) &&
+		    format.Parse(input, parse_result)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The number of digits of the year that the plain cast reads, which leads the value
+static idx_t CastYearDigits(const string_t &input) {
+	const auto data = input.GetData();
+	const auto size = input.GetSize();
+	idx_t pos = 0;
+	while (pos < size && StringUtil::CharacterIsSpace(data[pos])) {
+		pos++;
+	}
+	if (pos < size && data[pos] == '-') {
+		pos++;
+	}
+	idx_t digits = 0;
+	while (pos + digits < size && StringUtil::CharacterIsDigit(data[pos + digits])) {
+		digits++;
+	}
+	return digits;
+}
+
+//! Only for a value before the year 100, which is also what the cast and %Y read from a two digit year
+bool DateFormatMap::FourDigitYearReads(const LogicalTypeId type, optional_ptr<const StrpTimeFormat> format,
+                                       const string_t &input, optional_ptr<string> error_message) const {
+	if (format) {
+		if (!format->HasFormatSpecifier(StrTimeSpecifier::YEAR_DECIMAL) || !HasTwoDigitYear(type, input)) {
+			return true;
+		}
+		if (error_message) {
+			*error_message =
+			    StringUtil::Format("\"%s\" has a two digit year, which format specifier \"%s\" does not read",
+			                       input.GetString(), format->format_specifier);
+		}
+		return false;
+	}
+	if (CastYearDigits(input) > 2) {
+		return true;
+	}
+	if (error_message) {
+		*error_message =
+		    StringUtil::Format("\"%s\" has a two digit year, which the plain cast does not read", input.GetString());
+	}
+	return false;
+}
+
+bool DateFormatMap::CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, date_t &result,
+                                   optional_ptr<string> error_message) const {
+	if (format) {
+		if (error_message ? !format->TryParseDate(input, result, *error_message)
+		                  : !format->TryParseDate(input.GetData(), input.GetSize(), result)) {
+			return false;
+		}
+	} else if (!TryCast::Operation<string_t, date_t>(input, result, true)) {
+		if (error_message) {
+			*error_message = Date::FormatError(input);
+		}
+		return false;
+	}
+	static const auto first_day_of_year_100 = Date::FromDate(100, 1, 1);
+	return result >= first_day_of_year_100 || !result.IsFinite() ||
+	       FourDigitYearReads(LogicalTypeId::DATE, format, input, error_message);
+}
+
+bool DateFormatMap::CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input,
+                                   timestamp_t &result, optional_ptr<string> error_message) const {
+	if (format) {
+		if (error_message ? !format->TryParseTimestamp(input, result, *error_message)
+		                  : !format->TryParseTimestamp(input.GetData(), input.GetSize(), result)) {
+			return false;
+		}
+	} else {
+		bool has_offset = false;
+		string_t tz(nullptr, 0);
+		if (Timestamp::TryConvertTimestampTZ(input.GetData(), input.GetSize(), result, false, has_offset, tz) !=
+		    TimestampCastResult::SUCCESS) {
+			if (error_message) {
+				*error_message = Timestamp::FormatError(input);
+			}
+			return false;
+		}
+		// The cast to TIMESTAMP drops a zone, so values with one are TIMESTAMPTZ or text
+		if (tz.GetSize() != 0 || (has_offset && TimestampStringHasUtcOffset(input))) {
+			if (error_message) {
+				*error_message = StringUtil::Format(
+				    "\"%s\" has a time zone, which the plain cast to TIMESTAMP does not read", input.GetString());
+			}
+			return false;
+		}
+	}
+	static const auto first_instant_of_year_100 = Timestamp::FromDatetime(Date::FromDate(100, 1, 1), dtime_t(0));
+	return result >= first_instant_of_year_100 || !result.IsFinite() ||
+	       FourDigitYearReads(LogicalTypeId::TIMESTAMP, format, input, error_message);
+}
+
 void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &string_vector,
                                                 MutableDateFormatMap &date_format_map,
                                                 const bool user_specified_timestamp_format) {
@@ -372,6 +505,15 @@ void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &s
 			return;
 		}
 	}
+
+	// A type that takes over from a preferred one must read the vectors that one read
+	candidate_types.erase(std::remove_if(candidate_types.begin(), candidate_types.end(),
+	                                     [&](const LogicalTypeId type) {
+		                                     return date_format_map.HasFormats(type) &&
+		                                            !EliminateCandidateFormats(vec_count, string_vector, type,
+		                                                                       date_format_map);
+	                                     }),
+	                      candidate_types.end());
 
 	while (true) {
 		if (candidate_types.empty()) {
@@ -398,11 +540,7 @@ void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &s
 				return;
 			}
 		} else if (date_format_map.HasFormats(type)) {
-			if (EliminateCandidateFormats(vec_count, string_vector, result_vector, date_format_map)) {
-				return;
-			} else {
-				candidate_types.pop_back();
-			}
+			return; // It stayed in candidate_types above only by reading this vector
 		} else {
 			string error_message;
 			if (!VectorOperations::DefaultTryCast(string_vector, result_vector, vec_count, &error_message, true)) {
@@ -414,61 +552,62 @@ void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &s
 	}
 }
 
-template <class OP, class T>
-bool TryParse(const Vector &string_vector, StrpTimeFormat &format, const idx_t count) {
+template <class T>
+static bool ReadsEveryValue(const DateFormatMap &formats, optional_ptr<const StrpTimeFormat> format,
+                            const Vector &string_vector, const idx_t count) {
 	const auto strings = FlatVector::GetData<string_t>(string_vector);
 	const auto &validity = FlatVector::Validity(string_vector);
-
 	T result;
-	string error_message;
-	if (validity.CannotHaveNull()) {
-		for (idx_t i = 0; i < count; i++) {
-			if (!OP::template Operation<T>(format, strings[i], result, error_message)) {
-				return false;
-			}
-		}
-	} else {
-		for (idx_t i = 0; i < count; i++) {
-			if (validity.RowIsValid(i)) {
-				if (!OP::template Operation<T>(format, strings[i], result, error_message)) {
-					return false;
-				}
-			}
+	for (idx_t i = 0; i < count; i++) {
+		if (validity.RowIsValid(i) && !formats.CandidateReads(format, strings[i], result, nullptr)) {
+			return false;
 		}
 	}
 	return true;
 }
 
+static bool ReadsEveryValue(const DateFormatMap &formats, const LogicalTypeId type, const optional_idx format_index,
+                            const Vector &string_vector, const idx_t count) {
+	const auto format = formats.GetCandidate(type, format_index);
+	switch (type) {
+	case LogicalTypeId::DATE:
+		return ReadsEveryValue<date_t>(formats, format, string_vector, count);
+	case LogicalTypeId::TIMESTAMP:
+		return ReadsEveryValue<timestamp_t>(formats, format, string_vector, count);
+	default:
+		throw InternalException("No date/timestamp formats for %s", EnumUtil::ToString(type));
+	}
+}
+
 bool JSONStructureNode::EliminateCandidateFormats(const idx_t vec_count, Vector &string_vector,
-                                                  const Vector &result_vector, MutableDateFormatMap &date_format_map) {
+                                                  const LogicalTypeId type, MutableDateFormatMap &date_format_map) {
 	D_ASSERT(descriptions.size() == 1 && descriptions[0].type == LogicalTypeId::VARCHAR);
 
-	const auto type = result_vector.GetType().id();
-	auto i = date_format_map.NumberOfFormats(type);
-	for (; i != 0; i--) {
-		StrpTimeFormat format;
-		if (!date_format_map.GetFormatAtIndex(type, i - 1, format)) {
-			continue;
+	auto &format_candidates = descriptions[0].format_candidates;
+	auto entry = format_candidates.find(type);
+	if (entry == format_candidates.end()) {
+		JSONFormatCandidates all;
+		for (idx_t format_idx = 0; format_idx < date_format_map.NumberOfFormats(type); format_idx++) {
+			all.formats.push_back(format_idx);
 		}
+		all.cast = date_format_map.CastIsCandidate(type);
+		entry = format_candidates.emplace(type, std::move(all)).first;
+	}
 
-		bool success;
-		switch (type) {
-		case LogicalTypeId::DATE:
-			success = TryParse<TryParseDate, date_t>(string_vector, format, vec_count);
-			break;
-		case LogicalTypeId::TIMESTAMP:
-			success = TryParse<TryParseTimeStamp, timestamp_t>(string_vector, format, vec_count);
-			break;
-		default:
-			throw InternalException("No date/timestamp formats for %s", EnumUtil::ToString(type));
-		}
-
-		if (success) {
-			return true;
+	const auto &formats = date_format_map.GetDateFormatMap();
+	JSONFormatCandidates remaining;
+	remaining.cast = entry->second.cast && ReadsEveryValue(formats, type, optional_idx(), string_vector, vec_count);
+	for (const auto format_idx : entry->second.formats) {
+		if (ReadsEveryValue(formats, type, format_idx, string_vector, vec_count)) {
+			remaining.formats.push_back(format_idx);
 		}
 	}
 
-	return false;
+	if (remaining.Empty()) {
+		return false;
+	}
+	entry->second = std::move(remaining);
+	return true;
 }
 
 JSONStructureDescription::JSONStructureDescription(const LogicalTypeId type_p, const bool case_insensitive_keys)
@@ -481,6 +620,7 @@ static void SwapJSONStructureDescription(JSONStructureDescription &a, JSONStruct
 	std::swap(a.key_map, b.key_map);
 	std::swap(a.children, b.children);
 	std::swap(a.candidate_types, b.candidate_types);
+	std::swap(a.format_candidates, b.format_candidates);
 	std::swap(a.has_large_ubigint, b.has_large_ubigint);
 	std::swap(a.timestamp_offset_state, b.timestamp_offset_state);
 }
@@ -636,6 +776,28 @@ static void MergeNodeObject(JSONStructureNode &merged, const JSONStructureDescri
 	}
 }
 
+//! Keeps the formats of type that parse the values of both descriptions, false if there are none
+static bool IntersectFormatCandidates(JSONStructureDescription &merged_desc, const JSONStructureDescription &child_desc,
+                                      const LogicalTypeId type) {
+	const auto child_entry = child_desc.format_candidates.find(type);
+	if (child_entry == child_desc.format_candidates.end()) {
+		return true;
+	}
+	auto merged_entry = merged_desc.format_candidates.find(type);
+	if (merged_entry == merged_desc.format_candidates.end()) {
+		merged_desc.format_candidates.emplace(type, child_entry->second);
+		return true;
+	}
+	auto &merged_candidates = merged_entry->second;
+	const auto &child_candidates = child_entry->second;
+	vector<idx_t> both;
+	std::set_intersection(merged_candidates.formats.begin(), merged_candidates.formats.end(),
+	                      child_candidates.formats.begin(), child_candidates.formats.end(), std::back_inserter(both));
+	merged_candidates.formats = std::move(both);
+	merged_candidates.cast = merged_candidates.cast && child_candidates.cast;
+	return !merged_candidates.Empty();
+}
+
 static void MergeNodeVal(JSONStructureNode &merged, const JSONStructureDescription &child_desc,
                          const bool node_initialized) {
 	D_ASSERT(child_desc.type != LogicalTypeId::LIST && child_desc.type != LogicalTypeId::STRUCT);
@@ -656,10 +818,14 @@ static void MergeNodeVal(JSONStructureNode &merged, const JSONStructureDescripti
 	}
 	if (!merged.initialized) {
 		merged_desc.candidate_types = child_desc.candidate_types;
+		merged_desc.format_candidates = child_desc.format_candidates;
 	} else if (merged_desc.candidate_types.empty() != child_desc.candidate_types.empty() // both empty or neither empty
 	           || (!merged_desc.candidate_types.empty() &&
 	               merged_desc.candidate_types.back() != child_desc.candidate_types.back())) { // non-empty: check type
 		merged_desc.candidate_types.clear(); // Not the same, default to VARCHAR
+	} else if (!merged_desc.candidate_types.empty() &&
+	           !IntersectFormatCandidates(merged_desc, child_desc, merged_desc.candidate_types.back())) {
+		merged_desc.candidate_types.clear(); // No format parses the values of both, default to VARCHAR
 	}
 
 	merged.initialized = true;
@@ -788,15 +954,20 @@ static bool IsStructureInconsistent(const JSONStructureDescription &desc, const 
 	return avg_occurrence < field_appearance_threshold;
 }
 
+//! All values of the object node as one node, the way a MAP reads them
+static JSONStructureNode MergeChildren(const JSONStructureNode &node) {
+	auto merged = JSONStructureNode::EmptyLike(node);
+	for (const auto &child : node.descriptions[0].children) {
+		JSONStructure::MergeNodes(merged, child);
+	}
+	return merged;
+}
+
 static LogicalType GetMergedType(ClientContext &context, const JSONStructureNode &node, const idx_t max_depth,
                                  const double field_appearance_threshold, const idx_t map_inference_threshold,
                                  const idx_t depth, const LogicalType &null_type) {
 	D_ASSERT(node.descriptions.size() == 1);
-	auto &desc = node.descriptions[0];
-	auto merged = JSONStructureNode::EmptyLike(node);
-	for (const auto &child : desc.children) {
-		JSONStructure::MergeNodes(merged, child);
-	}
+	const auto merged = MergeChildren(node);
 	return JSONStructure::StructureToType(context, merged, max_depth, field_appearance_threshold,
 	                                      map_inference_threshold, depth + 1, null_type);
 }
@@ -879,6 +1050,55 @@ static LogicalType StructureToTypeString(const JSONStructureNode &node) {
 		return LogicalTypeId::VARCHAR;
 	}
 	return desc.candidate_types.back();
+}
+
+JSONColumnFormats JSONStructure::StructureToFormats(const JSONStructureNode &node, const LogicalType &type) {
+	JSONColumnFormats result;
+	if (node.descriptions.size() != 1) {
+		return result;
+	}
+	const auto &desc = node.descriptions[0];
+	switch (type.id()) {
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP: {
+		if (desc.type != LogicalTypeId::VARCHAR || desc.candidate_types.empty() ||
+		    desc.candidate_types.back() != type.id()) {
+			break;
+		}
+		// The cast and a format both read only the special values, and alike, so their order changes no value
+		const auto entry = desc.format_candidates.find(type.id());
+		if (entry != desc.format_candidates.end()) {
+			if (entry->second.cast) {
+				result.cast = true;
+			} else if (!entry->second.formats.empty()) {
+				result.format_index = entry->second.formats.back();
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::STRUCT:
+		if (desc.type != LogicalTypeId::STRUCT) {
+			break;
+		}
+		for (const auto &child_type : StructType::GetChildTypes(type)) {
+			const auto field = node.GetField(child_type.first.GetIdentifierName());
+			result.children.push_back(field ? StructureToFormats(*field, child_type.second) : JSONColumnFormats());
+		}
+		break;
+	case LogicalTypeId::MAP:
+		if (desc.type == LogicalTypeId::STRUCT) {
+			result.children.push_back(StructureToFormats(MergeChildren(node), MapType::ValueType(type)));
+		}
+		break;
+	case LogicalTypeId::LIST:
+		if (desc.type == LogicalTypeId::LIST) {
+			result.children.push_back(StructureToFormats(desc.children[0], ListType::GetChildType(type)));
+		}
+		break;
+	default:
+		break;
+	}
+	return result;
 }
 
 LogicalType JSONStructure::StructureToType(ClientContext &context, const JSONStructureNode &node, const idx_t max_depth,
