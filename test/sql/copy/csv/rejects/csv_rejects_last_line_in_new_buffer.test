@@ -295,7 +295,7 @@ DROP TABLE reject_errors;
 statement ok
 DROP TABLE reject_scans;
 
-# a relaxed read accepts the open quote and keeps the value
+# a relaxed read accepts the open quote and keeps ab, as with the default buffer
 query I
 SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote.csv', columns={'c': 'VARCHAR'},
     auto_detect=false, buffer_size=6, strict_mode=false);
@@ -351,7 +351,7 @@ DROP TABLE reject_errors;
 statement ok
 DROP TABLE reject_scans;
 
-# text after the closing quote of a last value that starts the last buffer or runs into it
+# a last value that starts the last buffer or runs into it, with text after its closing quote in that buffer
 query I
 SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/after_quote.csv', columns={'c': 'VARCHAR'}, auto_detect=false,
     buffer_size=6, store_rejects=true);

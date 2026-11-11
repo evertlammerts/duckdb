@@ -219,10 +219,7 @@ bool StringValueResult::UnsetComment(StringValueResult &result, idx_t buffer_pos
 	} else {
 		result.last_position.buffer_pos = buffer_pos + 2;
 	}
-	LinePosition current_line_start = {result.iterator.pos.buffer_idx, result.iterator.pos.buffer_pos,
-	                                   result.buffer_size};
-	result.current_line_position.begin = result.current_line_position.end;
-	result.current_line_position.end = current_line_start;
+	result.AdvanceLinePosition();
 	result.cur_col_id = 0;
 	result.chunk_col_id = 0;
 	return done;
@@ -699,6 +696,10 @@ void StringValueResult::HandleUnicodeError(idx_t col_idx, LinePosition &error_po
 }
 
 bool LineError::HandleErrors(StringValueResult &result) {
+	// every row comes here, so a row without an error leaves before the error path, whose line printing is large
+	if (!is_error_in_line) {
+		return false;
+	}
 	bool skip_sniffing = false;
 	for (auto &cur_error : current_errors) {
 		if (cur_error.type == CSVErrorType::INVALID_ENCODING) {
@@ -855,16 +856,18 @@ void StringValueResult::InvalidateUnwrittenColumns(idx_t first_unwritten_col) {
 	}
 }
 
-LinePosition StringValueResult::CurrentLineEnd() const {
+inline idx_t StringValueResult::AdvanceLinePosition() {
 	// the iterator can sit one past the data of a last line, a position the parallel validator relies on
-	return {iterator.pos.buffer_idx, MinValue(iterator.pos.buffer_pos, buffer_size), buffer_size};
+	const LinePosition line_end = {iterator.pos.buffer_idx, MinValue(iterator.pos.buffer_pos, buffer_size),
+	                               buffer_size};
+	const idx_t line_size = line_end - current_line_position.end;
+	current_line_position.begin = current_line_position.end;
+	current_line_position.end = line_end;
+	return line_size;
 }
 
 bool StringValueResult::AddRowInternal() {
-	LinePosition current_line_start = CurrentLineEnd();
-	idx_t current_line_size = current_line_start - current_line_position.end;
-	current_line_position.begin = current_line_position.end;
-	current_line_position.end = current_line_start;
+	const idx_t current_line_size = AdvanceLinePosition();
 	if (current_line_size > state_machine.options.maximum_line_size.GetValue()) {
 		current_errors.Insert(MAXIMUM_LINE_SIZE, 1, chunk_col_id, last_position, current_line_size);
 	}
@@ -1706,8 +1709,7 @@ StringValueScanner::MoveBufferResult StringValueScanner::TryMoveToNextBuffer() {
 	// This means we reached the end of the file, we must add a last line if there is any to be added
 	if (states.IsQuotedCurrent() && strict_mode) {
 		// tested before added_last_line, which ProcessOverBufferValue also sets for an unterminated last value
-		result.current_line_position.begin = result.current_line_position.end;
-		result.current_line_position.end = result.CurrentLineEnd();
+		result.AdvanceLinePosition();
 		if (result.added_last_line) {
 			// ProcessOverBufferValue did not add the unterminated value and cleared result.quoted
 			result.current_errors.Insert(UNTERMINATED_QUOTES, result.cur_col_id, result.chunk_col_id,
@@ -1718,8 +1720,7 @@ StringValueScanner::MoveBufferResult StringValueScanner::TryMoveToNextBuffer() {
 	} else if (states.EmptyLine() || states.NewRow() || result.added_last_line || states.IsCurrentNewRow() ||
 	           states.IsNotSet()) {
 		if (result.IsStateCurrent(CSVState::INVALID)) {
-			result.current_line_position.begin = result.current_line_position.end;
-			result.current_line_position.end = result.CurrentLineEnd();
+			result.AdvanceLinePosition();
 		} else if (result.cur_col_id >= result.number_of_columns) {
 			result.AddRowInternal();
 			lines_read++;
@@ -2057,8 +2058,7 @@ void StringValueScanner::FinishBoundaryScan(const bool moved) {
 				// ProcessOverBufferValue added the open value before the end of the file was known
 				col_idx = result.open_quote_col_id.GetIndex();
 				error_position = result.open_quote_start;
-				result.current_line_position.begin = result.current_line_position.end;
-				result.current_line_position.end = result.CurrentLineEnd();
+				result.AdvanceLinePosition();
 			}
 			// an unterminated quote joins the errors the line already has, so that the line takes one row
 			result.current_errors.Insert(UNTERMINATED_QUOTES, col_idx, result.chunk_col_id, error_position);

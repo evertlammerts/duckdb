@@ -283,8 +283,9 @@ public:
 	//! Handles EmptyLine states
 	static inline bool EmptyLine(StringValueResult &result, const idx_t buffer_pos);
 	inline bool AddRowInternal();
-	//! Where the current line ends, at the iterator but never past the buffer's data
-	LinePosition CurrentLineEnd() const;
+	//! Makes the current line the one from the end of the previous line to the iterator, never past the buffer's data,
+	//! and returns its size
+	inline idx_t AdvanceLinePosition();
 	//! Marks the columns of a borked row that were never written as NULL
 	void InvalidateUnwrittenColumns(idx_t first_unwritten_col);
 	//! Force the throw of a Unicode error
