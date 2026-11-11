@@ -5,7 +5,7 @@ import re
 import subprocess
 
 import pytest
-from conftest import ShellTest
+from conftest import ShellTest, assert_loaded
 
 
 def test_basic(shell):
@@ -201,6 +201,20 @@ def test_explicit_bail_within_init(shell, generated_file):
     result = test.run()
     result.check_stderr("selec")
     assert "reached here" in str(result.stdout)
+
+@pytest.mark.parametrize('generated_file', [
+    "SET memory_limit = '4GB';\nSET threads = 4;\nSET autoload_known_extensions = false;\n"
+    "SET TimeZone = 'america/los_angeles';\n"
+], indirect=True)
+def test_init_sets_a_linked_extension_setting_without_autoload(shell, generated_file):
+    assert_loaded(shell, "icu")
+    test = (
+        ShellTest(shell, ['-unsigned', '-init', generated_file.as_posix()])
+        .statement("SELECT current_setting('TimeZone') || '|' || current_setting('autoload_known_extensions')")
+    )
+
+    result = test.run()
+    result.check_stdout("America/Los_Angeles|false")
 
 @pytest.mark.parametrize('generated_file', ["selec 42;\nselect 'reached here'"], indirect=True)
 def test_explicit_bail_within_read(shell, generated_file):

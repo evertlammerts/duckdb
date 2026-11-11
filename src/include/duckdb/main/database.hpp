@@ -106,11 +106,19 @@ private:
 	//! Initializes the instance without attaching a database: the system catalog is the only catalog until one is
 	//! attached (ATTACH, or DatabaseManager::AttachDatabase).
 	void InitializeEmpty(DBConfig *config);
-	//! The part of initialization shared by both, up to the main database.
-	void InitializeInstance(const char *path, DBConfig *config);
-	//! Launches the scheduler threads; last, since storage init races on the catalog otherwise.
+	//! The part of initialization shared by both, up to the main database. Returns the startup settings that wait for
+	//! the linked extensions.
+	identifier_map_t<Value> InitializeInstance(const char *path, DBConfig *config);
+	//! Launches the scheduler threads; after the main database is attached, since storage init races on the catalog
+	//! otherwise.
 	void StartScheduler();
-	void LoadExtensionSettings();
+	//! Applies startup settings through the SET path, autoloading their owner where allowed, and throws for the ones
+	//! nothing provides. A setting owned by a linked extension that is not loaded yet is never autoloaded while
+	//! load_extensions is on; it is returned, to be applied once its owner loads.
+	identifier_map_t<Value> LoadExtensionSettings(const identifier_map_t<Value> &startup_options);
+	//! Loads the linked extensions after the main database, if any, is attached, so their load can run SQL against it,
+	//! and applies each startup setting they own once its owner has loaded.
+	void LoadLinkedExtensions(identifier_map_t<Value> waiting_options);
 	void CreateMainDatabase();
 
 	void Configure(DBConfig &config, const char *path);

@@ -260,47 +260,61 @@ static void ThrowExtensionSetUnrecognizedOptions(const identifier_map_t<Value> &
 	throw InvalidInputException("The following options were not recognized: " + concatenated);
 }
 
-void DatabaseInstance::LoadExtensionSettings() {
-	// copy the map, to protect against modifications during
-	auto unrecognized_options_copy = config.options.unrecognized_options;
-
-	if (Settings::Get<AutoloadKnownExtensionsSetting>(*this)) {
-		if (unrecognized_options_copy.empty()) {
-			// Nothing to do
-			return;
-		}
-
+identifier_map_t<Value> DatabaseInstance::LoadExtensionSettings(const identifier_map_t<Value> &startup_options) {
+	identifier_map_t<Value> waiting;
+	if (!startup_options.empty()) {
+		const bool autoload = Settings::Get<AutoloadKnownExtensionsSetting>(*this);
 		Connection con(*this);
 		con.BeginTransaction();
 
-		for (auto &option : unrecognized_options_copy) {
+		for (auto &option : startup_options) {
 			auto &name = option.first;
 			auto &value = option.second;
 
-			auto extension_name = ExtensionHelper::FindExtensionInEntries(name, EXTENSION_SETTINGS);
-			if (extension_name.empty()) {
-				continue;
-			}
-			if (!ExtensionHelper::TryAutoLoadExtension(*this, extension_name)) {
-				throw InvalidInputException(
-				    "To set the %s setting, the %s extension needs to be loaded. But it could not be autoloaded.", name,
-				    extension_name);
-			}
 			ExtensionOption extension_option;
 			if (!config.TryGetExtensionOption(name, extension_option)) {
-				throw InternalException("Extension %s did not provide the %s config setting", extension_name, name);
+				auto extension_name = ExtensionHelper::FindExtensionInEntries(name, EXTENSION_SETTINGS);
+				if (extension_name.empty()) {
+					continue;
+				}
+				if (config.options.load_extensions && ExtensionHelper::IsLinkedExtension(*this, extension_name)) {
+					waiting.insert(option);
+					continue;
+				}
+				if (!autoload) {
+					continue;
+				}
+				if (!ExtensionHelper::TryAutoLoadExtension(*this, extension_name)) {
+					throw InvalidInputException(
+					    "To set the %s setting, the %s extension needs to be loaded. But it could not be autoloaded.",
+					    name, extension_name);
+				}
+				if (!config.TryGetExtensionOption(name, extension_option)) {
+					throw InternalException("Extension %s did not provide the %s config setting", extension_name, name);
+				}
 			}
 			// if the extension provided the option, it should no longer be unrecognized.
 			D_ASSERT(config.options.unrecognized_options.find(name) == config.options.unrecognized_options.end());
-			auto &context = *con.context;
-			PhysicalSet::SetExtensionVariable(context, name, extension_option, SetScope::GLOBAL, value);
+			// an extension adopts a pending startup value uncast when it registers the option
+			try {
+				PhysicalSet::SetExtensionVariable(*con.context, name, extension_option, SetScope::GLOBAL, value);
+			} catch (std::exception &ex) {
+				ErrorData(ex).Throw(StringUtil::Format("Could not set option %s at startup: ", name));
+			}
 		}
 
 		con.Commit();
 	}
-	if (!config.options.unrecognized_options.empty()) {
-		ThrowExtensionSetUnrecognizedOptions(config.options.unrecognized_options);
+	identifier_map_t<Value> unrecognized;
+	for (auto &option : startup_options) {
+		if (config.options.unrecognized_options.count(option.first) && !waiting.count(option.first)) {
+			unrecognized.insert(option);
+		}
 	}
+	if (!unrecognized.empty()) {
+		ThrowExtensionSetUnrecognizedOptions(unrecognized);
+	}
+	return waiting;
 }
 
 static duckdb_ext_api_v1 CreateAPIv1Wrapper() {
@@ -308,7 +322,7 @@ static duckdb_ext_api_v1 CreateAPIv1Wrapper() {
 }
 
 void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_config) {
-	InitializeInstance(database_path, user_config);
+	auto waiting_options = InitializeInstance(database_path, user_config);
 	if (!db_manager->HasAttachedDatabase()) {
 		CreateMainDatabase();
 	}
@@ -324,11 +338,28 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	}
 	db_manager->SetDefaultDatabase(main_database->GetName());
 	StartScheduler();
+	LoadLinkedExtensions(waiting_options);
 }
 
 void DatabaseInstance::InitializeEmpty(DBConfig *user_config) {
-	InitializeInstance(nullptr, user_config);
+	auto waiting_options = InitializeInstance(nullptr, user_config);
 	StartScheduler();
+	LoadLinkedExtensions(waiting_options);
+}
+
+void DatabaseInstance::LoadLinkedExtensions(identifier_map_t<Value> waiting_options) {
+	if (config.options.load_extensions) {
+		DuckDB db_wrapper(*this);
+		// applied as soon as the owner has loaded, so the extensions that load after it see the validated value
+		ExtensionHelper::LoadAllExtensions(db_wrapper, [&]() {
+			if (!waiting_options.empty()) {
+				waiting_options = LoadExtensionSettings(waiting_options);
+			}
+		});
+	}
+	if (!waiting_options.empty()) {
+		ThrowExtensionSetUnrecognizedOptions(waiting_options);
+	}
 }
 
 void DatabaseInstance::StartScheduler() {
@@ -337,7 +368,7 @@ void DatabaseInstance::StartScheduler() {
 	scheduler->RelaunchThreads();
 }
 
-void DatabaseInstance::InitializeInstance(const char *database_path, DBConfig *user_config) {
+identifier_map_t<Value> DatabaseInstance::InitializeInstance(const char *database_path, DBConfig *user_config) {
 	DBConfig default_config;
 	DBConfig *config_ptr = &default_config;
 	if (user_config) {
@@ -345,6 +376,7 @@ void DatabaseInstance::InitializeInstance(const char *database_path, DBConfig *u
 	}
 
 	Configure(*config_ptr, database_path);
+	auto startup_options = config.options.unrecognized_options;
 	// publish what this binary links, unless the config already carries a set handed to us
 	ExtensionHelper::RegisterLinkedExtensions(config);
 	for (auto &linked : config.linked_extensions) {
@@ -403,14 +435,11 @@ void DatabaseInstance::InitializeInstance(const char *database_path, DBConfig *u
 		}
 	}
 
-	LoadExtensionSettings();
+	return LoadExtensionSettings(startup_options);
 }
 
 DuckDB::DuckDB(const char *path, DBConfig *new_config) : instance(make_shared_ptr<DatabaseInstance>()) {
 	instance->Initialize(path, new_config);
-	if (instance->config.options.load_extensions) {
-		ExtensionHelper::LoadAllExtensions(*this);
-	}
 	instance->db_manager->FinalizeStartup();
 }
 
@@ -420,11 +449,7 @@ DuckDB::DuckDB(const string &path, DBConfig *config) : DuckDB(path.c_str(), conf
 shared_ptr<DuckDB> DuckDB::CreateEmpty(DBConfig *config) {
 	auto instance = make_shared_ptr<DatabaseInstance>();
 	instance->InitializeEmpty(config);
-	auto db = make_shared_ptr<DuckDB>(*instance);
-	if (instance->config.options.load_extensions) {
-		ExtensionHelper::LoadAllExtensions(*db);
-	}
-	return db;
+	return make_shared_ptr<DuckDB>(*instance);
 }
 
 DuckDB::DuckDB(DatabaseInstance &instance_p) : instance(instance_p.shared_from_this()) {
