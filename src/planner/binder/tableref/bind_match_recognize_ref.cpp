@@ -175,6 +175,22 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 			return;
 		}
 	}
+	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expr->Cast<FunctionExpression>();
+		auto &path = function.GetQualifiedName().Path();
+		// The parser keeps the receiver of X.c.f() in the function's name. A pattern variable in front of it
+		// qualifies a column as it does anywhere else, so the call is the method call on that column, whose
+		// reference is then resolved below like any other.
+		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) &&
+		    !LambdaExpression::IsLambdaParameter(lambda_parameters, path[0]) &&
+		    !LambdaExpression::IsLambdaParameter(arrow_parameters, path[0])) {
+			unique_ptr<ParsedExpression> receiver =
+			    make_uniq<ColumnRefExpression>(vector<Identifier>(path.begin(), path.end() - 1));
+			receiver->SetQueryLocation(function.GetQueryLocation());
+			function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(receiver));
+			function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+		}
+	}
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
 		auto &names = colref.ColumnNames();
@@ -234,6 +250,18 @@ static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const P
 		if (MatchRecognizeLambdaParameters(expr, parameters)) {
 			inner.push_back(std::move(parameters));
 			auto found = FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner);
+			inner.pop_back();
+			return found;
+		}
+		// an arrow may be a lambda of its own, whose parameters then shadow the enclosing ones
+		if (MatchRecognizeArrowParameters(expr, parameters)) {
+			inner.push_back(std::move(parameters));
+			optional_ptr<const ParsedExpression> found;
+			ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+				if (!found) {
+					found = FindEnclosingLambdaParameter(child, enclosing, inner);
+				}
+			});
 			inner.pop_back();
 			return found;
 		}

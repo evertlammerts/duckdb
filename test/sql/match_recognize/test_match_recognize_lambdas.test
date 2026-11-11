@@ -424,3 +424,93 @@ statement error
 SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'s': 100}], lambda A: PREV(A.s)) AS m PATTERN (A B+) DEFINE B AS true);
 ----
 window functions cannot reference lambda parameters
+
+# A method call behind a pattern variable is a call on the variable's column, which the parser keeps
+# in the function's name: a lambda parameter spelled like the column does not claim it either.
+
+statement ok
+CREATE TABLE u AS SELECT * FROM (VALUES (1, 'W1'), (2, 'W2'), (3, 'W3'), (4, 'W4')) v(i, w);
+
+query I rowsort
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform(['w3'], lambda w: A.w.lower() <> 'w3')));
+----
+1
+2
+
+query I
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform(['w3'], lambda w: B.w.lower() <> 'w3')));
+----
+2
+2
+
+query I
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform(['w9'], lambda w: max(A.w.lower()) < w)));
+----
+4
+
+query III
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['Q'], lambda w: A.w.lower() || w) AS m, list_transform(['Q'], lambda w: max(B.w.lower()) || w) AS n, list_transform(['Q'], lambda q: LAST(B.w.lower()) || q) AS o PATTERN (A B+) DEFINE B AS true);
+----
+[w1Q]	[w4Q]	[w4Q]
+
+# without a lambda, with arguments, and with a field path in front of the call
+query II rowsort
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES A.w.lower() AS m, LAST(B.w.substr(2)) AS n PATTERN (A B+) DEFINE B AS B.w.lower() <> 'w3');
+----
+w1	2
+w3	4
+
+query I
+SELECT * FROM (SELECT i, {'g': {'h': w}} AS st FROM u) MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'g': {'h': 'Z'}}], lambda st: A.st.g.h.lower()) AS m PATTERN (A B+) DEFINE B AS true);
+----
+[w1]
+
+# a lambda parameter spelled like the variable is the one in scope, so the call is on its field
+query I
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'w': 'Z'}], lambda A: A.w.lower()) AS m PATTERN (A B+) DEFINE B AS true);
+----
+[z]
+
+query I
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'w': 'Z'}], lambda A: A.w.lower() = 'z')));
+----
+4
+
+statement error
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'w': 'Z'}], lambda A: max(A.w.lower())) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+# CLASSIFIER() of a name a lambda binds names no pattern variable, inside an aggregate or a navigation too
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(list_transform([0], lambda A: CLASSIFIER(A))[1]) AS c PATTERN (A+) DEFINE A AS true);
+----
+CLASSIFIER() takes a pattern variable
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'s': 1}], lambda B: CLASSIFIER(B)) AS c PATTERN (A B+) DEFINE B AS true);
+----
+CLASSIFIER() takes a pattern variable
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda A: CLASSIFIER(A) = 'A')));
+----
+CLASSIFIER() takes a pattern variable
+
+# an arrow that turns out to be a lambda is a scope of its own inside a step and an aggregate
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+query I rowsort
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda v: PREV(list_sum(list_transform([s], v -> v)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+[10]
+[30]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(list_transform([{'x': 100}], A -> A.x)[1]) AS m PATTERN (A+) DEFINE A AS true);
+----
+400
+
+statement ok
+RESET lambda_syntax

@@ -309,6 +309,15 @@ static void ScopeToVariable(unique_ptr<ParsedExpression> &expr, const MatchRecog
 			lambda_parameters.pop_back();
 			return;
 		}
+		// an arrow may be a lambda too, and then a name it binds is its own rather than a variable's
+		if (MatchRecognizeArrowParameters(*expr, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+				ScopeToVariable(child, symbols, scope, lambda_parameters);
+			});
+			lambda_parameters.pop_back();
+			return;
+		}
 	}
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
@@ -326,6 +335,8 @@ static void ScopeToVariable(unique_ptr<ParsedExpression> &expr, const MatchRecog
 		auto &argument = expr->Cast<FunctionExpression>().GetArguments()[0].GetExpression();
 		if (argument.GetExpressionType() != ExpressionType::COLUMN_REF ||
 		    argument.Cast<ColumnRefExpression>().ColumnNames().size() != 1 ||
+		    LambdaExpression::IsLambdaParameter(lambda_parameters,
+		                                        argument.Cast<ColumnRefExpression>().GetColumnName()) ||
 		    !symbols(argument.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName())) {
 			throw BinderException("CLASSIFIER() takes a pattern variable, or nothing for the match as a whole");
 		}
