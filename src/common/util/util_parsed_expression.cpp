@@ -659,6 +659,13 @@ bool FunctionExpression::Equals(const ParsedExpression &other) const {
 			return false;
 		}
 	}
+	if (is_legacy_function_call != other_p.is_legacy_function_call) {
+		for (auto &argument : arguments) {
+			if (argument.HasName()) {
+				return false;
+			}
+		}
+	}
 	return true;
 }
 
@@ -960,6 +967,13 @@ bool WindowExpression::Equals(const ParsedExpression &other) const {
 	for (idx_t i = 0; i < arguments.size(); i++) {
 		if (!arguments[i].Equals(other_p.arguments[i])) {
 			return false;
+		}
+	}
+	if (is_legacy_function_call != other_p.is_legacy_function_call) {
+		for (auto &argument : arguments) {
+			if (argument.HasName()) {
+				return false;
+			}
 		}
 	}
 	return true;

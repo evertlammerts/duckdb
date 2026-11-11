@@ -304,9 +304,26 @@ def generate_subclass_equals(entry):
         lines.append(f'\tauto &other_p = other.Cast<{class_name}>();')
         for member in comparable:
             lines.extend(generate_member_comparison(member, indent='\t'))
+    if class_name == 'FunctionExpression' or class_name == 'WindowExpression':
+        lines.extend(generate_legacy_function_call_comparison('\t'))
     lines.append('\treturn true;')
     lines.append('}')
     return lines
+
+
+# A legacy call binds its named arguments by position, so the flag matters only when an argument has a name.
+def generate_legacy_function_call_comparison(indent):
+    ii = indent + '\t'
+    iii = indent + '\t\t'
+    return [
+        f'{indent}if (is_legacy_function_call != other_p.is_legacy_function_call) {{',
+        f'{ii}for (auto &argument : arguments) {{',
+        f'{iii}if (argument.HasName()) {{',
+        f'{iii}\treturn false;',
+        f'{iii}}}',
+        f'{ii}}}',
+        f'{indent}}}',
+    ]
 
 
 # ---------------------------------------------------------------------------

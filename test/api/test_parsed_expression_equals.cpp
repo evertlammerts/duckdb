@@ -158,6 +158,15 @@ static const vector<std::pair<string, string>> EQUAL_PAIRS {
     {"* EXCLUDE (a)", "* EXCLUDE (A)"},
     {"t.*", "T.*"},
     {"a AS x", "a AS y"},
+    {"a+1", "a + 1"},
+    {"((a) + (1))", "a + 1"},
+    {"\"a\" + 1", "A + 1"},
+    {"CAST(a AS BIGINT)", "cast(a as BIGINT)"},
+    {"CAST(a AS BIGINT)", "a::BIGINT"},
+    {"NOT a = 1", "NOT (a = 1)"},
+    {"(SELECT s + 1 FROM t)", "(select (s+1) from t)"},
+    {"CAST(a AS STRUCT(x INTEGER))", "CAST(a AS STRUCT(\"x\" INTEGER))"},
+    {"struct_pack(x := a)", "struct_pack(\"x\" := a)"},
 };
 
 TEST_CASE("Parsed expressions that differ in a field are not equal", "[api][parser]") {
@@ -178,6 +187,17 @@ TEST_CASE("Parsed expressions that differ in a field are not equal", "[api][pars
 	}
 }
 
+static unique_ptr<ParsedExpression> Deserialized(const ParsedExpression &expression,
+                                                 const string &storage_version = "latest") {
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	options.storage_compatibility = StorageCompatibility::FromString(storage_version);
+	BinarySerializer::Serialize(expression, stream, options);
+	stream.Rewind();
+	return BinaryDeserializer::Deserialize<ParsedExpression>(stream);
+}
+
 TEST_CASE("Parsed expressions that differ in a field SQL cannot set alone are not equal", "[api][parser]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -188,6 +208,20 @@ TEST_CASE("Parsed expressions that differ in a field SQL cannot set alone are no
 	auto &stored_lambda = stored->Cast<FunctionExpression>().GetArgumentsMutable()[1].GetExpressionMutable();
 	stored_lambda->Cast<LambdaExpression>().GetLambdaSyntaxTypeMutable() = LambdaSyntaxType::SINGLE_ARROW_STORAGE;
 	RequireNotEqual(*lambda, *stored);
+
+	// a call read from storage before v2.0.0 passes its named arguments by position
+	for (auto &sql : {"power(y := 2, x := a)", "first(x := a) OVER ()"}) {
+		INFO(sql);
+		auto call = ParseExpression(con, sql);
+		auto stored_call = Deserialized(*call, "v1.4.0");
+		RequireEqualAndHashAlike(*stored_call, *stored_call->Copy());
+		RequireNotEqual(*call, *stored_call);
+	}
+	for (auto &sql : {"power(a, 2)", "first(a) OVER ()"}) {
+		INFO(sql);
+		auto call = ParseExpression(con, sql);
+		RequireEqualAndHashAlike(*call, *Deserialized(*call, "v1.4.0"));
+	}
 
 	auto quantified = [](bool excluded, bool reluctant, optional_idx min_count, optional_idx max_count) {
 		return make_uniq<QuantifiedExpression>(ConstantExpression::Integer(1), min_count, max_count, excluded,
@@ -221,16 +255,6 @@ TEST_CASE("Parsed expressions that differ in a field SQL cannot set alone are no
 	RequireNotEqual(*alternation(1, 2), *alternation(1, 3));
 }
 
-static unique_ptr<ParsedExpression> Deserialized(const ParsedExpression &expression) {
-	Allocator allocator;
-	MemoryStream stream(allocator);
-	SerializationOptions options;
-	options.storage_compatibility = StorageCompatibility::FromString("latest");
-	BinarySerializer::Serialize(expression, stream, options);
-	stream.Rewind();
-	return BinaryDeserializer::Deserialize<ParsedExpression>(stream);
-}
-
 TEST_CASE("Parsed expressions equal and hash alike their copy, reparsed text and deserialized form", "[api][parser]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -250,4 +274,9 @@ TEST_CASE("Parsed expressions equal and hash alike their copy, reparsed text and
 		RequireEqualAndHashAlike(*expression, *ParseExpression(con, expression->ToString()));
 		RequireEqualAndHashAlike(*expression, *Deserialized(*expression));
 	}
+
+	// the transformer marks a three argument like_escape as an operator, while ToString prints it as a call
+	auto like_escape = ParseExpression(con, "a LIKE b ESCAPE c");
+	RequireEqualAndHashAlike(*like_escape, *like_escape->Copy());
+	RequireEqualAndHashAlike(*like_escape, *Deserialized(*like_escape));
 }

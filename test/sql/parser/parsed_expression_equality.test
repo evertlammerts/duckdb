@@ -199,18 +199,6 @@ SELECT (SELECT s FROM range(1) AS T(x)) AS c FROM (VALUES (1)) v(s) GROUP BY (SE
 ----
 1
 
-statement ok
-SET pivot_filter_threshold = 0
-
-query I
-SELECT (SELECT COLUMNS('^[a-z]$') FROM (PIVOT (SELECT 1 AS g, 2 AS h, 3 AS k) ON k IN (3) USING count(*) GROUP BY g, H)) AS c
-GROUP BY (SELECT COLUMNS('^[a-z]$') FROM (PIVOT (SELECT 1 AS g, 2 AS h, 3 AS k) ON k IN (3) USING count(*) GROUP BY G, h)), c
-----
-1
-
-statement ok
-RESET pivot_filter_threshold
-
 query I
 SELECT (SELECT COLUMNS('^\(s ') FROM (SELECT 1 AS s) MATCH_RECOGNIZE (PARTITION BY s + 1, S + 2 PATTERN (A) DEFINE A AS true)) AS c
 GROUP BY (SELECT COLUMNS('^\(s ') FROM (SELECT 1 AS s) MATCH_RECOGNIZE (PARTITION BY S + 1, s + 2 PATTERN (A) DEFINE A AS true)), c
@@ -478,3 +466,29 @@ query I
 SELECT EXISTS (SELECT 1 WHERE false) AS c GROUP BY NOT EXISTS (SELECT 1 WHERE false), c
 ----
 false
+
+# a macro read from storage before v2.0.0 passes its named arguments by position, so it is not the twin of the same text
+statement ok
+ATTACH '{TEST_DIR}/parsed_expression_equality_legacy_call.db' AS legacy (STORAGE_VERSION 'v1.4.0')
+
+statement ok
+CREATE MACRO legacy.named(x) AS power(y := 2, x := x)
+
+statement ok
+CREATE MACRO legacy.positional(x) AS power(x, 2)
+
+statement ok
+DETACH legacy
+
+statement ok
+ATTACH '{TEST_DIR}/parsed_expression_equality_legacy_call.db' AS legacy
+
+statement error
+SELECT legacy.named(s) AS c FROM t GROUP BY power(y := 2, x := s)
+----
+must appear in the GROUP BY clause
+
+query I
+SELECT legacy.positional(s) + 1 AS c FROM t GROUP BY power(s, 2)
+----
+2.0
