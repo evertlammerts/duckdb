@@ -1167,7 +1167,7 @@ void ClientContext::InterruptCheck() const {
 	if (IsInterrupted()) {
 		throw InterruptException();
 	}
-	// Only check timeout every N calls to avoid expensive steady_clock::now() syscall
+	// Operator loops call this per row or vector, where a clock read on every call would show in their run time.
 	if (HasQueryDeadline() && ++timeout_check_counter % TIMEOUT_CHECK_INTERVAL == 0) {
 		BlockingInterruptCheck();
 	}

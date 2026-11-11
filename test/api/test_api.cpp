@@ -1114,6 +1114,48 @@ TEST_CASE("Test ClientInterruptState suppresses interrupts after irreversible op
 	}
 }
 
+TEST_CASE("Test a COMMIT whose deadline passes while it commits is reported as committed", "[api]") {
+	struct DeadlinePassesAtCommit : public ClientContextState {
+		void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
+			context.query_deadline = 1;
+		}
+	};
+
+	DuckDB db;
+	Connection con(db);
+	auto &context = *con.context;
+	// with one thread the COMMIT runs on this thread, so it meets the InterruptCheck counter placed below
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE committed (i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO committed VALUES (42)"));
+
+	// leave the counter one call short of a clock read, so the first counted check after the commit reads the clock
+	context.query_deadline = 1;
+	bool counter_at_read = false;
+	for (idx_t i = 0; i < 256 && !counter_at_read; i++) {
+		try {
+			context.InterruptCheck();
+		} catch (InterruptException &) {
+			counter_at_read = true;
+		}
+	}
+	REQUIRE(counter_at_read);
+	context.query_deadline = NumericLimits<idx_t>::Maximum();
+	for (idx_t i = 0; i < 255; i++) {
+		context.InterruptCheck();
+	}
+	context.query_deadline.SetInvalid();
+
+	context.Services().GetRegisteredState().Insert("deadline_passes_at_commit",
+	                                               make_shared_ptr<DeadlinePassesAtCommit>());
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+	context.Services().GetRegisteredState().Remove("deadline_passes_at_commit");
+
+	auto result = con.Query("SELECT count(*) FROM committed");
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+}
+
 TEST_CASE("Test internal connections follow the interrupts of their base client", "[api]") {
 	DuckDB db;
 	Connection con(db);
