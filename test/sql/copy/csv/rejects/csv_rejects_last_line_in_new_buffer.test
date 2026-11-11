@@ -305,7 +305,7 @@ SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote.csv'
 3
 ab
 
-# guards the end of file condition: a quoted value open at the end of a middle buffer is not skipped as unterminated
+# a quoted value open at the end of a middle buffer is not the last line, and ignore_errors drops its line
 query II
 SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/quote_past_buffer.csv', columns={'a': 'INTEGER', 'b': 'VARCHAR'},
     auto_detect=false, buffer_size=4, parallel=false, ignore_errors=true);
@@ -350,6 +350,51 @@ DROP TABLE reject_errors;
 
 statement ok
 DROP TABLE reject_scans;
+
+# text after the closing quote of a last value that starts the last buffer or runs into it
+query I
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/after_quote.csv', columns={'c': 'VARCHAR'}, auto_detect=false,
+    buffer_size=6, store_rejects=true);
+----
+1
+2
+3
+
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, csv_line FROM reject_errors ORDER BY ALL;
+----
+4	7	7	1	UNQUOTED VALUE	"ab"x
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/after_quote.csv', columns={'c': 'VARCHAR'}, auto_detect=false,
+    buffer_size=8, store_rejects=true);
+----
+1
+2
+3
+
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, csv_line FROM reject_errors ORDER BY ALL;
+----
+4	7	7	1	UNQUOTED VALUE	"ab"x
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+statement error
+SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/after_quote.csv', columns={'c': 'VARCHAR'}, auto_detect=false,
+    buffer_size=6);
+----
+Original Line: "ab"x
 
 # the scanner of the last buffer starts inside the quoted value, and the parallel validator refuses the file
 statement error
@@ -577,11 +622,11 @@ SELECT count(*), sum(c) FROM read_csv('{DATA_DIR}/csv/rejects/last_line/untermin
 ----
 2047	2047
 
-query IIIII
-SELECT line, line_byte_position, byte_position, column_idx, error_type FROM reject_errors ORDER BY ALL;
+query IIIIII
+SELECT line, line_byte_position, byte_position, column_idx, error_type, length(csv_line) FROM reject_errors ORDER BY ALL;
 ----
-2048	4095	4095	1	CAST
-2048	4095	4095	1	UNQUOTED VALUE
+2048	4095	4095	1	CAST	4094
+2048	4095	4095	1	UNQUOTED VALUE	4094
 
 statement ok
 DROP TABLE reject_errors;

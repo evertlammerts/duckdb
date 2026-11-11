@@ -1717,7 +1717,10 @@ StringValueScanner::MoveBufferResult StringValueScanner::TryMoveToNextBuffer() {
 		}
 	} else if (states.EmptyLine() || states.NewRow() || result.added_last_line || states.IsCurrentNewRow() ||
 	           states.IsNotSet()) {
-		if (result.cur_col_id >= result.number_of_columns && !result.IsStateCurrent(CSVState::INVALID)) {
+		if (result.IsStateCurrent(CSVState::INVALID)) {
+			result.current_line_position.begin = result.current_line_position.end;
+			result.current_line_position.end = result.CurrentLineEnd();
+		} else if (result.cur_col_id >= result.number_of_columns) {
 			result.AddRowInternal();
 			lines_read++;
 		}
