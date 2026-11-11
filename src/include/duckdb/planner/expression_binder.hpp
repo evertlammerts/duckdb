@@ -151,7 +151,7 @@ public:
 
 	//! Entry point for qualifying the column references of the expression
 	static void QualifyColumnNames(Binder &binder, unique_ptr<ParsedExpression> &expr,
-	                               optional_ptr<ColumnAliasBinder> alias_binder = nullptr);
+	                               optional_ptr<ColumnAliasBinder> alias_binder = nullptr, bool from_item = false);
 	static void QualifyColumnNames(ExpressionBinder &binder, unique_ptr<ParsedExpression> &expr);
 	static void QualifyColumnNames(HavingBinder &having_binder, unique_ptr<ParsedExpression> &expr);
 
@@ -245,10 +245,12 @@ public:
 
 	//! FIXME: Generalise this for extensibility.
 	//! Recursively replaces macro parameters with the provided input parameters.
-	void ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr, vector<identifier_set_t> &lambda_params);
+	void ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr, vector<identifier_set_t> &lambda_params,
+	                            bool from_item = false);
 	//! Enables special-handling of lambda parameters during macro replacement by tracking them in the lambda_params
 	//! vector.
-	void ReplaceMacroParametersInLambda(FunctionExpression &function, vector<identifier_set_t> &lambda_params);
+	void ReplaceMacroParametersInLambda(FunctionExpression &function, vector<identifier_set_t> &lambda_params,
+	                                    bool from_item);
 
 	static LogicalType GetExpressionReturnType(const Expression &expr);
 
@@ -256,6 +258,8 @@ public:
 
 	//! Returns true if the function name is an alias for the UNNEST function
 	static bool IsUnnestFunction(const Identifier &function_name);
+	//! The argument position at which the function takes a lambda, if it takes one
+	static optional_idx GetLambdaArgumentIndex(ScalarFunctionCatalogEntry &function);
 
 	//! Continues the expression depth of the binder this one binds a nested expression for
 	void ContinueStackDepth(const ExpressionBinder &parent);

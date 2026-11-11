@@ -3,6 +3,7 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/planner/column_qualifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -43,8 +44,9 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 	vector<identifier_set_t> lambda_params;
 
 	auto node = macro_def.Cast<TableMacroFunction>().query_node->Copy();
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    *node, [&](unique_ptr<ParsedExpression> &child) { eb.ReplaceMacroParameters(child, lambda_params); });
+	ColumnQualifier::EnumerateQueryNodeExpressions(*node, [&](unique_ptr<ParsedExpression> &child, bool from_item) {
+		eb.ReplaceMacroParameters(child, lambda_params, from_item);
+	});
 
 	return node;
 }

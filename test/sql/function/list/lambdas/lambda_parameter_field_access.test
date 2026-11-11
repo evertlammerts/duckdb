@@ -1,0 +1,975 @@
+# name: test/sql/function/list/lambdas/lambda_parameter_field_access.test
+# description: A field access on a lambda parameter reads the parameter, not a column of the same name
+# group: [lambdas]
+
+statement ok
+CREATE TABLE t AS SELECT {'d': 99, 'e': {'f': 98}} AS p_, 7 AS d;
+
+query I
+SELECT list_transform([{'d': 1}], lambda p_: p_.d) FROM t
+----
+[1]
+
+query I
+SELECT [p_.d FOR p_ IN [{'d': 1}]] FROM t
+----
+[1]
+
+# the parameter matches in any letter case and when quoted
+
+query III
+SELECT list_transform([{'d': 1}], lambda P_: p_.d),
+       list_transform([{'d': 1}], lambda p_: P_.D),
+       list_transform([{'d': 1}], lambda "p_": "P_"."d")
+FROM t
+----
+[1]	[1]	[1]
+
+query I
+SELECT list_transform([{'e': {'f': 2}}], lambda p_: p_.e.f) FROM t
+----
+[2]
+
+query III
+SELECT list_transform([{'d': 1}], lambda p_: p_['d']),
+       list_transform([{'d': 1}], lambda p_: p_.d),
+       list_transform([{'d': 1}], lambda p_: struct_extract(p_, 'd'))
+FROM t
+----
+[1]	[1]	[1]
+
+query I
+SELECT list_transform([{'d': 1}, NULL, {'d': NULL}], lambda p_: p_.d) FROM t
+----
+[1, NULL, NULL]
+
+query II
+SELECT list_transform([{'d': 'Ab'}], lambda p_: p_.d.lower()), list_transform(['Ab'], lambda p_: p_.upper()) FROM t
+----
+[ab]	[AB]
+
+query I
+SELECT list_transform([{'d': 1}], lambda p_: struct_pack(a := p_.d)) FROM t
+----
+[{'a': 1}]
+
+# a parameter that clashes with no column behaves the same
+query I
+SELECT list_transform([{'d': 1}], lambda q: q.d) FROM t
+----
+[1]
+
+# the inner parameter shadows both the outer parameter and the column
+query I
+SELECT list_transform([{'d': 1}], lambda p_: list_transform([{'d': 2}], lambda p_: p_.d)) FROM t
+----
+[[2]]
+
+query I
+SELECT list_transform([{'d': 1}], lambda p_: list_transform([{'d': 2}], lambda q: p_.d * 10 + q.d)) FROM t
+----
+[[12]]
+
+# a qualified reference whose first part names no parameter is a column
+query II
+SELECT list_transform([{'d': 1}], lambda p_: t.p_.d + p_.d),
+       list_transform([1], lambda d: t.d + d)
+FROM t
+----
+[100]	[8]
+
+query I
+SELECT list_transform([{'d': 1}], lambda q: p_.d + q.d) FROM t
+----
+[100]
+
+query III
+SELECT list_filter([{'d': 1}, {'d': 2}], lambda p_: p_.d > 1),
+       list_reduce([{'d': 1}, {'d': 2}], lambda p_, q: {'d': p_.d + q.d}),
+       list_transform([{'d': 1}, {'d': 2}], lambda p_, i: p_.d * 10 + i)
+FROM t
+----
+[{'d': 2}]	{'d': 3}	[11, 22]
+
+query I
+SELECT list_transform([{'d': 1}], lambda p_: p_.d) FROM t GROUP BY ALL
+----
+[1]
+
+query I
+SELECT count(*) FROM t GROUP BY p_ HAVING list_transform([{'d': 1}], lambda p_: p_.d) = [1]
+----
+1
+
+query I
+SELECT count(*) FROM t HAVING list_transform([{'d': 1}], lambda q: q.d) = [1]
+----
+1
+
+# outside a lambda body the same spelling is still the column
+query I
+SELECT p_.d FROM t ORDER BY list_transform([{'d': 1}], lambda p_: p_.d)
+----
+99
+
+statement ok
+CREATE TABLE u AS SELECT {'d': 99} AS p_;
+
+query II
+SELECT list_transform([{'d': 1}], lambda p_: p_.d), list_transform([{'d': 1}], lambda p_: p_)
+FROM u AS u1 JOIN u AS u2 USING (p_)
+----
+[1]	[{'d': 1}]
+
+query I
+SELECT list_transform([{'d': 1}], lambda p_: p_.d) FROM u AS u1 FULL JOIN u AS u2 USING (p_)
+----
+[1]
+
+query I
+SELECT count(*) FROM u AS u1 JOIN u AS u2 USING (p_) WHERE list_transform([{'d': 1}], lambda p_: p_.d) = [1]
+----
+1
+
+query I
+SELECT count(*) FROM t WHERE list_transform([{'d': 1}], lambda p_: p_.d) = [1]
+----
+1
+
+# the aggregate belongs to the subquery, not to the query with the column of the same name
+statement ok
+INSERT INTO t SELECT * FROM t
+
+query I
+SELECT (SELECT max(list_transform([{'d': 1}], lambda p_: p_.d)[1]) FROM range(3)) FROM t
+----
+1
+1
+
+query I
+SELECT (SELECT count(*) + max(list_transform([{'d': 1}], lambda p_: p_.d)[1]) FROM range(3)) FROM t
+----
+4
+4
+
+query I
+SELECT r FROM t, LATERAL (SELECT max(list_transform([{'d': 1}], lambda p_: p_.d)[1]) AS r FROM range(3))
+----
+1
+1
+
+statement ok
+CREATE MACRO m(p_) AS list_transform([{'d': 1}], lambda p_: p_.d);
+
+query I
+SELECT m({'d': 99})
+----
+[1]
+
+statement ok
+CREATE MACRO m_outer(s) AS list_transform([{'d': 1}], lambda p_: p_.d + s.d);
+
+query I
+SELECT m_outer({'d': 10})
+----
+[11]
+
+statement ok
+CREATE MACRO m_table(p_) AS TABLE SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS r FROM t;
+
+query I
+SELECT DISTINCT r FROM m_table({'d': 99})
+----
+[1]
+
+statement ok
+CREATE MACRO m_column() AS list_transform([{'d': 1}], lambda p_: p_.d);
+
+query I
+SELECT m_column() FROM t
+----
+[1]
+[1]
+
+# a table qualification still takes precedence over a lambda parameter of the same name
+query II
+SELECT list_transform([{'p_': 1}], lambda t: t.p_), list_transform([{'d': 1}], lambda t: t.d) FROM t
+----
+[{'d': 99, 'e': {'f': 98}}]	[7]
+[{'d': 99, 'e': {'f': 98}}]	[7]
+
+query II
+SELECT list_transform([{'q': 1}], lambda t: t.q), list_transform([{'p_': 1}], lambda t: t.p_) FROM t GROUP BY p_
+----
+[1]	[{'d': 99, 'e': {'f': 98}}]
+
+statement ok
+CREATE TABLE v AS SELECT * FROM (VALUES ({'d': 2}, [{'d': 1}], 'a'), ({'d': 1}, [{'d': 2}], 'b')) v(p_, l, n);
+
+query I
+SELECT n FROM v ORDER BY list_transform(l, lambda p_: p_.d)
+----
+a
+b
+
+query II
+SELECT n, row_number() OVER (ORDER BY n) AS rn FROM v QUALIFY list_transform(l, lambda p_: p_.d) = [1]
+----
+a	1
+
+query I
+SELECT {'d': 42} AS z FROM t GROUP BY ALL HAVING list_transform([{'d': 1}], lambda z: z.d) = [1]
+----
+{'d': 42}
+
+query I
+SELECT count(*) FROM t HAVING list_transform([{'d': 1}], lambda p_: p_.d) = [1]
+----
+2
+
+query I
+SELECT count(*) FROM t HAVING list_transform([{'d': 1}], lambda q, d: q.d) = [1]
+----
+2
+
+# a dot call on a parameter in a clause that is not qualified up front
+statement ok
+CREATE TABLE s_ AS SELECT 'zz' AS c;
+
+query I
+SELECT 1 FROM s_ WHERE list_transform(['Ab'], lambda c: c.upper()) = ['AB']
+----
+1
+
+query I
+SELECT count(*) FROM s_ AS a JOIN s_ AS b ON list_transform(['Ab'], lambda c: c.upper()) = ['AB']
+----
+1
+
+statement ok
+UPDATE s_ SET c = list_transform(['Ab'], lambda c: c.upper())[1];
+
+query I
+SELECT c FROM s_
+----
+AB
+
+statement ok
+CREATE TABLE up (k INTEGER PRIMARY KEY, x INTEGER, l INTEGER[]);
+
+statement ok
+INSERT INTO up VALUES (1, 10, NULL);
+
+statement ok
+INSERT INTO up VALUES (1, 20, NULL) ON CONFLICT DO UPDATE SET l = list_transform([{'q': 1}], lambda x: x.q);
+
+query II
+SELECT x, l FROM up
+----
+10	[1]
+
+# a field receiver and an outer parameter as the receiver, in a clause that is not qualified up front
+statement ok
+CREATE TABLE sf AS SELECT {'g': 'Col'} AS c;
+
+query I
+SELECT 1 FROM sf WHERE list_transform([{'g': 'Ab'}], lambda c: c.g.upper()) = ['AB']
+----
+1
+
+query I
+SELECT 1 FROM sf WHERE list_transform([{'g': 'Ab'}], lambda c: upper(c.g)) = ['AB']
+----
+1
+
+query I
+SELECT 1 FROM s_ WHERE list_transform(['Xy'], lambda c: list_transform([1], lambda y: c.lower())) = [['xy']]
+----
+1
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+query II
+SELECT (SELECT count(*) FROM sf WHERE list_transform([{'g': 'Ab'}], c -> c.g.lower()) = ['ab']),
+       (SELECT count(*) FROM sf WHERE list_transform([{'g': 'Ab'}], c -> lower(c.g)) = ['ab'])
+----
+1	1
+
+statement ok
+RESET lambda_syntax;
+
+# a table that provides the receiver wins over a parameter named like it, as for the plain call
+statement ok
+CREATE TABLE sg AS SELECT 'Col' AS g;
+
+query II
+SELECT (SELECT count(*) FROM sg WHERE list_transform([{'g': 'Ab'}], lambda sg: sg.g.upper()) = ['COL']),
+       (SELECT count(*) FROM sg WHERE list_transform([{'g': 'Ab'}], lambda sg: upper(sg.g)) = ['COL'])
+----
+1	1
+
+query II
+SELECT list_transform([{'g': 'Ab'}], lambda sg: sg.g.upper()), list_transform([{'g': 'Ab'}], lambda sg: upper(sg.g))
+FROM sg
+----
+[COL]	[COL]
+
+# a clause that takes no lambda rejects a dot call on a parameter as it rejects the plain call
+statement error
+CREATE TABLE c1 (k VARCHAR CHECK (list_transform([k], lambda x: x.lower()) = [lower(k)]))
+----
+Lambda functions are currently not supported in CHECK constraints
+
+statement error
+CREATE TABLE c1 (k VARCHAR CHECK (list_transform([k], lambda x: lower(x)) = [lower(k)]))
+----
+Lambda functions are currently not supported in CHECK constraints
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1]))
+----
+DEFAULT value cannot contain column names
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform(['Dd'], lambda x: lower(x))[1]))
+----
+DEFAULT value cannot contain column names
+
+statement error
+CREATE MACRO md1(a, b := list_transform(['Dd'], lambda x: x.lower())) AS b
+----
+Default value for parameter "b" cannot contain column names
+
+statement error
+CREATE MACRO md1(a, b := list_transform(['Dd'], lambda x: lower(x))) AS b
+----
+Default value for parameter "b" cannot contain column names
+
+statement error
+CREATE TABLE d1 (i INTEGER, k VARCHAR DEFAULT (list_transform([{'d': 'Dd'}], lambda x: x.d.lower())[1]))
+----
+DEFAULT value cannot contain column names
+
+statement ok
+CREATE TABLE d2 (i INTEGER, k VARCHAR)
+
+statement error
+ALTER TABLE d2 ALTER COLUMN k SET DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1])
+----
+DEFAULT value cannot contain column names
+
+statement error
+ALTER TABLE d2 ADD COLUMN j VARCHAR DEFAULT (list_transform(['Dd'], lambda x: x.lower())[1])
+----
+DEFAULT value cannot contain column names
+
+statement ok
+CREATE TABLE pv AS SELECT 'Ab' AS k, 1 AS v
+
+statement error
+PIVOT pv ON k IN (list_transform(['Ab'], lambda x: x.lower())[1]) USING sum(v)
+----
+PIVOT IN list cannot contain column names
+
+statement error
+PIVOT pv ON k IN (list_transform(['Ab'], lambda x: lower(x))[1]) USING sum(v)
+----
+PIVOT IN list cannot contain column names
+
+# a macro parameter's field read inside a lambda whose parameter is named like that field
+statement ok
+CREATE MACRO m_field(s) AS list_transform([1], lambda d: s.d + d);
+
+query I
+SELECT m_field({'d': 10})
+----
+[11]
+
+# a lambda parameter is read in its own scope, so a reference to it never reaches an enclosing query
+query I
+SELECT (SELECT max(list_transform([{'d': 1}], lambda p_: p_.d)[1]) FROM range(1)) FROM v
+----
+1
+1
+
+query I
+SELECT (SELECT max(list_transform([{'q': 1}], lambda v: v.q)[1]) FROM range(1)) FROM v
+----
+1
+1
+
+# a reference that names a table of an enclosing query, with no parameter of that name, still reaches it,
+# so the aggregate belongs to that query and returns one row
+query I
+SELECT (SELECT max(list_transform([{'d': 1}], lambda q: v.p_.d + q.d)[1]) FROM range(1)) FROM v
+----
+3
+
+# a parameter also beats a reference that names a whole table, which would otherwise pack its columns
+statement ok
+CREATE SCHEMA sch;
+
+statement ok
+CREATE TABLE sch.tbl AS SELECT 5 AS x;
+
+query I
+SELECT list_transform([{'tbl': 1}], lambda sch: sch.tbl) FROM sch.tbl
+----
+[1]
+
+# the field access resolves to the parameter even when the column name is ambiguous
+query I
+SELECT list_transform([{'d': 1}], lambda p_: p_.d) FROM u AS u1, u AS u2
+----
+[1]
+
+# a parameter named like a table alias whose table has the field's name as a column: the table provides the
+# reference, so it is that column, under the GROUP BY rules of any column
+statement ok
+CREATE TABLE t2 AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30)) v(a, b);
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT count(*) FROM t2 AS z HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_filter([{'b': 5}], lambda z: z.b = 10) = []
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING list_transform([[{'b': 5}]], lambda y: list_transform(y, lambda z: z.b)) = [[10]]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a HAVING [z.b FOR z IN [{'b': 5}]] = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+statement error
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t2 AS z GROUP BY a
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a ORDER BY list_transform([{'b': 5}], lambda z: z.b)
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+statement error
+SELECT a FROM t2 AS z GROUP BY a QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+query I
+SELECT a FROM t2 AS z GROUP BY ALL HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query I
+SELECT a FROM t2 AS z GROUP BY a, b HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query I
+SELECT b FROM t2 AS z GROUP BY b HAVING list_transform([{'b': 5}], lambda z: z.b) = [20]
+----
+20
+
+query I
+SELECT a FROM t2 AS z GROUP BY a HAVING max(list_transform([{'b': 5}], lambda z: z.b)) = [30]
+----
+2
+
+query II
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t2 AS z
+WHERE list_transform([{'b': 5}], lambda z: z.b) <> [20]
+ORDER BY list_transform([{'b': 5}], lambda z: z.b) DESC
+----
+2	[30]
+1	[10]
+
+query II
+SELECT a, row_number() OVER (ORDER BY b) FROM t2 AS z QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [20]
+----
+1	2
+
+query II
+SELECT a, sum(b) OVER (ORDER BY b ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t2 AS z ORDER BY b
+----
+1	10
+1	30
+2	60
+
+query II
+SELECT a, max(list_transform([{'b': 5}], lambda z: z.b)) FROM t2 AS z GROUP BY a ORDER BY a
+----
+1	[20]
+2	[30]
+
+# a parameter named like a column, in a window frame and an aggregate
+statement ok
+CREATE TABLE tc AS SELECT * FROM (VALUES (1, {'b': 7}), (2, {'b': 8})) v(a, p_);
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda p_: p_.b)[1] PRECEDING AND CURRENT ROW)
+FROM tc ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, row_number() OVER (ORDER BY a) FROM tc QUALIFY list_transform([{'b': 5}], lambda p_: p_.b) = [5] ORDER BY a
+----
+1	1
+2	2
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda p_: p_.b)) FROM tc
+----
+[5]
+
+# a parameter named like a table alias and like a column of that table, which has no column named like the field:
+# no table provides the reference, so the column does not claim it and it is the parameter's field
+statement ok
+CREATE TABLE t3 AS SELECT * FROM (VALUES (1, {'b': 7}), (2, {'b': 8})) v(a, z);
+
+query II
+SELECT list_transform([{'b': 5}], lambda z: z.b), [z.b FOR z IN [{'b': 5}]] FROM t3 AS z ORDER BY a
+----
+[5]	[5]
+[5]	[5]
+
+query I
+SELECT a FROM t3 AS z WHERE list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT count(*) FROM t3 AS z HAVING list_transform([{'b': 5}], lambda z: z.b) = [5]
+----
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY ALL HAVING list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_filter([{'b': 5}], lambda z: z.b = 5) = [{'b': 5}] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([[{'b': 5}]], lambda y: list_transform(y, lambda z: z.b)) = [[5]]
+ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING [z.b FOR z IN [{'b': 5}]] = [5] ORDER BY a
+----
+1
+2
+
+query II
+SELECT a, list_transform([{'b': 5}], lambda z: z.b) FROM t3 AS z GROUP BY a ORDER BY a
+----
+1	[5]
+2	[5]
+
+query II
+SELECT z.b, list_transform([{'b': 5}], lambda z: z.b) FROM t3 AS z GROUP BY z.b ORDER BY 1
+----
+7	[5]
+8	[5]
+
+query I
+SELECT a FROM t3 AS z GROUP BY a ORDER BY list_transform([{'b': 5}], lambda z: z.b), a DESC
+----
+2
+1
+
+query II
+SELECT a, row_number() OVER (ORDER BY a) FROM t3 AS z QUALIFY list_transform([{'b': 5}], lambda z: z.b) = [5] ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t3 AS z ORDER BY a
+----
+1	1
+2	2
+
+query II
+SELECT a, count(*) OVER (PARTITION BY list_transform([{'b': 5}], lambda z: z.b)) FROM t3 AS z ORDER BY a
+----
+1	2
+2	2
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda z: z.b)) FROM t3 AS z
+----
+[5]
+
+query I
+SELECT list_transform([{'b': {'c': 5}}], lambda z: z.b.c) FROM t3 AS z ORDER BY a
+----
+[5]
+[5]
+
+# with three parts the table provides z.z, so the column wins there
+query I
+SELECT list_transform([{'z': {'b': 5}}], lambda z: z.z.b) FROM t3 AS z ORDER BY a
+----
+[7]
+[8]
+
+statement error
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'z': {'b': 5}}], lambda z: z.z.b) = [7]
+----
+column "z" must appear in the GROUP BY clause or be used in an aggregate function
+
+# the same, but the table also has a column named like the field, so the table provides the reference
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10, {'b': 7}), (2, 20, {'b': 8})) v(a, b, z);
+
+query I
+SELECT list_transform([{'b': 5}], lambda z: z.b) FROM t4 AS z ORDER BY a
+----
+[10]
+[20]
+
+statement error
+SELECT a FROM t4 AS z GROUP BY a HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+query I
+SELECT a FROM t4 AS z GROUP BY a, b HAVING list_transform([{'b': 5}], lambda z: z.b) = [10]
+----
+1
+
+query II
+SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN list_transform([{'b': 0}], lambda z: z.b)[1] PRECEDING AND CURRENT ROW)
+FROM t4 AS z ORDER BY a
+----
+1	1
+2	3
+
+query I
+SELECT max(list_transform([{'b': 5}], lambda z: z.b)) FROM t4 AS z
+----
+[20]
+
+# a column that the subquery's own table provides keeps the aggregate in the subquery, also where the parameter
+# names that table and the qualifier wrote the column with the parameter's name in front
+statement ok
+CREATE TABLE o AS SELECT * FROM (VALUES (100), (200)) v(oa);
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b)[1] + o.oa) FROM t2 AS z) FROM o ORDER BY 1
+----
+130
+230
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: a + o.oa)) FROM t2 AS z) FROM o ORDER BY 1
+----
+[102]
+[202]
+
+query I
+SELECT (SELECT max(list_transform([1], lambda memory: b + o.oa + memory)) FROM t2) FROM o ORDER BY 1
+----
+[131]
+[231]
+
+query I
+SELECT (SELECT count(*) FROM t2 AS z HAVING max(list_transform([{'b': 5}], lambda z: z.b + o.oa)) = [130]) FROM o
+ORDER BY 1
+----
+3
+NULL
+
+query I
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b + a + o.oa)) FROM t3 AS z) FROM o ORDER BY 1
+----
+[107]
+[207]
+
+# HAVING reads the parameter's field where no table provides it, also through a macro and as a dot call receiver,
+# and sees the table column with a catalog in front
+statement ok
+CREATE MACRO mh() AS list_transform([{'b': 5}], lambda z: z.b);
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING list_transform([{'b': 'Pp'}], lambda z: z.b.lower()) = ['pp'] ORDER BY a
+----
+1
+2
+
+query I
+SELECT a FROM t3 AS z GROUP BY a HAVING mh() = [5] ORDER BY a
+----
+1
+2
+
+statement error
+SELECT a FROM t2 GROUP BY a HAVING list_transform([1], lambda memory: b + memory) = [11]
+----
+column "b" must appear in the GROUP BY clause or be used in an aggregate function
+
+query I
+SELECT b FROM t2 GROUP BY b HAVING list_transform([1], lambda memory: b + memory) = [11]
+----
+10
+
+# a table found through its schema wins over a parameter named like that schema
+query I
+SELECT list_transform([{'tbl': {'x': 1}}], lambda sch: sch.tbl.x) FROM sch.tbl
+----
+[5]
+
+statement error
+SELECT list_transform([{'b': 5}], lambda t2: t2.b) FROM t2, t2
+----
+Ambiguous reference to table "t2"
+
+# no table of the subquery provides z.b, so the parameter's field and the outer column leave the aggregate to the
+# outer query
+statement error
+SELECT (SELECT max(list_transform([{'b': 5}], lambda z: z.b + o.oa)) FROM t3 AS z) FROM o
+----
+More than one row returned by a subquery
+
+# a field access that the parameter cannot provide is an error, never a column of an enclosing query
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z)) FROM (VALUES (99)) AS z(b)
+----
+Cannot extract field 'b' from expression "z"
+
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z))
+----
+Cannot extract field 'b' from expression "z"
+
+statement error
+SELECT (SELECT list_transform([1], lambda z: z.b) FROM range(1)) FROM (VALUES (99)) AS z(b)
+----
+Cannot extract field 'b' from expression "z"
+
+query I
+SELECT (SELECT list_transform([{'b': 5}], lambda z: z.b) FROM (VALUES ({'b': 7})) AS z(z)) FROM (VALUES (99)) AS z(b)
+----
+[5]
+
+statement error
+SELECT (SELECT list_transform([[1]], lambda x: list_transform(x, lambda y: x.d))) FROM (VALUES (10)) x(d)
+----
+Cannot extract field 'd' from expression "x"
+
+query I
+SELECT (SELECT list_transform([{'d': 1}], lambda x: list_transform([2], lambda y: x.d + y))) FROM (VALUES (10)) x(d)
+----
+[[3]]
+
+statement error
+SELECT * FROM (VALUES (10)) x(d), unnest(list_transform([1], lambda x: x.d))
+----
+Cannot extract field 'd' from expression "x"
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement error
+SELECT (SELECT list_transform([1], x -> x.d)) FROM (VALUES (10), (20)) x(d)
+----
+Cannot extract field 'd' from expression "x"
+
+statement ok
+RESET lambda_syntax;
+
+# keyword lambdas stored before storage version v1.3.0 read back as arrow lambdas and keep their reading, also where
+# a stored view or macro passes one to a macro, read from another database
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v100.db' AS db_v100 (STORAGE_VERSION 'v1.0.0');
+
+statement ok
+USE db_v100;
+
+statement ok
+CREATE TABLE t AS SELECT {'d': 99} AS p_, {'x': 98} AS x, 10 AS k;
+
+statement ok
+CREATE VIEW vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM t;
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE VIEW vm AS SELECT apply_f([1, 2], lambda k: k + 1) AS r FROM t;
+
+statement ok
+CREATE VIEW vm_inner AS SELECT (SELECT max(apply_f([1], lambda k: k + 1)[1])) AS r FROM range(3) r(k);
+
+statement ok
+CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vk AS SELECT m_kw(5) AS r;
+
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO m_lower(k) AS lower([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vl AS SELECT m_lower(5) AS r;
+
+query I
+SELECT m_kw(5);
+----
+[2, 3]
+
+statement ok
+USE memory;
+
+statement ok
+DETACH db_v100;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v100.db' AS db_v100;
+
+query II
+SELECT * FROM db_v100.vw;
+----
+[1]	[1]
+
+query I
+SELECT r FROM db_v100.vm;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v100.vm_inner;
+----
+2
+2
+2
+
+query I
+SELECT r FROM db_v100.vk;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v100.vl;
+----
+[2, 3]
+
+statement ok
+DETACH db_v100;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS db_v120 (STORAGE_VERSION 'v1.2.0');
+
+statement ok
+USE db_v120;
+
+statement ok
+CREATE TABLE t AS SELECT {'d': 99} AS p_, {'x': 98} AS x, 10 AS k;
+
+statement ok
+CREATE VIEW vw AS SELECT list_transform([{'d': 1}], lambda p_: p_.d) AS fixed, list_transform([{'x': 1}], lambda x: x.x) AS protected FROM t;
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE VIEW vm AS SELECT apply_f([1, 2], lambda k: k + 1) AS r FROM t;
+
+statement ok
+CREATE VIEW vm_inner AS SELECT (SELECT max(apply_f([1], lambda k: k + 1)[1])) AS r FROM range(3) r(k);
+
+statement ok
+CREATE MACRO m_kw(k) AS apply_f([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vk AS SELECT m_kw(5) AS r;
+
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO m_lower(k) AS lower([1, 2], lambda k: k + 1);
+
+statement ok
+CREATE VIEW vl AS SELECT m_lower(5) AS r;
+
+query I
+SELECT m_kw(5);
+----
+[2, 3]
+
+statement ok
+USE memory;
+
+statement ok
+DETACH db_v120;
+
+statement ok
+ATTACH '{TEST_DIR}/lambda_parameter_field_access_v120.db' AS db_v120;
+
+query II
+SELECT * FROM db_v120.vw;
+----
+[1]	[1]
+
+query I
+SELECT r FROM db_v120.vm;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v120.vm_inner;
+----
+2
+2
+2
+
+query I
+SELECT r FROM db_v120.vk;
+----
+[2, 3]
+
+query I
+SELECT r FROM db_v120.vl;
+----
+[2, 3]
+
+statement ok
+DETACH db_v120;

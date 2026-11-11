@@ -1,0 +1,571 @@
+# name: test/sql/function/list/lambdas/lambda_parameter_json_arrow.test
+# description: A JSON arrow inside an ordinary function in a lambda body names the lambda parameter, and a single arrow at a lambda position is still a lambda
+# group: [lambdas]
+
+require json
+
+statement ok
+CREATE TABLE t AS SELECT '{"f": "bbbb"}'::JSON AS k;
+
+# the group is over the column k, the body's k is the parameter
+
+query I
+SELECT list_transform(['{"f": "a"}'::JSON], lambda k: concat(k -> 'f', '')) FROM t GROUP BY concat(k -> 'f', '');
+----
+['"a"']
+
+query I
+SELECT list_transform(['{"f": "a"}'::JSON], lambda k: concat(k ->> 'f', '')) FROM t GROUP BY concat(k ->> 'f', '');
+----
+[a]
+
+query I
+SELECT list_transform(['{"f": "a"}'::JSON], lambda k: lower(k -> 'f')) FROM t GROUP BY lower(k -> 'f');
+----
+['"a"']
+
+query II
+SELECT lower(k -> 'f'), list_transform(['{"f": "a"}'::JSON], lambda k: lower(k -> 'f')) FROM t GROUP BY lower(k -> 'f') HAVING list_transform(['{"f": "a"}'::JSON], lambda k: lower(k -> 'f')) = ['"a"'] ORDER BY list_transform(['{"f": "a"}'::JSON], lambda k: lower(k -> 'f'));
+----
+"bbbb"	['"a"']
+
+query II
+SELECT lower(k -> 'f'), row_number() OVER () FROM t GROUP BY lower(k -> 'f') QUALIFY list_transform(['{"f": "a"}'::JSON], lambda k: lower(k -> 'f')) = ['"a"'];
+----
+"bbbb"	1
+
+# the arrow over the grouped column outside the lambda is still the group
+
+query II
+SELECT lower(k -> 'f'), list_transform([1], lambda x: lower(k -> 'f')) FROM t GROUP BY lower(k -> 'f');
+----
+"bbbb"	['"bbbb"']
+
+statement error
+SELECT list_transform([1], lambda x: lower(k -> 'f')) FROM t GROUP BY lower(k ->> 'f');
+----
+must appear in the GROUP BY clause
+
+# a lambda whose body holds a JSON arrow on its own parameter
+
+query I
+SELECT list_transform(['{"f": 1}'::JSON, NULL, '{"g": 2}'::JSON], lambda x: x -> 'f') FROM t;
+----
+[1, NULL, NULL]
+
+# a keyword lambda is a lambda in any position, and errors where the function takes none
+
+statement error
+SELECT concat(lambda x: x, '');
+----
+This scalar function does not support lambdas!
+
+# under the single arrow syntax, an arrow at the lambda position stays a lambda
+
+statement ok
+SET lambda_syntax = 'ENABLE_SINGLE_ARROW';
+
+query I
+SELECT list_transform([1, 2], x -> x + 1) FROM (SELECT 10 AS x);
+----
+[2, 3]
+
+query I
+SELECT (SELECT max(list_transform([1], x -> x + 1)[1])) FROM range(3) t(x);
+----
+2
+2
+2
+
+query I
+SELECT (SELECT max(list_reduce([1, 2, 3], (x, y) -> x + y))) FROM range(3) t(x);
+----
+6
+6
+6
+
+query I
+SELECT (SELECT max(invoke(x -> x + 1, 41))) FROM range(3) t(x);
+----
+42
+42
+42
+
+query I
+SELECT (SELECT max(l.list_transform(x -> x + 1)[1]) FROM (SELECT [1] AS l) i) FROM range(3) t(x);
+----
+2
+2
+2
+
+query I
+SELECT (SELECT max(l.list_transform(x -> x + 1)[1]) FROM (SELECT 7 AS x)) FROM (SELECT [1] AS l UNION ALL SELECT [2] UNION ALL SELECT [3]);
+----
+4
+
+# a call written on a column in a macro body, expanded three times in one statement
+
+statement ok
+CREATE MACRO plus_one_each(v, x) AS v.list_transform(x -> x + 1);
+
+query III
+SELECT plus_one_each(l, 100), plus_one_each(s, 100), plus_one_each(l, 100) FROM (SELECT [1, 2, 3] AS l, [4, 5] AS s);
+----
+[2, 3, 4]	[5, 6]	[2, 3, 4]
+
+# the same arrow in a function that takes no lambda is the JSON operator over the outer column
+
+query I
+SELECT (SELECT max(lower(x -> '$.a'))) FROM (SELECT '{"a": 1}'::JSON AS x UNION ALL SELECT '{"a": 2}'::JSON);
+----
+2
+
+# ON CONFLICT DO UPDATE SET leaves the parameter bare although the table has a column of its name, also in a call
+# written on a qualified column
+
+statement ok
+CREATE TABLE ul (id INTEGER PRIMARY KEY, l INTEGER[], v INTEGER[], x INTEGER);
+
+statement ok
+INSERT INTO ul VALUES (1, [1, 2], NULL, 100);
+
+statement ok
+INSERT INTO ul VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = list_transform(l, x -> x + 1);
+
+query I
+SELECT v FROM ul;
+----
+[2, 3]
+
+statement ok
+INSERT INTO ul VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = excluded.l.list_transform(x -> x + 10);
+
+query I
+SELECT v FROM ul;
+----
+[15]
+
+statement ok
+INSERT INTO ul VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = ul.l.list_transform(x -> x + 20);
+
+query I
+SELECT v FROM ul;
+----
+[21, 22]
+
+# a bare column in the lambda body is the existing row's
+
+statement ok
+INSERT INTO ul VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = list_transform(l, lambda q: x);
+
+query I
+SELECT v FROM ul;
+----
+[100, 100]
+
+# a field of the left side as the path: the arrow is still JSON outside a lambda position, so an aggregate over
+# an outer column belongs to the outer query
+
+statement ok
+CREATE TABLE sp AS SELECT * FROM (VALUES ({path: '$.d', d: 10}), ({path: '$.d', d: 20})) v(s);
+
+query I
+SELECT (SELECT max(s -> s.path) FROM range(1)) FROM sp;
+----
+20
+
+query I
+SELECT (SELECT max(concat(s -> s.path, '')) FROM range(1)) FROM sp;
+----
+20
+
+query I
+SELECT (SELECT count(*) FILTER (WHERE (s -> s.path) = '10') FROM range(1)) FROM sp;
+----
+1
+
+query I
+SELECT upper(s -> s.path) FROM sp ORDER BY ALL;
+----
+10
+20
+
+query I
+SELECT s -> s.path FROM sp ORDER BY ALL;
+----
+10
+20
+
+# the left side of an arrow outside a lambda position is an ordinary column, so it matches its group
+
+statement ok
+CREATE TABLE sx AS SELECT {path: '$.d', d: 'x'} AS s;
+
+query I
+SELECT upper(s -> s.path) FROM sx GROUP BY s;
+----
+"X"
+
+query I
+SELECT count(*) FROM sx GROUP BY s HAVING upper(s -> s.path) = '"X"';
+----
+1
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+query I
+SELECT (SELECT max(s -> s.path) FROM range(1)) FROM sp;
+----
+20
+
+query I
+SELECT list_transform([{'path': 1}], s -> s.path) FROM sp;
+----
+[1]
+[1]
+
+statement ok
+RESET lambda_syntax;
+
+# an arrow passed to a macro is a lambda, since the macro places its arguments only when it expands
+
+statement ok
+CREATE MACRO apply_f(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO apply_g(l, g) AS apply_f(l, g);
+
+statement ok
+CREATE TABLE tm AS SELECT 10 AS x, {'d': 99} AS p_;
+
+statement ok
+SET lambda_syntax = 'ENABLE_SINGLE_ARROW';
+
+query I
+SELECT apply_f([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query II
+SELECT x, apply_f([1, 2], x -> x + 1) FROM tm GROUP BY x;
+----
+10	[2, 3]
+
+query I
+SELECT apply_f([1, 2], f := x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT [1, 2].apply_f(x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT apply_f([{'d': 1}], p_ -> p_.d) FROM tm;
+----
+[1]
+
+query I
+SELECT apply_g([1, 2], x -> x * 10) FROM tm;
+----
+[10, 20]
+
+# an aggregate over a forwarded lambda reads no column, so it stays in the subquery
+
+query I
+SELECT (SELECT max(apply_f([1], x -> x + 1)[1])) FROM range(3) t(x);
+----
+2
+2
+2
+
+query I
+SELECT (SELECT max(apply_g([1], x -> x + 1)[1])) FROM range(3) t(x);
+----
+2
+2
+2
+
+statement ok
+CREATE MACRO apply_shadow(x) AS apply_f([1, 2], x -> x + 1);
+
+query I
+SELECT apply_shadow(5);
+----
+[2, 3]
+
+statement ok
+CREATE TABLE um (id INTEGER PRIMARY KEY, l INTEGER[], v INTEGER[], x INTEGER);
+
+statement ok
+INSERT INTO um VALUES (1, [1, 2], NULL, 100);
+
+statement ok
+INSERT INTO um VALUES (1, [5], NULL, 7) ON CONFLICT DO UPDATE SET v = apply_f(l, x -> x + 1);
+
+query I
+SELECT v FROM um;
+----
+[2, 3]
+
+# also where the macro body uses the parameter as a value too
+
+statement ok
+CREATE MACRO lambda_and_value(l, f) AS [list_transform(l, f)[1]::VARCHAR, f::VARCHAR];
+
+query I
+SELECT lambda_and_value(['x'], k -> '$.f') FROM t;
+----
+[$.f, '"bbbb"']
+
+# an arrow passed to a macro stays a lambda wherever the macro places it: a view in another schema, a table macro,
+# one overload calling another, the parameter as a dot call receiver, a named argument out of order, a subquery
+
+statement ok
+CREATE SCHEMA ms;
+
+statement ok
+SET schema = 'ms';
+
+statement ok
+CREATE MACRO forward_items(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO shadow_item(x) AS forward_items([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v AS SELECT shadow_item(100) AS r;
+
+statement ok
+SET schema = 'main';
+
+query I
+SELECT r FROM ms.v;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_table(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO apply_scalar(l, f) AS (SELECT r FROM apply_table(l, f));
+
+query I
+SELECT apply_scalar([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO dispatch_items(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE OR REPLACE MACRO dispatch_items (l, f) AS list_transform(l, f), (f, l, unused) AS dispatch_items(l, f);
+
+query I
+SELECT dispatch_items(x -> x + 1, [1, 2], 0) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO ma(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO mb(l, g) AS ma(l, g);
+
+statement ok
+CREATE OR REPLACE MACRO ma(l, f) AS list_transform(l, f), (l) AS mb(l, y -> y + 1);
+
+query I
+SELECT (SELECT max(ma([1], y -> y)[1] + mb([1], x -> x * 2)[1])) FROM range(3) t(x);
+----
+3
+3
+3
+
+query I
+SELECT (SELECT max(mb([1], x -> x * 2)[1] + ma([1], y -> y)[1])) FROM range(3) t(x);
+----
+3
+3
+3
+
+statement ok
+CREATE MACRO by_function(f, l) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO by_dot(l, f) AS f.by_function(l);
+
+query I
+SELECT by_dot([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+query I
+SELECT apply_f(f := x -> x + 1, l := [1, 2]) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_sub(l, f) AS (SELECT list_transform(l, f));
+
+query I
+SELECT apply_sub([1, 2], x -> x + 1) FROM tm;
+----
+[2, 3]
+
+statement ok
+CREATE MACRO apply_rec(l, f) AS CASE WHEN len(l) = 0 THEN [] ELSE apply_rec(l[2:], f) END;
+
+statement error
+SELECT apply_rec([1], x -> x + 1);
+----
+Max expression depth limit
+
+# a scalar function reads its lambda argument by position, also when it is named
+
+query I
+SELECT list_transform([1, 2], "lambda" := x -> x + 1) FROM tm;
+----
+[2, 3]
+
+# a macro named like a built in function: the lookup that reads the arrow finds the entry the call binds to, in the
+# search path of a view and among the table macros of a FROM clause
+
+statement ok
+SET schema = 'ms';
+
+statement ok
+CREATE MACRO lower(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO lower_one(x) AS lower([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v_lower AS SELECT lower_one(100) AS r;
+
+statement ok
+CREATE MACRO concat(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO concat_one(x) AS concat([1, 2], x -> x + 1);
+
+statement ok
+CREATE VIEW v_concat AS SELECT concat_one(100) AS r;
+
+statement ok
+SET schema = 'main';
+
+query II
+SELECT (SELECT r FROM ms.v_lower), (SELECT r FROM ms.v_concat);
+----
+[2, 3]	[2, 3]
+
+statement ok
+CREATE MACRO lower(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO lower_from(x) AS (SELECT r FROM lower([1, 2], x -> x + 1));
+
+query I
+SELECT lower_from(100);
+----
+[2, 3]
+
+statement ok
+CREATE MACRO lower_rows(x) AS TABLE SELECT r FROM lower([1, 2], x -> x + 1);
+
+query I
+SELECT * FROM lower_rows(100);
+----
+[2, 3]
+
+statement ok
+CREATE MACRO lower_rows_shifted(x) AS TABLE SELECT r FROM lower([1, 2], y -> y + x);
+
+query I
+SELECT * FROM lower_rows_shifted(100);
+----
+[101, 102]
+
+statement ok
+DROP MACRO TABLE lower;
+
+# a FROM clause item is never a scalar call, so a table macro of another schema named like a built in scalar function
+# is not read as a dot call on a column named like the schema
+
+statement ok
+CREATE SCHEMA tms;
+
+statement ok
+CREATE MACRO tms.lower(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO tms_lower_rows(x) AS TABLE SELECT r FROM tms.lower([1, 2], lambda y: y + x);
+
+query I
+SELECT * FROM tms_lower_rows(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms_lower_rows_arrow(x) AS TABLE SELECT r FROM tms.lower([1, 2], y -> y + x);
+
+query I
+SELECT * FROM tms_lower_rows_arrow(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms_lower_rows_catalog(x) AS TABLE SELECT r FROM memory.tms.lower([1, 2], lambda y: y + x);
+
+query I
+SELECT * FROM tms_lower_rows_catalog(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms.concat(a, b) AS TABLE SELECT a || b AS r;
+
+statement ok
+CREATE MACRO tms_concat_rows(x) AS TABLE SELECT r FROM tms.concat(x, 'b');
+
+query I
+SELECT * FROM tms_concat_rows('a');
+----
+ab
+
+# the creation check no longer looks a FROM clause call up among scalar functions, so a table macro records no
+# dependency on a scalar macro of the same name as the table macro it calls
+
+statement ok
+SET enable_macro_dependencies = true;
+
+statement ok
+CREATE MACRO dep_f(x) AS x;
+
+statement ok
+CREATE MACRO dep_f(x) AS TABLE SELECT x AS v;
+
+statement ok
+CREATE MACRO dep_g(x) AS TABLE SELECT * FROM dep_f(x);
+
+statement ok
+DROP MACRO dep_f;
+
+query I
+SELECT * FROM dep_g(7);
+----
+7
+
+statement error
+DROP MACRO TABLE dep_f;
+----
+depends on
+
+statement ok
+RESET enable_macro_dependencies;
+
+statement ok
+RESET lambda_syntax;

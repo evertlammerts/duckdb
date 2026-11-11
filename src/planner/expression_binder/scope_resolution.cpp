@@ -176,13 +176,14 @@ ColumnResolution ExpressionBinder::ResolveColumn(ColumnRefExpression &colref, id
 }
 
 //! Whether `predicate` holds for a column reference of the expression that the expression does not declare itself.
-//! Lambda declarations are read as `ColumnQualifier::QualifyColumnNames` reads them, since that walk decides which
-//! names stay bare: only a lambda passed as a function argument declares parameters, and any other arrow is the JSON
-//! operator. A subquery binds in a chain of its own and is skipped; its IN or ANY operand is walked only with
-//! `subquery_operands`, since for ownership the subquery's correlated columns would count as well.
+//! An argument declares lambda parameters only where `ColumnQualifier::EnumerateCallChildren` reads it as a lambda,
+//! and any other arrow is the JSON operator, whose sides are ordinary expressions. A field access on a parameter is
+//! declared too, unless a table of the query the lambda is written in provides the reference. A subquery binds in a
+//! chain of its own and is skipped; its IN or ANY operand is walked only with `subquery_operands`, since for ownership
+//! the subquery's correlated columns would count as well.
 template <class PREDICATE>
-static bool AnyFreeColumn(ParsedExpression &expr, vector<identifier_set_t> &lambda_params, bool subquery_operands,
-                          PREDICATE &predicate) {
+static bool AnyFreeColumn(Binder &binder, ColumnQualifier &qualifier, ParsedExpression &expr,
+                          vector<identifier_set_t> &lambda_params, bool subquery_operands, PREDICATE &predicate) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::SUBQUERY:
 		if (!subquery_operands) {
@@ -191,9 +192,7 @@ static bool AnyFreeColumn(ParsedExpression &expr, vector<identifier_set_t> &lamb
 		break;
 	case ExpressionClass::COLUMN_REF: {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
-		// a lambda parameter is always a bare name, so a qualified reference is a column even when its
-		// last component happens to match one - `t.x` inside `lambda x: ...` names the table's column
-		if (!col_ref.IsQualified() && LambdaExpression::IsLambdaParameter(lambda_params, col_ref.GetColumnName())) {
+		if (qualifier.IsLambdaParameterReference(lambda_params, col_ref)) {
 			return false;
 		}
 		return predicate(col_ref);
@@ -203,41 +202,28 @@ static bool AnyFreeColumn(ParsedExpression &expr, vector<identifier_set_t> &lamb
 		if (!function.IsLambdaFunction()) {
 			break;
 		}
-		for (auto &argument : function.GetArgumentsMutable()) {
-			auto &child = *argument.GetExpressionMutable();
-			if (child.GetExpressionClass() != ExpressionClass::LAMBDA) {
-				if (AnyFreeColumn(child, lambda_params, subquery_operands, predicate)) {
-					return true;
-				}
-				continue;
-			}
-			auto &lambda = child.Cast<LambdaExpression>();
-			string error_message;
-			auto parameters = lambda.ExtractColumnRefExpressions(error_message);
-			if (!error_message.empty()) {
-				if (AnyFreeColumn(*lambda.LeftMutable(), lambda_params, subquery_operands, predicate) ||
-				    AnyFreeColumn(*lambda.RightMutable(), lambda_params, subquery_operands, predicate)) {
-					return true;
-				}
-				continue;
-			}
-			lambda_params.emplace_back();
-			for (auto &parameter : parameters) {
-				lambda_params.back().emplace(parameter.get().Cast<ColumnRefExpression>().GetName());
-			}
-			auto found = AnyFreeColumn(*lambda.RightMutable(), lambda_params, subquery_operands, predicate);
-			lambda_params.pop_back();
-			if (found) {
-				return true;
-			}
-		}
-		return false;
+		bool found = false;
+		ColumnQualifier::EnumerateCallChildren(
+		    binder, function,
+		    [&](unique_ptr<ParsedExpression> &child) {
+			    found = found || AnyFreeColumn(binder, qualifier, *child, lambda_params, subquery_operands, predicate);
+		    },
+		    [&](LambdaExpression &lambda, identifier_set_t &parameters) {
+			    if (found) {
+				    return;
+			    }
+			    lambda_params.push_back(std::move(parameters));
+			    found = AnyFreeColumn(binder, qualifier, *lambda.RightMutable(), lambda_params, subquery_operands,
+			                          predicate);
+			    lambda_params.pop_back();
+		    });
+		return found;
 	}
 	default:
 		break;
 	}
 	for (auto &child : expr.ChildrenMutable()) {
-		if (AnyFreeColumn(*child, lambda_params, subquery_operands, predicate)) {
+		if (AnyFreeColumn(binder, qualifier, *child, lambda_params, subquery_operands, predicate)) {
 			return true;
 		}
 	}
@@ -247,39 +233,42 @@ static bool AnyFreeColumn(ParsedExpression &expr, vector<identifier_set_t> &lamb
 //! Collect the column references that decide which scope owns an expression. Lambda parameters declared inside the
 //! expression are skipped: they are bound by the lambda rather than by any scope, so a parameter that happens to
 //! share a name with an outer column must not pull the expression out to that scope.
-static void CollectResolvableColumns(ParsedExpression &expr, vector<reference<ColumnRefExpression>> &result) {
+static void CollectResolvableColumns(Binder &binder, ColumnQualifier &qualifier, ParsedExpression &expr,
+                                     vector<reference<ColumnRefExpression>> &result) {
 	vector<identifier_set_t> lambda_params;
 	auto collect = [&](ColumnRefExpression &col_ref) {
 		result.push_back(col_ref);
 		return false;
 	};
-	AnyFreeColumn(expr, lambda_params, false, collect);
+	AnyFreeColumn(binder, qualifier, expr, lambda_params, false, collect);
 }
 
 bool ExpressionBinder::ReferencesLambdaParameter(ParsedExpression &expr) {
 	if (!lambda_bindings) {
 		return false;
 	}
+	ColumnQualifier qualifier(binder);
 	vector<identifier_set_t> lambda_params;
 	auto is_parameter = [&](ColumnRefExpression &col_ref) {
 		return !col_ref.IsQualified() &&
 		       LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.GetColumnName());
 	};
-	return AnyFreeColumn(expr, lambda_params, true, is_parameter);
+	return AnyFreeColumn(binder, qualifier, expr, lambda_params, true, is_parameter);
 }
 
 optional_idx ExpressionBinder::ResolveAggregateOwner(FunctionExpression &aggregate, idx_t start) {
 	vector<reference<ColumnRefExpression>> columns;
+	ColumnQualifier qualifier(binder);
 	// an arrow passed straight to the aggregate is the JSON operator, as the aggregate binds it
 	for (auto &child : aggregate.GetArgumentsMutable()) {
-		CollectResolvableColumns(*child.GetExpressionMutable(), columns);
+		CollectResolvableColumns(binder, qualifier, *child.GetExpressionMutable(), columns);
 	}
 	if (aggregate.Filter()) {
-		CollectResolvableColumns(*aggregate.FilterMutable(), columns);
+		CollectResolvableColumns(binder, qualifier, *aggregate.FilterMutable(), columns);
 	}
 	if (aggregate.OrderBy()) {
 		for (auto &order : aggregate.OrderByMutable()->orders) {
-			CollectResolvableColumns(*order.expression, columns);
+			CollectResolvableColumns(binder, qualifier, *order.expression, columns);
 		}
 	}
 	return ResolveOwner(columns, start);
@@ -287,7 +276,8 @@ optional_idx ExpressionBinder::ResolveAggregateOwner(FunctionExpression &aggrega
 
 optional_idx ExpressionBinder::ResolveExpressionOwner(ParsedExpression &expr, idx_t start) {
 	vector<reference<ColumnRefExpression>> columns;
-	CollectResolvableColumns(expr, columns);
+	ColumnQualifier qualifier(binder);
+	CollectResolvableColumns(binder, qualifier, expr, columns);
 	return ResolveOwner(columns, start);
 }
 

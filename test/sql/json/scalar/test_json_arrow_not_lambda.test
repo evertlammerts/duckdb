@@ -1,0 +1,255 @@
+# name: test/sql/json/scalar/test_json_arrow_not_lambda.test
+# description: The JSON arrow operator outside a lambda position reads its left side as an ordinary expression
+# group: [scalar]
+
+require json
+
+statement ok
+CREATE TABLE jt AS SELECT '{"a": 1}'::JSON AS j UNION ALL SELECT '{"a": 2}'::JSON UNION ALL SELECT '{"a": 3}'::JSON;
+
+# an aggregate over a column of the outer query belongs to the outer query, with -> as with ->>
+
+query I
+SELECT (SELECT max(j -> '$.a')) FROM jt;
+----
+3
+
+query I
+SELECT (SELECT max(j ->> '$.a')) FROM jt;
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT (SELECT max(j -> '$.a')) FROM jt);
+----
+1
+
+query I
+SELECT (SELECT max(concat(j -> '$.a', ''))) FROM jt;
+----
+3
+
+query I
+SELECT (SELECT max(coalesce(j -> '$.a', NULL))) FROM jt;
+----
+3
+
+query I
+SELECT (SELECT sum(CASE WHEN (j -> '$.a') = '2' THEN 1 ELSE 0 END)) FROM jt;
+----
+1
+
+query I
+SELECT (SELECT bool_or((j -> '$.a') = '3')) FROM jt;
+----
+true
+
+query I
+SELECT (SELECT count(*) FILTER (WHERE (j -> '$.a') = '1')) FROM jt;
+----
+1
+
+query I
+SELECT (SELECT string_agg('x', ',' ORDER BY j -> '$.a' DESC)) FROM jt;
+----
+x,x,x
+
+query I
+SELECT (SELECT max(list_transform([1], lambda x: j -> '$.a'))) FROM jt;
+----
+[3]
+
+# a NULL document and duplicates do not change the owner
+
+query II
+SELECT (SELECT count(j -> '$.a')), (SELECT count(DISTINCT j -> '$.a')) FROM (SELECT j FROM jt UNION ALL SELECT j FROM jt UNION ALL SELECT NULL::JSON);
+----
+6	3
+
+# a column of the subquery's own scope keeps the aggregate there
+
+query I
+SELECT (SELECT max(i.j -> '$.a') FROM (SELECT '{"a": 7}'::JSON AS j) i) FROM jt;
+----
+7
+7
+7
+
+# the parameter of a lambda in the aggregate is not a column of either query
+
+query I
+SELECT (SELECT max(list_transform(['{"a": 9}'::JSON], lambda j: j -> '$.a'))) FROM jt;
+----
+[9]
+[9]
+[9]
+
+# an aggregate takes no lambda, so an arrow on a macro parameter inside one is the JSON operator
+
+statement ok
+CREATE MACRO max_a(v) AS max(v -> '$.a');
+
+query I
+SELECT max_a(j) FROM jt;
+----
+3
+
+statement ok
+CREATE MACRO list_a(v) AS list(v -> '$.a' ORDER BY v -> '$.a');
+
+query I
+SELECT list_a(j) FROM jt;
+----
+[1, 2, 3]
+
+# a macro body may apply the arrow to its parameter inside a function
+
+statement ok
+CREATE MACRO first_f(k) AS concat(k -> 'f', '');
+
+query I
+SELECT first_f('{"f": "z"}'::JSON);
+----
+"z"
+
+statement ok
+CREATE MACRO first_f_each(k) AS list_transform([1, 2], lambda x: concat(k -> 'f', x::VARCHAR));
+
+query I
+SELECT first_f_each('{"f": "z"}'::JSON);
+----
+['"z"1', '"z"2']
+
+# a lambda parameter of the body shadows the macro parameter of the same name
+
+statement ok
+CREATE MACRO inner_f(k) AS list_transform(['{"f": "in"}'::JSON], lambda k: concat(k -> 'f', ''));
+
+query I
+SELECT inner_f('{"f": "out"}'::JSON);
+----
+['"in"']
+
+# a macro parameter in the FILTER or ORDER BY of an aggregate with an arrow argument is replaced
+
+statement ok
+CREATE MACRO ordered_a(p) AS (SELECT string_agg(j -> '$.a', ',' ORDER BY (j ->> '$.a')::INTEGER * p) FROM jt);
+
+query I
+SELECT ordered_a(-1);
+----
+3,2,1
+
+statement ok
+CREATE MACRO counted_a(p) AS (SELECT count(j -> '$.a') FILTER (WHERE (j ->> '$.a')::INTEGER > p) FROM jt);
+
+query I
+SELECT counted_a(1);
+----
+2
+
+# ON CONFLICT DO UPDATE SET reads a bare column on the left of the arrow as the existing row
+
+statement ok
+CREATE TABLE u (id INTEGER PRIMARY KEY, k JSON, v VARCHAR);
+
+statement ok
+INSERT INTO u VALUES (1, '{"f": "old"}', NULL);
+
+statement ok
+INSERT INTO u VALUES (1, '{"f": "new"}', NULL) ON CONFLICT DO UPDATE SET v = concat(k -> 'f', '');
+
+query III
+SELECT * FROM u;
+----
+1	{"f": "old"}	"old"
+
+statement ok
+INSERT INTO u VALUES (1, '{"f": "new"}', NULL) ON CONFLICT DO UPDATE SET v = concat(excluded.k -> 'f', '') WHERE lower(k -> 'f') = '"old"';
+
+query III
+SELECT * FROM u;
+----
+1	{"f": "old"}	"new"
+
+# a table macro named like a scalar function does not change an arrow in an expression call, in a query, in a macro
+# body, in a table macro body or in ON CONFLICT DO UPDATE SET
+
+statement ok
+CREATE MACRO lower_a(v) AS lower(v -> '$.a');
+
+statement ok
+CREATE MACRO max_lower_a(v) AS max(lower(v -> '$.a'));
+
+statement ok
+CREATE MACRO lower_a_rows(v) AS TABLE SELECT lower(v -> '$.a') AS s;
+
+statement ok
+CREATE TABLE ul (id INTEGER PRIMARY KEY, j JSON, v VARCHAR);
+
+statement ok
+CREATE MACRO lower(x) AS TABLE SELECT 1 AS r;
+
+query I
+SELECT (SELECT max(lower(j -> '$.a'))) FROM jt;
+----
+3
+
+query I
+SELECT lower_a(j) FROM jt ORDER BY ALL;
+----
+1
+2
+3
+
+query I
+SELECT max_lower_a(j) FROM jt;
+----
+3
+
+query I
+SELECT * FROM lower_a_rows('{"a": 5}'::JSON);
+----
+5
+
+statement ok
+INSERT INTO ul VALUES (1, '{"a": "OLD"}', NULL);
+
+statement ok
+INSERT INTO ul VALUES (1, '{"a": "NEW"}', NULL) ON CONFLICT DO UPDATE SET v = lower(j -> '$.a');
+
+query I
+SELECT v FROM ul;
+----
+"old"
+
+statement ok
+DROP MACRO TABLE lower;
+
+# a built in table function takes no lambda, so an arrow passed to one in a FROM clause is the JSON operator, in a
+# table macro body, in a scalar macro body's subquery and in a CTE of a table macro body
+
+statement ok
+CREATE MACRO count_each_a(v) AS TABLE SELECT count(*) AS n FROM json_each(v -> '$.a');
+
+query I
+SELECT * FROM count_each_a('{"a": [1, 2, 3]}'::JSON);
+----
+3
+
+statement ok
+CREATE MACRO count_each_a_scalar(v) AS (SELECT count(*) FROM json_each(v -> '$.a'));
+
+query I
+SELECT count_each_a_scalar('{"a": [1, 2, 3]}'::JSON);
+----
+3
+
+statement ok
+CREATE MACRO each_a(j) AS TABLE WITH c AS (SELECT value FROM json_each(j -> '$.a')) SELECT value FROM c;
+
+query I
+SELECT value FROM each_a('{"a": [1, 2]}'::JSON) ORDER BY value;
+----
+1
+2
