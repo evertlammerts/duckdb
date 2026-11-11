@@ -72,13 +72,11 @@ public:
 		}
 		return distance + to.buffer_pos;
 	}
-	//! Finds where the content of [begin, end) starts, after the line ends that begin may point at, and whether a
-	//! carriage return before a newline at end ends it
+	//! Finds where the content of [begin, end) starts, after the line ends that begin may point at, and counts them
 	template <class T>
-	void ContentBounds(T &buffer_handles, LinePosition &content_begin, idx_t &front, idx_t &back) const {
+	void ContentBegin(T &buffer_handles, LinePosition &content_begin, idx_t &front) const {
 		content_begin = StartOfNextBufferAtEnd(buffer_handles, begin);
 		front = 0;
-		back = 0;
 		// line ends at the start are those of the line before and of empty lines, which are no content
 		while (Before(content_begin, end)) {
 			auto entry = buffer_handles.find(content_begin.buffer_idx);
@@ -93,22 +91,15 @@ public:
 			content_begin.buffer_pos++;
 			content_begin = StartOfNextBufferAtEnd(buffer_handles, content_begin);
 		}
-		auto entry = buffer_handles.find(end.buffer_idx);
-		if (Before(content_begin, end) && end.buffer_pos > 0 && entry != buffer_handles.end() &&
-		    end.buffer_pos < entry->second->actual_size && entry->second->Ptr()[end.buffer_pos] == '\n' &&
-		    entry->second->Ptr()[end.buffer_pos - 1] == '\r') {
-			back = 1;
-		}
 	}
-	//! The content size of the line, without any line end
+	//! The content size of the line, without any line end, since a line ends at the carriage return of a carriage
+	//! return and newline
 	template <class T>
 	idx_t LineSize(T &buffer_handles) const {
 		LinePosition content_begin;
 		idx_t front;
-		idx_t back;
-		ContentBounds(buffer_handles, content_begin, front, back);
-		const idx_t size = Distance(buffer_handles, content_begin, end);
-		return size > back ? size - back : 0;
+		ContentBegin(buffer_handles, content_begin, front);
+		return Distance(buffer_handles, content_begin, end);
 	}
 	//! Reconstructs the content of the current line to be used in error messages
 	template <class T>
@@ -118,8 +109,7 @@ public:
 		}
 		LinePosition content_begin;
 		idx_t front;
-		idx_t back;
-		ContentBounds(buffer_handles, content_begin, front, back);
+		ContentBegin(buffer_handles, content_begin, front);
 		first_char_nl = front > 0;
 		string result;
 		for (idx_t buffer_idx = content_begin.buffer_idx; buffer_idx <= end.buffer_idx; buffer_idx++) {
@@ -134,7 +124,6 @@ public:
 				result += buffer[i];
 			}
 		}
-		result.resize(result.size() > back ? result.size() - back : 0);
 		// sanitize borked line
 		SanitizeError(result);
 		return result;
@@ -157,6 +146,8 @@ public:
 	idx_t chunk_idx;
 	//! Current CSV Line size in Bytes
 	idx_t current_line_size;
+	//! False for a line that was not read to its end, whose current_line_size is that of the part read
+	bool line_read_to_end = true;
 	//! Error Message produced
 	string error_message;
 	//! Exact Position where the error happened
@@ -177,12 +168,14 @@ public:
 		is_error_in_line = false;
 	}
 	void Insert(const CSVErrorType &type, const idx_t &col_idx, const idx_t &chunk_idx,
-	            const LinePosition &error_position, const idx_t current_line_size = 0) {
+	            const LinePosition &error_position, const idx_t current_line_size = 0,
+	            const bool line_read_to_end = true) {
 		is_error_in_line = true;
 		if (!ignore_errors) {
 			// We store it for later
 			current_errors.push_back({type, col_idx, chunk_idx, error_position, current_line_size});
 			current_errors.back().current_line_size = current_line_size;
+			current_errors.back().line_read_to_end = line_read_to_end;
 		}
 	}
 	//! Set that we currently have an error, but don't really store them
@@ -365,6 +358,8 @@ public:
 	//! Handles EmptyLine states
 	static inline bool EmptyLine(StringValueResult &result, const idx_t buffer_pos);
 	inline bool AddRowInternal();
+	//! Records a line size error for the current line when its content is longer than maximum_line_size
+	void CheckLineSize(idx_t maximum_line_size);
 	//! The bookkeeping of a value that is not projected
 	inline void SkipValueInternal();
 	//! Moves last_position past the newline that ends the row at buffer_pos

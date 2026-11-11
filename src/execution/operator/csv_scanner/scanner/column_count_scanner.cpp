@@ -108,7 +108,7 @@ void ColumnCountResult::InvalidState(ColumnCountResult &result) {
 
 bool ColumnCountResult::EmptyLine(ColumnCountResult &result, idx_t buffer_pos) {
 	result.empty_lines++;
-	// an empty line is no part of the line after it
+	// an empty line is no part of the line after it, so the buffers it spans are released
 	result.last_position = LinePosition(result.cur_buffer_idx, buffer_pos + 1, result.current_buffer_size);
 	return false;
 }
@@ -212,7 +212,7 @@ void ColumnCountScanner::FinalizeChunkProcess() {
 					    CSVError::LineSizeError(result.state_machine.options, lines_per_batch, csv_row,
 					                            result.last_position.GetGlobalPosition(
 					                                result.state_machine.options.buffer_size_option.GetValue(), false),
-					                            result.state_machine.options.file_path);
+					                            result.state_machine.options.file_path, false);
 					error_handler->Error(error);
 					result.error = true;
 					return;

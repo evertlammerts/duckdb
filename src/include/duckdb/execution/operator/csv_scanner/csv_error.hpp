@@ -60,9 +60,10 @@ public:
 	static CSVError CastError(const CSVReaderOptions &options, const string &column_name, string &cast_error,
 	                          idx_t column_idx, string &csv_row, LinesPerBoundary error_info, idx_t row_byte_position,
 	                          optional_idx byte_position, LogicalTypeId type, const String &current_path);
-	//! Produces error for when the line size exceeds the maximum line size option
+	//! Produces error for when the line size exceeds the maximum line size option; csv_row is only the part read of a
+	//! line that was not read to its end
 	static CSVError LineSizeError(const CSVReaderOptions &options, LinesPerBoundary error_info, string &csv_row,
-	                              idx_t byte_position, const String &current_path);
+	                              idx_t byte_position, const String &current_path, bool line_read_to_end = true);
 	//! Produces error for when the state machine reaches an invalid state
 	static CSVError InvalidState(const CSVReaderOptions &options, idx_t current_column, LinesPerBoundary error_info,
 	                             string &csv_row, idx_t row_byte_position, optional_idx byte_position,

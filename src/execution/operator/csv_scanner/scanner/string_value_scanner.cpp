@@ -19,6 +19,15 @@
 
 #include <algorithm>
 
+// the measure of a line that crosses a buffer or is long stays out of AddRowInternal, which is inlined in the row loop
+#if defined(_MSC_VER)
+#define DUCKDB_CSV_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__)
+#define DUCKDB_CSV_NOINLINE __attribute__((noinline))
+#else
+#define DUCKDB_CSV_NOINLINE
+#endif
+
 namespace duckdb {
 
 constexpr idx_t StringValueScanner::LINE_FINDER_ID;
@@ -717,6 +726,10 @@ void StringValueResult::HandleUnicodeError(idx_t col_idx, LinePosition &error_po
 }
 
 bool LineError::HandleErrors(StringValueResult &result) {
+	// every row comes here, so a row without an error leaves before the error path, whose line printing is large
+	if (!is_error_in_line) {
+		return false;
+	}
 	bool skip_sniffing = false;
 	for (auto &cur_error : current_errors) {
 		if (cur_error.type == CSVErrorType::INVALID_ENCODING) {
@@ -812,7 +825,8 @@ bool LineError::HandleErrors(StringValueResult &result) {
 		case MAXIMUM_LINE_SIZE:
 			csv_error = CSVError::LineSizeError(
 			    result.state_machine.options, lines_per_batch, borked_line,
-			    result.current_line_position.begin.GetGlobalPosition(result.requested_size, first_nl), result.path);
+			    result.current_line_position.begin.GetGlobalPosition(result.requested_size, first_nl), result.path,
+			    cur_error.line_read_to_end);
 			break;
 		case INVALID_STATE:
 			if (result.current_line_position.begin == line_pos) {
@@ -880,18 +894,22 @@ void StringValueResult::StoreLinePosition() {
 	}
 }
 
+DUCKDB_CSV_NOINLINE void StringValueResult::CheckLineSize(const idx_t maximum_line_size) {
+	const idx_t current_line_size = current_line_position.LineSize(buffer_handles);
+	if (current_line_size > maximum_line_size) {
+		current_errors.Insert(MAXIMUM_LINE_SIZE, 1, chunk_col_id, last_position, current_line_size);
+	}
+}
+
 bool StringValueResult::AddRowInternal() {
 	LinePosition current_line_start = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, buffer_size};
 	current_line_position.begin = current_line_position.end;
 	current_line_position.end = current_line_start;
 	const idx_t maximum_line_size = state_machine.options.maximum_line_size.GetValue();
 	// within one buffer the line ends only add to the distance, so a line within it is measured only when long
-	if (current_line_position.begin.buffer_idx != current_line_position.end.buffer_idx ||
-	    current_line_position.end - current_line_position.begin > maximum_line_size) {
-		const idx_t current_line_size = current_line_position.LineSize(buffer_handles);
-		if (current_line_size > maximum_line_size) {
-			current_errors.Insert(MAXIMUM_LINE_SIZE, 1, chunk_col_id, last_position, current_line_size);
-		}
+	if (current_line_position.end - current_line_position.begin > maximum_line_size ||
+	    current_line_position.begin.buffer_idx != current_line_position.end.buffer_idx) {
+		CheckLineSize(maximum_line_size);
 	}
 	if (!state_machine.options.null_padding) {
 		for (idx_t col_idx = cur_col_id; col_idx < number_of_columns; col_idx++) {
@@ -1513,11 +1531,11 @@ void StringValueScanner::ProcessOverBufferValue() {
 			        buffer_handle_ptr[iterator.pos.buffer_pos] == '\r')) {
 				if (buffer_handle_ptr[iterator.pos.buffer_pos] == '\r') {
 					if (result.last_position.buffer_pos <= previous_buffer_handle->actual_size) {
-						// we add the value
-						result.AddValue(result, previous_buffer_handle->actual_size);
+						// the text after a comment marker is no value, so the comment is decided before any value
 						if (result.IsCommentSet(result)) {
 							result.UnsetComment(result, iterator.pos.buffer_pos);
 						} else {
+							result.AddValue(result, previous_buffer_handle->actual_size);
 							result.AddRow(result, previous_buffer_handle->actual_size);
 						}
 						state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
@@ -1582,7 +1600,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 	    !result.comment && !cur_buffer_handle->is_last_buffer) {
 		// The value fills the buffer, so it is joined with the next buffer from its start here, since a value is only
 		// ever joined across two buffers.
-		result.last_position = {iterator.pos.buffer_idx, 0, cur_buffer_handle->actual_size};
+		result.last_position = {iterator.pos.buffer_idx,
+		                        result.last_position.buffer_pos - previous_buffer_handle->actual_size,
+		                        cur_buffer_handle->actual_size};
 		over_buffer_value_open = true;
 		return;
 	}
@@ -1935,6 +1955,11 @@ bool StringValueScanner::IsRowValid(CSVIterator &current_iterator) const {
 	try {
 		auto &tuples = scan_finder->ParseChunk();
 		current_iterator.pos = scan_finder->GetIteratorPosition();
+		// a quote opened at a wrong start can run through the next buffer to the end of the file, which a read that is
+		// not strict accepts as one row
+		if (scan_finder->FinishedFile() && scan_finder->states.IsQuotedCurrent()) {
+			return false;
+		}
 		bool has_error = false;
 		if (tuples.current_errors.HasError()) {
 			if (tuples.current_errors.Size() != 1 || !tuples.current_errors.HasErrorType(MAXIMUM_LINE_SIZE)) {
@@ -2092,20 +2117,17 @@ void StringValueScanner::FinishBoundaryScan(const bool moved) {
 			line_ended = ProcessExtraRow();
 		}
 		// The next boundary skips to the line after this one, so a line that runs past the buffer is finished here.
-		// A line this scan owns starts in the boundary's buffer or at the start of the next one, so within
-		// max_line_size it ends two buffers after the boundary's at the latest.
 		bool crossed = moved;
 		while (!line_ended && !cur_buffer_handle->is_last_buffer) {
 			FullLinePosition open_line;
 			open_line.begin = result.current_line_position.end;
 			open_line.end = {iterator.pos.buffer_idx, MinValue(iterator.pos.buffer_pos, cur_buffer_handle->actual_size),
 			                 cur_buffer_handle->actual_size};
-			const bool beyond_reach = iterator.pos.buffer_idx >= iterator.GetBoundaryBufferIdx() + 2;
 			const idx_t line_size = open_line.LineSize(result.buffer_handles);
-			if (beyond_reach || (crossed && line_size > state_machine->options.maximum_line_size.GetValue())) {
+			if (crossed && line_size > state_machine->options.maximum_line_size.GetValue()) {
 				result.current_line_position = open_line;
-				result.current_errors.Insert(MAXIMUM_LINE_SIZE, 1, result.chunk_col_id, result.last_position,
-				                             line_size);
+				result.current_errors.Insert(MAXIMUM_LINE_SIZE, 1, result.chunk_col_id, result.last_position, line_size,
+				                             false);
 				const auto chunk_col_id_before = result.chunk_col_id;
 				if (result.current_errors.HandleErrors(result)) {
 					result.InvalidateUnwrittenColumns(chunk_col_id_before);
@@ -2116,6 +2138,9 @@ void StringValueScanner::FinishBoundaryScan(const bool moved) {
 				states.Initialize();
 				break;
 			}
+			// buffers before the last are full and at least max_line_size, so a line still open at the end of the
+			// second buffer after the boundary's is over the limit
+			D_ASSERT(iterator.pos.buffer_idx < iterator.GetBoundaryBufferIdx() + 2);
 			const auto move_result = TryMoveToNextBuffer();
 			if (move_result == MoveBufferResult::NOT_IN_MEMORY) {
 				suspended = true;
