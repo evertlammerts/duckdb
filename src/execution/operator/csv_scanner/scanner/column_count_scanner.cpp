@@ -42,12 +42,16 @@ idx_t ColumnCountResult::GetMostFrequentColumnCount() const {
 
 bool ColumnCountResult::AddRow(ColumnCountResult &result, idx_t buffer_pos) {
 	const LinePosition cur_position(result.cur_buffer_idx, buffer_pos + 1, result.current_buffer_size);
-	if (cur_position - result.last_position > result.state_machine.options.maximum_line_size.GetValue() &&
-	    buffer_pos != NumericLimits<idx_t>::Maximum()) {
+	FullLinePosition current_line_position;
+	current_line_position.begin = result.last_position;
+	current_line_position.end = LinePosition(result.cur_buffer_idx, buffer_pos, result.current_buffer_size);
+	const idx_t maximum_line_size = result.state_machine.options.maximum_line_size.GetValue();
+	// within one buffer the line ends only add to the distance, so a line within it is measured only when long
+	if (buffer_pos != NumericLimits<idx_t>::Maximum() &&
+	    (current_line_position.begin.buffer_idx != current_line_position.end.buffer_idx ||
+	     current_line_position.end - current_line_position.begin > maximum_line_size) &&
+	    current_line_position.LineSize(result.buffer_handles) > maximum_line_size) {
 		LinesPerBoundary lines_per_batch;
-		FullLinePosition current_line_position;
-		current_line_position.begin = result.last_position;
-		current_line_position.end = cur_position;
 		bool mock = false;
 		string csv_row = current_line_position.ReconstructCurrentLine(mock, result.buffer_handles, true);
 		auto error = CSVError::LineSizeError(
@@ -104,6 +108,8 @@ void ColumnCountResult::InvalidState(ColumnCountResult &result) {
 
 bool ColumnCountResult::EmptyLine(ColumnCountResult &result, idx_t buffer_pos) {
 	result.empty_lines++;
+	// an empty line is no part of the line after it, so the buffers it spans are released
+	result.last_position = LinePosition(result.cur_buffer_idx, buffer_pos + 1, result.current_buffer_size);
 	return false;
 }
 
@@ -121,7 +127,7 @@ ColumnCountScanner::ColumnCountScanner(shared_ptr<CSVBufferManager> buffer_manag
 	idx_t actual_size = 0;
 	if (cur_buffer_handle) {
 		actual_size = cur_buffer_handle->actual_size;
-		result.buffer_handles[0] = cur_buffer_handle;
+		result.buffer_handles[cur_buffer_handle->buffer_idx] = cur_buffer_handle;
 	}
 	result.last_position = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, actual_size};
 	result.current_buffer_size = actual_size;
@@ -195,24 +201,26 @@ void ColumnCountScanner::FinalizeChunkProcess() {
 				// Do a quick check that the line is still sane
 				const LinePosition cur_position(result.cur_buffer_idx, 0, result.current_buffer_size);
 				LinesPerBoundary lines_per_batch;
-				if (cur_position - result.last_position > result.state_machine.options.maximum_line_size.GetValue()) {
-					FullLinePosition current_line_position;
-					current_line_position.begin = result.last_position;
-					current_line_position.end = cur_position;
+				FullLinePosition current_line_position;
+				current_line_position.begin = result.last_position;
+				current_line_position.end = cur_position;
+				if (current_line_position.LineSize(result.buffer_handles) >
+				    result.state_machine.options.maximum_line_size.GetValue()) {
 					bool mock = false;
 					string csv_row = current_line_position.ReconstructCurrentLine(mock, result.buffer_handles, true);
 					auto error =
 					    CSVError::LineSizeError(result.state_machine.options, lines_per_batch, csv_row,
 					                            result.last_position.GetGlobalPosition(
 					                                result.state_machine.options.buffer_size_option.GetValue(), false),
-					                            result.state_machine.options.file_path);
+					                            result.state_machine.options.file_path, false);
 					error_handler->Error(error);
 					result.error = true;
 					return;
 				}
 			}
-			if (result.buffer_handles.size() > 2) {
-				// pop lowest value
+			// the buffer the open line starts in stays, since the line is measured and printed from there
+			while (result.buffer_handles.size() > 2 &&
+			       result.buffer_handles.begin()->first < result.last_position.buffer_idx) {
 				result.buffer_handles.erase(result.buffer_handles.begin());
 			}
 			iterator.pos.buffer_pos = 0;

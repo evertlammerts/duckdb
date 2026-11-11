@@ -1,4 +1,5 @@
 #include "duckdb/execution/operator/csv_scanner/csv_validator.hpp"
+#include "duckdb/common/helper.hpp"
 #include <sstream>
 
 namespace duckdb {
@@ -26,7 +27,8 @@ void ThreadLines::Verify() const {
 			initialized = true;
 		} else {
 			if (line_info.second.start_pos == line_info.second.end_pos) {
-				last_end_pos = line_info.second.end_pos;
+				// A scan that read nothing can skip ahead, but the line before it may end past its position.
+				last_end_pos = MaxValue(last_end_pos, line_info.second.end_pos);
 				continue;
 			}
 			if (last_end_pos + error_margin < line_info.second.start_pos ||

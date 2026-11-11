@@ -110,6 +110,10 @@ idx_t CSVIterator::GetBufferIdx() const {
 	return pos.buffer_idx;
 }
 
+idx_t CSVIterator::GetBoundaryBufferIdx() const {
+	return boundary.buffer_idx;
+}
+
 idx_t CSVIterator::GetBoundaryIdx() const {
 	return boundary.boundary_idx;
 }

@@ -73,7 +73,7 @@ statement ok
 set variable max_line_size=(SELECT COALESCE(MAX(strlen(csv_line)), 0) FROM reject_errors)
 
 statement ok
-set variable potential_buffer_sizes=(SELECT range(getvariable('max_line_size') + 3, getvariable('max_line_size') + 8))
+set variable potential_buffer_sizes=(SELECT range(getvariable('max_line_size') + 4, getvariable('max_line_size') + 9))
 
 statement ok
 create or replace table ground_truth as SELECT * FROM read_csv_auto('{file}') ORDER BY ALL;

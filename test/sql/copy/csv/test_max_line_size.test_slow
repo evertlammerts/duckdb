@@ -23,7 +23,7 @@ CREATE TABLE test (a INTEGER, b VARCHAR, c INTEGER);
 statement error
 COPY test FROM '{TEST_DIR}/test.csv';
 ----
-Possible Solution: Change the maximum length size, e.g., max_line_size=10485769
+Possible Solution: Change the maximum length size, e.g., max_line_size=10485768
 
 # we can override the max line size
 statement ok
