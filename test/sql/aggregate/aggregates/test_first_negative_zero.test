@@ -44,6 +44,19 @@ SELECT (SELECT [y] FROM (SELECT d AS y FROM zeros) t)::VARCHAR;
 ----
 [-0.0]
 
+# an ASOF join over a small build side is planned as first with arg_max_null or arg_min_null
+query II
+SELECT a.g, b.l::VARCHAR FROM (VALUES (1, 5)) a(g, ts)
+ASOF JOIN (SELECT 1 AS g, 1 AS ts, ['-0.0'::DOUBLE] AS l) b ON a.g = b.g AND a.ts >= b.ts;
+----
+1	[-0.0]
+
+query II
+SELECT a.g, b.l::VARCHAR FROM (VALUES (1, 0)) a(g, ts)
+ASOF JOIN (SELECT 1 AS g, 1 AS ts, ['-0.0'::DOUBLE] AS l) b ON a.g = b.g AND a.ts <= b.ts;
+----
+1	[-0.0]
+
 # NULL rows, NULL elements and NaN beside the zero
 query II
 SELECT first([d, NULL, 'nan'::DOUBLE])::VARCHAR, first({'a': NULL, 'b': [f, NULL]})::VARCHAR FROM zeros;
@@ -166,6 +179,13 @@ SELECT finalize(to_aggregate_state({'value': ['-0.0'::DOUBLE]}, 'first', ['DOUBL
 	finalize(to_aggregate_state({'arg': ['-0.0'::DOUBLE], 'by': [1]}, 'arg_max', ['DOUBLE[]', 'INTEGER[]']))::VARCHAR;
 ----
 [-0.0]	[-0.0]	[-0.0]	[-0.0]	[-0.0]
+
+# an imported by field keeps the key that merges the two zeros, so the next field decides
+query I
+SELECT finalize(combine(to_aggregate_state({'arg': 1, 'by': ['-0.0'::DOUBLE, 2]}, 'arg_min', ['INTEGER', 'DOUBLE[]']),
+	to_aggregate_state({'arg': 2, 'by': [0.0, 1]}, 'arg_min', ['INTEGER', 'DOUBLE[]'])));
+----
+2
 
 # ordering, DISTINCT and grouping still treat the two zeros as one value
 query II

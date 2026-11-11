@@ -991,12 +991,10 @@ static void CreateSingleColumnSortKey(const Vector &input, idx_t input_count, Or
 }
 
 static void SetNullSortKeys(const Vector &input, Vector &result, idx_t count) {
-	UnifiedVectorFormat format;
-	input.ToUnifiedFormat(format);
+	auto input_validity = input.Validity();
 	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < count; i++) {
-		auto idx = format.sel->get_index(i);
-		if (!format.validity.RowIsValid(idx)) {
+		if (!input_validity.IsValid(i)) {
 			validity.SetInvalid(i);
 		}
 	}

@@ -806,7 +806,7 @@ void SpecializeArgMinMaxNFunction(PhysicalType val_type, PhysicalType arg_type, 
 		break;
 #endif
 	default:
-		SpecializeArgMinMaxNFunction<MinMaxFallbackArgValue, COMPARATOR>(arg_type, function);
+		SpecializeArgMinMaxNFunction<MinMaxFallbackReturnValue, COMPARATOR>(arg_type, function);
 		break;
 	}
 }
@@ -875,7 +875,7 @@ void SpecializeArgMinMaxNullNFunction(PhysicalType val_type, PhysicalType arg_ty
 		break;
 #endif
 	default:
-		SpecializeArgMinMaxNullNFunction<MinMaxFallbackArgValue, NULLS_LAST, COMPARATOR>(arg_type, function);
+		SpecializeArgMinMaxNullNFunction<MinMaxFallbackReturnValue, NULLS_LAST, COMPARATOR>(arg_type, function);
 		break;
 	}
 }

@@ -416,7 +416,7 @@ struct MinMaxSortKeyValue {
 
 using MinMaxFallbackValue = MinMaxSortKeyValue<false>;
 //! The value side of arg_min and arg_max is never compared, so it keeps the sign of -0.0.
-using MinMaxFallbackArgValue = MinMaxSortKeyValue<true>;
+using MinMaxFallbackReturnValue = MinMaxSortKeyValue<true>;
 
 template <class T, bool NULLS_LAST>
 struct ValueOrNull {
