@@ -1169,7 +1169,8 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
 }
 
-TEST_CASE("An error inside a view or table macro body bound through a relation reports no location", "[relation_api]") {
+TEST_CASE("An error inside a view or table macro body or a query() string bound through a relation reports no location",
+          "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -1221,4 +1222,24 @@ TEST_CASE("An error inside a view or table macro body bound through a relation r
 	REQUIRE(StringUtil::Contains(result->GetError(), "Could not convert string"));
 	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
 	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	struct QueryCall {
+		string function;
+		string argument;
+		string message;
+	};
+	for (auto &call :
+	     vector<QueryCall> {{"query", "SELECT 1, 2, 3, 4, 5, 6 FROMM missing_tbl", "syntax error"},
+	                        {"query", "SELECT 1, 2, 3, 4, 5, 6 FROM missing_tbl", "missing_tbl does not exist"},
+	                        {"query_table", "missing_tbl", "missing_tbl does not exist"}}) {
+		try {
+			con.TableFunction(call.function, {Value(call.argument)})->Execute();
+			FAIL("expected an error");
+		} catch (std::exception &ex) {
+			string message = ex.what();
+			REQUIRE(StringUtil::Contains(message, call.message));
+			REQUIRE(!StringUtil::Contains(message, "\"position\""));
+			REQUIRE(!StringUtil::Contains(message, "\"location\""));
+		}
+	}
 }
