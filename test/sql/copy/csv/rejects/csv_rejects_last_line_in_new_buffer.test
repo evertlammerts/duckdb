@@ -305,7 +305,7 @@ SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/unterminated_quote.csv'
 3
 ab
 
-# a quoted value that is still open at the end of a buffer in the middle of the file is not dropped
+# guards the end of file condition: a quoted value open at the end of a middle buffer is not skipped as unterminated
 query II
 SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/quote_past_buffer.csv', columns={'a': 'INTEGER', 'b': 'VARCHAR'},
     auto_detect=false, buffer_size=4, parallel=false, ignore_errors=true);
@@ -351,7 +351,7 @@ DROP TABLE reject_errors;
 statement ok
 DROP TABLE reject_scans;
 
-# the scanner of the last buffer starts inside the quoted value; the parallel reader refuses the file as before
+# the scanner of the last buffer starts inside the quoted value, and the parallel validator refuses the file
 statement error
 SELECT * FROM read_csv('{DATA_DIR}/csv/rejects/last_line/quoted_newline.csv', columns={'c': 'VARCHAR'},
     auto_detect=false, buffer_size=6);
