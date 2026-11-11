@@ -5,9 +5,6 @@
 require json
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE j AS SELECT i, ('{"k": ' || i || '}')::JSON AS v FROM range(1, 5) r(i);
 
 statement ok
@@ -25,9 +22,26 @@ SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(A -> A.pos) AS f PAT
 ----
 10
 
-# with the deprecated arrow an arrow is a lambda as well, whose parameter is its own
+# nor does it bind a lambda parameter named like the column behind the variable
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([99], lambda pos: FIRST(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+# With the deprecated arrow an arrow is a lambda as well, but only where the binder tries one: as a direct argument
+# of a scalar function. Inside a navigation it is still the JSON operator.
 statement ok
 SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(v -> '$.k')) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(A -> A.pos) AS f PATTERN (A) DEFINE A AS true);
+----
+10
 
 query I rowsort
 SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda w: PREV(list_sum(list_transform([i], w -> w)))) AS z PATTERN (A B) DEFINE B AS true);

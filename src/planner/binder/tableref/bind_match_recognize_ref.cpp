@@ -24,6 +24,7 @@
 
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/column_qualifier.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -106,17 +107,8 @@ static unique_ptr<MatchRecognizePattern> BuildPattern(const ParsedExpression &ex
 struct HoistedInputRefs {
 	HoistedInputRefs(Binder &binder_p, GeneratedNames &names_p, const case_insensitive_set_t &input_columns_p,
 	                 const case_insensitive_set_t &input_tables_p)
-	    : binder(binder_p), arrow_lambdas(MatchRecognizeArrowLambdas(binder_p.context)), names(names_p),
-	      input_columns(input_columns_p), input_tables(input_tables_p) {
-	}
-
-	//! Whether a qualified call names a function in the catalog, which the engine prefers to a method call
-	bool IsCatalogFunction(const FunctionExpression &function) {
-		QueryErrorContext error_context(function.GetQueryLocation());
-		EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, QualifiedName(function.FunctionName()),
-		                       error_context);
-		auto bound_name = Binder::BindTableName(binder.EntryRetriever(), function.GetQualifiedName());
-		return binder.GetCatalogEntry(EntryLookupInfo(lookup, bound_name), OnEntryNotFound::RETURN_NULL) != nullptr;
+	    : binder(binder_p), arrows(binder_p), names(names_p), input_columns(input_columns_p),
+	      input_tables(input_tables_p) {
 	}
 
 	//! The subquery column standing for this reference, allocated on first use. Behind a pattern
@@ -148,8 +140,7 @@ struct HoistedInputRefs {
 	}
 
 	Binder &binder;
-	//! Whether an arrow can be a lambda at all, which only the deprecated single arrow setting allows
-	const bool arrow_lambdas;
+	const MatchRecognizeArrowScope arrows;
 	GeneratedNames &names;
 	const case_insensitive_set_t &input_columns;
 	const case_insensitive_set_t &input_tables;
@@ -177,16 +168,6 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 			lambda_parameters.pop_back();
 			return;
 		}
-		// The arrow is a lambda or the JSON operator, and only binding the function around it settles which. Its
-		// references are hoisted as if it were the operator, but a qualifier it may bind is not dropped.
-		if (MatchRecognizeArrowParameters(*expr, refs.arrow_lambdas, parameters)) {
-			arrow_parameters.push_back(std::move(parameters));
-			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-				HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
-			});
-			arrow_parameters.pop_back();
-			return;
-		}
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
@@ -194,7 +175,8 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 		// The parser keeps the receiver of X.c.f() in the function's name, and the engine reads it as a method
 		// call when no catalog function has that name. Turned into the call on the column path here, the
 		// reference is resolved below like any other, as the variable's column or a lambda parameter's field.
-		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) && !refs.IsCatalogFunction(function)) {
+		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) &&
+		    !ColumnQualifier::FindFunction(refs.binder, function)) {
 			unique_ptr<ParsedExpression> receiver =
 			    make_uniq<ColumnRefExpression>(vector<Identifier>(path.begin(), path.end() - 1));
 			receiver->SetQueryLocation(function.GetQueryLocation());
@@ -229,7 +211,19 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 		}
 		return;
 	}
+	const auto call = expr->GetExpressionClass() == ExpressionClass::FUNCTION;
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		// An arrow lambda's references are hoisted as if it were the JSON operator, which renames a parameter and
+		// its uses alike, but a qualifier it binds is not dropped.
+		identifier_set_t parameters;
+		if (call && refs.arrows.IsLambda(expr->Cast<FunctionExpression>(), *child, parameters)) {
+			arrow_parameters.push_back(std::move(parameters));
+			ParsedExpressionIterator::EnumerateChildren(*child, [&](unique_ptr<ParsedExpression> &part) {
+				HoistInputReferences(part, symbols, aliases, refs, lambda_parameters, arrow_parameters);
+			});
+			arrow_parameters.pop_back();
+			return;
+		}
 		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
 	});
 }
@@ -256,25 +250,12 @@ static bool HasExclusion(const ParsedExpression &expr) {
 static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const ParsedExpression &expr,
                                                                          const vector<identifier_set_t> &enclosing,
                                                                          vector<identifier_set_t> &inner,
-                                                                         bool arrow_lambdas) {
+                                                                         const MatchRecognizeArrowScope &arrows) {
 	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(expr, parameters)) {
 			inner.push_back(std::move(parameters));
-			auto found =
-			    FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner, arrow_lambdas);
-			inner.pop_back();
-			return found;
-		}
-		// an arrow may be a lambda of its own, whose parameters then shadow the enclosing ones
-		if (MatchRecognizeArrowParameters(expr, arrow_lambdas, parameters)) {
-			inner.push_back(std::move(parameters));
-			optional_ptr<const ParsedExpression> found;
-			ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
-				if (!found) {
-					found = FindEnclosingLambdaParameter(child, enclosing, inner, arrow_lambdas);
-				}
-			});
+			auto found = FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner, arrows);
 			inner.pop_back();
 			return found;
 		}
@@ -285,11 +266,25 @@ static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const P
 		    !LambdaExpression::IsLambdaParameter(inner, name) && LambdaExpression::IsLambdaParameter(enclosing, name);
 		return bound_outside ? &expr : nullptr;
 	}
+	const auto call = expr.GetExpressionClass() == ExpressionClass::FUNCTION;
 	optional_ptr<const ParsedExpression> found;
 	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
-		if (!found) {
-			found = FindEnclosingLambdaParameter(child, enclosing, inner, arrow_lambdas);
+		if (found) {
+			return;
 		}
+		// an arrow lambda's parameters shadow the enclosing ones
+		identifier_set_t parameters;
+		if (call && arrows.IsLambda(expr.Cast<FunctionExpression>(), child, parameters)) {
+			inner.push_back(std::move(parameters));
+			ParsedExpressionIterator::EnumerateChildren(child, [&](const ParsedExpression &part) {
+				if (!found) {
+					found = FindEnclosingLambdaParameter(part, enclosing, inner, arrows);
+				}
+			});
+			inner.pop_back();
+			return;
+		}
+		found = FindEnclosingLambdaParameter(child, enclosing, inner, arrows);
 	});
 	return found;
 }
@@ -300,13 +295,14 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
                                    vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
-                                   bool arrow_lambdas, vector<identifier_set_t> &lambda_parameters) {
+                                   const MatchRecognizeArrowScope &arrows,
+                                   vector<identifier_set_t> &lambda_parameters) {
 	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
 			lambda_parameters.push_back(std::move(parameters));
 			HoistMeasureNavigation(expr->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
-			                       hoisted, names, arrow_lambdas, lambda_parameters);
+			                       hoisted, names, arrows, lambda_parameters);
 			lambda_parameters.pop_back();
 			return;
 		}
@@ -341,14 +337,14 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			}
 			// the step is computed below the matcher, outside every lambda it is written in
 			vector<identifier_set_t> inner_parameters;
-			auto parameter = FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters,
-			                                              inner_parameters, arrow_lambdas);
+			auto parameter =
+			    FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters, inner_parameters, arrows);
 			if (parameter) {
 				throw BinderException(*parameter, "window functions cannot reference lambda parameters");
 			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, universal, hoisted,
-				                       names, arrow_lambdas, lambda_parameters);
+				                       names, arrows, lambda_parameters);
 			}
 			// a step is a fixed distance through the partition, so the offset is a non-negative
 			// constant - a negative one would step the other way and a column a different way per row
@@ -358,7 +354,7 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			auto inner = std::move(arguments[0].GetExpressionMutable());
 			auto variable = MatchRecognizeNavigationVariable(
 			    inner, [&](const string &name) { return symbols.find(name) != symbols.end(); }, universal,
-			    function_name, arrow_lambdas);
+			    function_name, arrows);
 			// A step names the row it starts from rather than the one it reaches: a pattern variable in
 			// front of it is the row that variable denotes (5.6.2), and FIRST or LAST within it says
 			// which of that variable's rows (5.6.4). Stepping and then reading the row reached is the
@@ -388,8 +384,7 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 		}
 	}
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, arrow_lambdas,
-		                       lambda_parameters);
+		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, arrows, lambda_parameters);
 	});
 }
 
@@ -397,9 +392,9 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
                                    vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
-                                   bool arrow_lambdas) {
+                                   const MatchRecognizeArrowScope &arrows) {
 	vector<identifier_set_t> lambda_parameters;
-	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, arrow_lambdas, lambda_parameters);
+	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, arrows, lambda_parameters);
 }
 
 //! The conditions and the frame are bound against the input but evaluated over the projection above
@@ -1139,7 +1134,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	vector<unique_ptr<ParsedExpression>> measure_navigation;
 	for (auto &expr : ref.config->measures_expression_list) {
 		HoistMeasureNavigation(expr, *window_template, measure_symbols, input_refs.universal, measure_navigation, names,
-		                       input_refs.arrow_lambdas);
+		                       input_refs.arrows);
 	}
 	if (!measure_navigation.empty()) {
 		SelectBinder navigation_binder(*define_binder, context, define_node);

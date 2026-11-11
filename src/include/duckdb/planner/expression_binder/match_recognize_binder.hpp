@@ -232,6 +232,20 @@ void MatchRecognizeRejectNavigationInAggregate(const ParsedExpression &argument,
 //! CLASSIFIER(), with or without a variable in front of it, anywhere in the expression
 bool MatchRecognizeContainsClassifier(const ParsedExpression &expr);
 
+//! Where the arrow form is a lambda rather than the JSON operator, decided as the binder decides it: as a direct
+//! argument of a scalar function, under the single arrow setting or when read back from storage before v2.0.0
+class MatchRecognizeArrowScope {
+public:
+	explicit MatchRecognizeArrowScope(Binder &binder);
+
+	//! Whether this argument of the call binds as a lambda, and the names it binds if so
+	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
+
+private:
+	Binder &binder;
+	bool single_arrow;
+};
+
 //! Whether a name is a pattern variable. The two clauses hold their symbols differently, so which
 //! names are theirs is the caller's to say.
 using MatchRecognizeIsSymbol = std::function<bool(const string &)>;
@@ -243,7 +257,7 @@ using MatchRecognizeIsSymbol = std::function<bool(const string &)>;
 //! as a whole.
 string MatchRecognizeNavigationVariable(unique_ptr<ParsedExpression> &inner, const MatchRecognizeIsSymbol &symbols,
                                         const case_insensitive_map_t<string> &universal, const string &function_name,
-                                        bool arrow_lambdas);
+                                        const MatchRecognizeArrowScope &arrows);
 
 //! FIRST() and LAST() count from the end of the match they read from, by a constant the two clauses
 //! spell the same way.
@@ -255,10 +269,5 @@ unique_ptr<ParsedExpression> MatchRecognizeStateField(const string &state, const
 //! The names a lambda binds for its body, or false when the expression is only spelled like one: the
 //! arrow form is also the JSON operator, and which it is only settles when the function is bound.
 bool MatchRecognizeLambdaParameters(const ParsedExpression &expr, identifier_set_t &parameters);
-//! Whether the arrow form can be a lambda, which only the deprecated single arrow setting allows: otherwise it is
-//! the JSON operator
-bool MatchRecognizeArrowLambdas(ClientContext &context);
-//! The names the arrow form would bind if it turns out to be a lambda
-bool MatchRecognizeArrowParameters(const ParsedExpression &expr, bool arrow_lambdas, identifier_set_t &parameters);
 
 } // namespace duckdb

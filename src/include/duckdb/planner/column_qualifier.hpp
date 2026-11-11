@@ -44,6 +44,8 @@ public:
 	                        const bool within_function_expression = false);
 
 	optional_ptr<CatalogEntry> QualifyFunction(FunctionExpression &function);
+	//! The function a call names in the catalog, as it is written, or nothing
+	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function);
 
 private:
 	Binder &binder;
