@@ -1,0 +1,249 @@
+# name: test/sql/error/error_location_stored_query_execution.test
+# description: An error raised at execution from a part of a stored view or macro body points at the reference that pulled it in
+# group: [error]
+
+statement ok
+CREATE TABLE cast_src (s VARCHAR);
+
+statement ok
+INSERT INTO cast_src VALUES ('x');
+
+statement ok
+CREATE VIEW v_cast AS SELECT s::INTEGER AS i FROM cast_src;
+
+statement ok
+CREATE VIEW vv_cast AS SELECT * FROM v_cast;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+                                                             ^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM vv_cast
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM vv_cast
+                                                             ^^^^^^^
+
+statement ok
+CREATE VIEW v_cast_in_subquery AS SELECT (SELECT max(s::INTEGER) FROM cast_src) AS i;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast_in_subquery
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast_in_subquery
+                                                             ^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, (SELECT max(i) FROM v_cast) AS second_column
+----
+LINE 1: SELECT 1 AS first_column, (SELECT max(i) FROM v_cast) AS second_column
+                                                      ^^^^^^
+
+# parts of a view body that the expression tree does not hold: pivot and unpivot columns, a NEAREST ranking expression
+# and the input of MATCH_RECOGNIZE
+statement ok
+CREATE TABLE pivot_src (k INTEGER, c VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO pivot_src VALUES (1, 'x', 1);
+
+statement ok
+CREATE VIEW v_pivot AS SELECT * FROM (PIVOT pivot_src ON (c::INTEGER) IN (1) USING sum(val) GROUP BY k);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+                                                             ^^^^^^^
+
+statement ok
+CREATE VIEW v_unpivot AS SELECT * FROM (UNPIVOT (SELECT k, c FROM pivot_src) ON (c::INTEGER) AS x INTO NAME n VALUE val);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_unpivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_unpivot
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE nearest_left (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE TABLE nearest_right (id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO nearest_left VALUES (1, [1, 2]);
+
+statement ok
+INSERT INTO nearest_right VALUES (1, 'x');
+
+statement ok
+CREATE VIEW v_nearest AS SELECT l.id FROM nearest_left l JOIN nearest_right r NEAREST 1 BY DISTANCE array_distance(l.e, r.s::FLOAT[2]);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE match_src (p INTEGER, o INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO match_src VALUES (1, 1, 'x');
+
+statement ok
+CREATE VIEW v_match AS SELECT * FROM (SELECT p, o, s::INTEGER AS v FROM match_src) MATCH_RECOGNIZE (PARTITION BY p ORDER BY o MEASURES FIRST(v) AS mv ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+                                                             ^^^^^^^
+
+# a macro body points at its call, and a call inside a view body points at the view reference
+statement ok
+CREATE MACRO plus_int(x) AS 1 + ('0' || x)::INTEGER;
+
+statement ok
+CREATE VIEW v_over_scalar_macro AS SELECT plus_int(s) AS i FROM cast_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, plus_int(s) FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, plus_int(s) FROM cast_src
+                                                      ^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_scalar_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_scalar_macro
+                                                             ^^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO tm_cast() AS TABLE SELECT s::INTEGER AS i FROM cast_src;
+
+statement ok
+CREATE VIEW v_over_table_macro AS SELECT * FROM tm_cast();
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM tm_cast()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM tm_cast()
+                                                             ^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_table_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_table_macro
+                                                             ^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO sum_int(x) AS sum(x::INTEGER);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sum_int(s) OVER () FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sum_int(s) OVER () FROM cast_src
+                                                      ^
+
+statement ok
+CREATE MACRO max_over_view() AS (SELECT max(i) FROM v_cast);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+                                                      ^^^^^^^^^^^^^^^
+
+# the arguments of a macro come from the calling query and keep their locations in it
+statement ok
+CREATE MACRO add_one(x) AS x + 1;
+
+statement ok
+CREATE MACRO tm_arg(x) AS TABLE SELECT x AS i FROM range(1);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, add_one(CAST(s AS INTEGER)) FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, add_one(CAST(s AS INTEGER)) FROM cast_src
+                                                              ^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
+                                                ^^^^^^^^^^^^^^^^^^^^
+
+# a default value of a macro parameter points at the call, an argument given for it keeps its place
+statement ok
+CREATE TABLE default_src (a INTEGER);
+
+statement ok
+INSERT INTO default_src VALUES (1);
+
+statement ok
+CREATE MACRO sm_eq(x, lim := 'all') AS x = lim;
+
+statement ok
+CREATE MACRO tm_filter(lim := 'all') AS TABLE SELECT a FROM default_src WHERE a = lim;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+                                                      ^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, sm_eq(a, lim := CAST('all' AS VARCHAR)) FROM default_src
+----
+LINE 1: SELECT 1 AS first_column, sm_eq(a, lim := CAST('all' AS VARCHAR)) FROM default_src
+                                                  ^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_filter()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_filter()
+                                                             ^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_filter(lim := CAST('all' AS VARCHAR))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_filter(lim := CAST('all' AS VARCHAR))
+                                                          ^^^^^^^^^^^^^^^^^^^^^^
+
+# a body parsed by query points at the call that parsed it
+statement ok
+CREATE MACRO tm_query(q) AS TABLE FROM query(q);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
+----
+<REGEX>:.*"location":"\[53,6\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+----
+<REGEX>:.*"location":"\[46,15\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+----
+<REGEX>:.*"location":"\[46,8\]".*

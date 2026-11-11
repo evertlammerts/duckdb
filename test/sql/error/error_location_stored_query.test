@@ -1,0 +1,526 @@
+# name: test/sql/error/error_location_stored_query.test
+# description: An error raised while a stored view, macro or prepared body is bound points at the reference that pulled it in
+# group: [error]
+
+statement ok
+CREATE TABLE src (a INTEGER, b INTEGER);
+
+statement ok
+CREATE VIEW v AS SELECT a FROM src;
+
+statement ok
+CREATE VIEW v_b AS SELECT b FROM src;
+
+statement ok
+CREATE VIEW vv AS SELECT * FROM v;
+
+statement ok
+CREATE VIEW v_one AS SELECT 1 AS a;
+
+statement ok
+CREATE MACRO tm() AS TABLE SELECT a FROM src;
+
+statement ok
+CREATE MACRO tm_over_view() AS TABLE SELECT a FROM v;
+
+statement ok
+CREATE VIEW v_over_tm AS SELECT * FROM tm();
+
+statement ok
+PREPARE p_over_view AS SELECT 1 AS first_column, 2 AS second_column, a FROM v;
+
+statement ok
+ALTER TABLE src DROP COLUMN b;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_b
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_b
+                                                             ^^^
+
+statement ok
+DROP TABLE src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, v.a FROM v
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, v.a FROM v
+                                                               ^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM vv
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM vv
+                                                             ^^
+
+statement error
+SELECT * FROM v AS aliased_view, range(3) r
+----
+LINE 1: SELECT * FROM v AS aliased_view, range(3) r
+                      ^
+
+statement error
+SELECT 1 AS first_column, (SELECT max(a) FROM v) AS second_column
+----
+LINE 1: SELECT 1 AS first_column, (SELECT max(a) FROM v) AS second_column
+                                                      ^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_over_view()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_over_view()
+                                                             ^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
+                                                             ^^^^^^^^^
+
+# a macro body points at its call, and a call inside a view body points at the view reference
+statement ok
+CREATE TABLE macro_src (a INTEGER);
+
+statement ok
+CREATE MACRO scalar_over_src() AS (SELECT max(a) FROM macro_src);
+
+statement ok
+CREATE VIEW v_over_macro AS SELECT scalar_over_src() AS x;
+
+statement ok
+DROP TABLE macro_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
+                                                             ^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_src() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, scalar_over_src() AS x
+                                                      ^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE TABLE view_in_macro_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_in_macro AS SELECT a FROM view_in_macro_src;
+
+statement ok
+CREATE MACRO scalar_over_view() AS (SELECT max(a) FROM v_in_macro);
+
+statement ok
+DROP TABLE view_in_macro_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+                                                      ^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO inner_add(x) AS x + 1;
+
+statement ok
+CREATE MACRO window_sum(x) AS sum(inner_add(x));
+
+statement ok
+DROP MACRO inner_add;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, window_sum(a) OVER () FROM range(1) t(a)
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, window_sum(a) OVER () FROM range(1) t(a)
+                                                      ^^^^^^^^^^^^^^^^^^^^^
+
+# the arguments of a macro come from the calling query and keep their locations in it
+statement ok
+CREATE MACRO add_one(x) AS x + 1;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, add_one(missing_column)
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, add_one(missing_column)
+                                                              ^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO tm_arg(x) AS TABLE SELECT x AS i FROM range(1);
+
+statement error
+SELECT 1 AS first_column, * FROM tm_arg(no_such_function(1))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_arg(no_such_function(1))
+                                                ^^^^^^^^^^^^^^^^
+
+# an error without a location from a table macro body gets the call's
+statement ok
+CREATE TABLE alias_src (a INTEGER, b INTEGER);
+
+statement ok
+CREATE MACRO tm_alias() AS TABLE SELECT * FROM alias_src AS x(a, b);
+
+statement ok
+DROP TABLE alias_src;
+
+statement ok
+CREATE TABLE alias_src (a INTEGER);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
+                                                             ^^^^^^^^^^
+
+# a default value of a macro parameter points at the call, an argument given for it keeps its place
+statement ok
+CREATE MACRO tm_limit(n := -1) AS TABLE SELECT 42 LIMIT n;
+
+statement ok
+CREATE MACRO sm_limit(n := -1) AS (SELECT 42 LIMIT n);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+                                                             ^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_limit(n := CAST(-1 AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_limit(n := CAST(-1 AS INTEGER))
+                                                       ^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_limit()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sm_limit()
+                                                      ^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, sm_limit(n := CAST(-1 AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, sm_limit(n := CAST(-1 AS INTEGER))
+                                                ^^^^^^^^^^^^^^^^^^^
+
+# a body parsed by query_table or query points at the call that parsed it
+statement ok
+CREATE TABLE query_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_query AS SELECT a FROM query_src;
+
+statement ok
+CREATE MACRO tm_query_table(t) AS TABLE SELECT * FROM query_table(t);
+
+statement ok
+CREATE MACRO tm_query_table_view() AS TABLE SELECT * FROM query_table('v_query');
+
+statement ok
+CREATE MACRO tm_query(q) AS TABLE FROM query(q);
+
+statement ok
+DROP TABLE query_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table_view()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table_view()
+                                                             ^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, no_such_column')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, no_such_column')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('missing_tbl')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('missing_tbl')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('v_query')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('v_query')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, no_such_column')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, no_such_column')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+# a syntax error in the string given to query points at the call as well
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+CREATE VIEW v_query_syntax AS SELECT 1 AS a, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: CREATE VIEW v_query_syntax AS SELECT 1 AS a, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+# a view bound for its columns alone has no reference to point at
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+Table with name src does not exist
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<!REGEX>:.*LINE 1:.*
+
+# an error the outer query raises against the view keeps having no location
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_one AS x(a, b)
+----
+has 1 columns available but 2 columns specified
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_one AS x(a, b)
+----
+<!REGEX>:.*LINE 1:.*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm()
+                                                             ^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, missing_column FROM range(1)
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, missing_column FROM range(1)
+                                                      ^^^^^^^^^^^^^^
+
+# parts of a view body outside its expression tree: a cast's target type, a pivot column, a NEAREST ranking expression,
+# the input of MATCH_RECOGNIZE and the key of a recursive CTE
+statement ok
+CREATE TYPE mood AS ENUM ('happy');
+
+statement ok
+CREATE VIEW v_type AS SELECT 'happy'::mood AS m;
+
+statement ok
+DROP TYPE mood;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, m FROM v_type
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, m FROM v_type
+                                                             ^^^^^^
+
+statement ok
+CREATE TABLE pivot_src (k INTEGER, c VARCHAR, val INTEGER);
+
+statement ok
+CREATE VIEW v_pivot AS SELECT * FROM (PIVOT pivot_src ON c IN ('a') USING sum(val) GROUP BY k);
+
+statement ok
+ALTER TABLE pivot_src RENAME c TO c2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_pivot
+                                                             ^^^^^^^
+
+statement ok
+CREATE TABLE nearest_left (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE TABLE nearest_right (id INTEGER, e FLOAT[2]);
+
+statement ok
+CREATE VIEW v_nearest AS SELECT l.id FROM nearest_left l JOIN nearest_right r NEAREST 1 BY DISTANCE array_distance(l.e, r.e);
+
+statement ok
+ALTER TABLE nearest_right RENAME e TO e2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_nearest
+                                                             ^^^^^^^^^
+
+statement ok
+CREATE TABLE match_src (p INTEGER, o INTEGER, v INTEGER);
+
+statement ok
+CREATE VIEW v_match AS SELECT * FROM (SELECT p, o, v FROM match_src) MATCH_RECOGNIZE (PARTITION BY p ORDER BY o MEASURES FIRST(o) AS ms ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+statement ok
+ALTER TABLE match_src RENAME v TO v2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
+                                                             ^^^^^^^
+
+statement ok
+CREATE TABLE key_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_key AS WITH RECURSIVE t USING KEY (a) AS (SELECT * FROM key_src UNION ALL SELECT * FROM t WHERE false) SELECT * FROM t;
+
+statement ok
+ALTER TABLE key_src RENAME a TO a2;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM v_key
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_key
+                                                             ^^^^^
+
+statement ok
+CREATE TABLE prepared_src (a INTEGER);
+
+statement ok
+PREPARE p AS SELECT 1 AS first_column, 2 AS second_column, a FROM prepared_src;
+
+statement ok
+DROP TABLE prepared_src;
+
+# the EXECUTE statement carries no location of its own, so an error from binding the prepared body has none
+statement error
+EXECUTE p /* a comment that makes this statement longer than the prepared text */
+----
+Table with name prepared_src does not exist
+
+statement error
+EXECUTE p /* a comment that makes this statement longer than the prepared text */
+----
+<!REGEX>:.*LINE 1:.*
+
+statement error
+EXPLAIN EXECUTE p /* a comment that makes this statement longer than the prepared text */
+----
+Table with name prepared_src does not exist
+
+statement error
+EXPLAIN EXECUTE p /* a comment that makes this statement longer than the prepared text */
+----
+<!REGEX>:.*LINE 1:.*
+
+statement error
+EXECUTE p_over_view /* a comment that makes this statement longer than the prepared text */
+----
+Table with name src does not exist
+
+statement error
+EXECUTE p_over_view /* a comment that makes this statement longer than the prepared text */
+----
+<!REGEX>:.*LINE 1:.*
+
+# an error in an EXECUTE parameter is raised in the EXECUTE text and keeps its place
+statement ok
+PREPARE p_param AS SELECT $x::INTEGER AS x;
+
+statement error
+EXECUTE p_param(x := no_such_function(1))
+----
+LINE 1: EXECUTE p_param(x := no_such_function(1))
+                             ^
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM vv
+----
+<REGEX>:.*"position":"53".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM vv
+----
+<REGEX>:.*"location":"\[53,2\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+----
+<REGEX>:.*"location":"\[46,18\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+----
+<REGEX>:.*"location":"\[53,10\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+----
+<REGEX>:.*"location":"\[53,29\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+<REGEX>:.*"location":"\[53,51\]".*
+
+statement error
+EXECUTE p
+----
+<REGEX>:.*prepared_src does not exist.*
+
+statement error
+EXECUTE p
+----
+<!REGEX>:.*"position".*
+
+statement error
+EXECUTE p
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<REGEX>:.*src does not exist.*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<!REGEX>:.*"position".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_tm')
+----
+<REGEX>:.*Table with name src does not exist.*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_tm')
+----
+<!REGEX>:.*"location".*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_macro')
+----
+<REGEX>:.*Table with name macro_src does not exist.*
+
+statement error
+SELECT * FROM pragma_table_info('v_over_macro')
+----
+<!REGEX>:.*"location".*

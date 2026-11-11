@@ -1,4 +1,6 @@
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/function/table/range.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -12,7 +14,16 @@ namespace duckdb {
 static unique_ptr<SubqueryRef> ParseSubquery(const string &query, TableFunctionBindInput &input, ClientContext &context,
                                              const string &err_msg) {
 	Parser parser(context);
-	parser.ParseQuery(query);
+	try {
+		parser.ParseQuery(query);
+	} catch (std::exception &ex) {
+		// a syntax error carries an offset into the string, not into the text the error is rendered against
+		ErrorData error(ex);
+		if (!error.ReplaceQueryLocation(input.ref.query_location)) {
+			throw;
+		}
+		error.Throw();
+	}
 	if (parser.statements.size() != 1) {
 		throw ParserException(err_msg);
 	}
@@ -32,6 +43,7 @@ static unique_ptr<SubqueryRef> ParseSubquery(const string &query, TableFunctionB
 	if (stmt->type == StatementType::SELECT_STATEMENT) {
 		// Regular SELECT statement
 		auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(stmt));
+		ParsedExpressionIterator::ReplaceQueryLocations(*select_stmt->node, input.ref.query_location);
 		return duckdb::make_uniq<SubqueryRef>(std::move(select_stmt));
 	} else if (stmt->type == StatementType::MULTI_STATEMENT) {
 		// MultiStatement (e.g., from PIVOT statements that create enum types)

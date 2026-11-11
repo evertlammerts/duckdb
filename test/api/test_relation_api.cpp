@@ -1179,3 +1179,78 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 	auto values = con.Values("(42)");
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
 }
+
+TEST_CASE("An error inside a view or table macro body or a query() string bound through a relation reports no location",
+          "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("SET errors_as_json = true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE src(a INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE VIEW v AS SELECT a FROM src"));
+	auto relation = con.View("v");
+	REQUIRE_NO_FAIL(con.Query("DROP TABLE src"));
+
+	auto result = relation->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "src does not exist"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_src(s VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_src VALUES ('x')"));
+	REQUIRE_NO_FAIL(con.Query("CREATE VIEW v_cast AS SELECT s::INTEGER AS i FROM cast_src"));
+	result = con.View("v_cast")->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "Could not convert string"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE macro_src(a INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO tm() AS TABLE SELECT a FROM macro_src"));
+	REQUIRE_NO_FAIL(con.Query("CREATE VIEW v_over_tm AS SELECT * FROM tm()"));
+	auto over_macro = con.View("v_over_tm");
+	REQUIRE_NO_FAIL(con.Query("DROP TABLE macro_src"));
+	result = over_macro->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "macro_src does not exist"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE table_macro_src(a INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO tm_src() AS TABLE SELECT a FROM table_macro_src"));
+	auto table_macro = con.TableFunction("tm_src");
+	REQUIRE_NO_FAIL(con.Query("DROP TABLE table_macro_src"));
+	result = table_macro->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "table_macro_src does not exist"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO tm_cast() AS TABLE SELECT s::INTEGER AS i FROM cast_src"));
+	result = con.TableFunction("tm_cast")->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "Could not convert string"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	struct QueryCall {
+		string function;
+		string argument;
+		string message;
+	};
+	for (auto &call :
+	     vector<QueryCall> {{"query", "SELECT 1, 2, 3, 4, 5, 6 FROMM missing_tbl", "syntax error"},
+	                        {"query", "SELECT 1, 2, 3, 4, 5, 6 FROM missing_tbl", "missing_tbl does not exist"},
+	                        {"query_table", "missing_tbl", "missing_tbl does not exist"}}) {
+		try {
+			con.TableFunction(call.function, {Value(call.argument)})->Execute();
+			FAIL("expected an error");
+		} catch (std::exception &ex) {
+			string message = ex.what();
+			REQUIRE(StringUtil::Contains(message, call.message));
+			REQUIRE(!StringUtil::Contains(message, "\"position\""));
+			REQUIRE(!StringUtil::Contains(message, "\"location\""));
+		}
+	}
+}

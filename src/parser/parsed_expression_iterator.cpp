@@ -344,4 +344,148 @@ void ParsedExpressionIterator::VisitExpressionClassMutable(
 	    expr, [&](ParsedExpression &child) { VisitExpressionClassMutable(child, expr_class, callback); });
 }
 
+namespace {
+
+class QueryLocationReplacer {
+public:
+	explicit QueryLocationReplacer(QueryLocation location_p) : location(location_p) {
+	}
+
+	void ReplaceInNode(QueryNode &node) {
+		ReplaceInNodeSkippedParts(node);
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    node, [&](unique_ptr<ParsedExpression> &child) { ReplaceInExpression(*child); },
+		    [&](TableRef &ref) { ReplaceInTableRef(ref); });
+	}
+
+	void ReplaceInExpression(ParsedExpression &expr) {
+		if (expr.HasQueryLocation()) {
+			expr.SetQueryLocation(location);
+		}
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY:
+			ReplaceInNode(*expr.Cast<SubqueryExpression>().SubqueryMutable()->node);
+			break;
+		case ExpressionClass::CAST:
+			ReplaceInExpression(expr.Cast<CastExpression>().TargetTypeMutable());
+			break;
+		default:
+			break;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { ReplaceInExpression(child); });
+	}
+
+private:
+	//! Visits the parts under the reference that the iterator does not enumerate
+	void ReplaceInTableRef(TableRef &ref) {
+		if (ref.query_location.IsValid()) {
+			ref.query_location = location;
+		}
+		switch (ref.type) {
+		case TableReferenceType::BASE_TABLE: {
+			auto &at_clause = ref.Cast<BaseTableRef>().at_clause;
+			if (at_clause && at_clause->ExpressionMutable()) {
+				ReplaceInExpression(*at_clause->ExpressionMutable());
+			}
+			break;
+		}
+		case TableReferenceType::JOIN: {
+			auto &ranking_expression = ref.Cast<JoinRef>().ranking_expression;
+			if (ranking_expression) {
+				ReplaceInExpression(*ranking_expression);
+			}
+			break;
+		}
+		case TableReferenceType::PIVOT:
+			for (auto &pivot : ref.Cast<PivotRef>().pivots) {
+				for (auto &expr : pivot.pivot_expressions) {
+					ReplaceInExpression(*expr);
+				}
+				for (auto &entry : pivot.entries) {
+					if (entry.expr) {
+						ReplaceInExpression(*entry.expr);
+					}
+				}
+			}
+			break;
+		case TableReferenceType::MATCH_RECOGNIZE: {
+			auto &input = ref.Cast<MatchRecognizeRef>().input;
+			if (input) {
+				ParsedExpressionIterator::EnumerateTableRefChildren(
+				    *input, [&](unique_ptr<ParsedExpression> &child) { ReplaceInExpression(*child); },
+				    [&](TableRef &child_ref) { ReplaceInTableRef(child_ref); });
+			}
+			break;
+		}
+		case TableReferenceType::SUBQUERY:
+			ReplaceInNodeSkippedParts(*ref.Cast<SubqueryRef>().subquery->node);
+			break;
+		case TableReferenceType::SHOW_REF: {
+			auto &query = ref.Cast<ShowRef>().query;
+			if (query) {
+				ReplaceInNodeSkippedParts(*query);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	//! The iterator skips recursive CTE key targets, so every node it enters without a table reference is searched here
+	void ReplaceInNodeSkippedParts(QueryNode &node) {
+		for (auto &entry : node.cte_map.map) {
+			if (entry.second->query_node) {
+				ReplaceInNodeSkippedParts(*entry.second->query_node);
+			}
+		}
+		switch (node.type) {
+		case QueryNodeType::RECURSIVE_CTE_NODE: {
+			auto &rcte_node = node.Cast<RecursiveCTENode>();
+			for (auto &expr : rcte_node.key_targets) {
+				ReplaceInExpression(*expr);
+			}
+			ReplaceInNodeSkippedParts(*rcte_node.left);
+			ReplaceInNodeSkippedParts(*rcte_node.right);
+			break;
+		}
+		case QueryNodeType::SET_OPERATION_NODE:
+			for (auto &child : node.Cast<SetOperationNode>().children) {
+				ReplaceInNodeSkippedParts(*child);
+			}
+			break;
+		case QueryNodeType::INSERT_QUERY_NODE: {
+			auto &select_statement = node.Cast<InsertQueryNode>().select_statement;
+			if (select_statement) {
+				ReplaceInNodeSkippedParts(*select_statement->node);
+			}
+			break;
+		}
+		case QueryNodeType::COPY_QUERY_NODE: {
+			auto &select_statement = node.Cast<CopyQueryNode>().info->select_statement;
+			if (select_statement) {
+				ReplaceInNodeSkippedParts(*select_statement);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	QueryLocation location;
+};
+
+} // namespace
+
+void ParsedExpressionIterator::ReplaceQueryLocations(QueryNode &node, QueryLocation location) {
+	QueryLocationReplacer replacer(location);
+	replacer.ReplaceInNode(node);
+}
+
+void ParsedExpressionIterator::ReplaceQueryLocations(ParsedExpression &expr, QueryLocation location) {
+	QueryLocationReplacer replacer(location);
+	replacer.ReplaceInExpression(expr);
+}
+
 } // namespace duckdb

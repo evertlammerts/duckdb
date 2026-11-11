@@ -86,7 +86,8 @@
     {
       "reason": "Reconstructed expressions have locations in generated SQL rather than the original source; the fixture requires original-source error carets",
       "paths": [
-        "test/sql/cast/cast_error_location.test"
+        "test/sql/cast/cast_error_location.test",
+        "test/sql/error/error_location_stored_query_execution.test"
       ]
     },
     {

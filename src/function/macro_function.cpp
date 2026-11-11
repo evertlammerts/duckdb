@@ -13,6 +13,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -50,7 +51,7 @@ MacroBindResult MacroFunction::BindMacroFunction(
     Binder &binder, const vector<unique_ptr<MacroFunction>> &functions, const Identifier &name,
     FunctionExpression &function_expr, vector<unique_ptr<ParsedExpression>> &positional_arguments,
     InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> &named_arguments,
-    idx_t depth) {
+    idx_t depth, QueryLocation call_location) {
 	ExpressionBinder expr_binder(binder, binder.context);
 	expr_binder.lambda_bindings = binder.lambda_bindings;
 
@@ -257,6 +258,7 @@ MacroBindResult MacroFunction::BindMacroFunction(
 		D_ASSERT(default_it != macro_def.default_parameters.end());
 		auto &named_arg = named_arguments[param_name];
 		named_arg = default_it->second->Copy();
+		ParsedExpressionIterator::ReplaceQueryLocations(*named_arg, call_location);
 		if (parameter_types[param_idx] != LogicalType::UNKNOWN) {
 			// This macro parameter is typed, add a cast
 			named_arg = make_uniq<CastExpression>(parameter_types[param_idx], std::move(named_arg));

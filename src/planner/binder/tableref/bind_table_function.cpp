@@ -476,7 +476,7 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 		if (!func_catalog.ParentCatalog().IsSystemCatalog()) {
 			GetStatementProperties().RegisterDBRead(func_catalog.ParentCatalog(), context);
 		}
-		auto query_node = BindTableMacro(fexpr, macro_func, 0);
+		auto query_node = BindTableMacro(fexpr, macro_func, 0, ref.query_location);
 		D_ASSERT(query_node);
 
 		auto binder = Binder::CreateBinder(context, this);
@@ -489,7 +489,10 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 			query = binder->BindNode(*query_node);
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
-			error.AddQueryLocation(ref);
+			// the body already points at the call, and an argument keeps its place in the calling query
+			if (error.ExtraInfo().count("position") == 0) {
+				error.AddQueryLocation(ref);
+			}
 			error.Throw();
 		}
 

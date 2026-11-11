@@ -126,6 +126,7 @@ void ExpressionBinder::FindAggregateExprs(unique_ptr<ParsedExpression> &expr,
 
 void ExpressionBinder::UnfoldWindowMacroExpression(unique_ptr<ParsedExpression> &expr, ScalarMacroFunction &macro_def) {
 	auto macro_copy = macro_def.expression->Copy();
+	ParsedExpressionIterator::ReplaceQueryLocations(*macro_copy, expr->GetQueryLocation());
 	vector<reference<unique_ptr<ParsedExpression>>> aggregate_exprs;
 	FindAggregateExprs(macro_copy, aggregate_exprs);
 
@@ -175,8 +176,9 @@ MacroFunction &ExpressionBinder::UnfoldMacroExpression(FunctionExpression &funct
 	vector<unique_ptr<ParsedExpression>> positional_arguments;
 	InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> named_arguments;
 	binder.lambda_bindings = lambda_bindings;
-	auto bind_result = MacroFunction::BindMacroFunction(binder, macro_func.macros, macro_func.name, function,
-	                                                    positional_arguments, named_arguments, depth);
+	auto bind_result =
+	    MacroFunction::BindMacroFunction(binder, macro_func.macros, macro_func.name, function, positional_arguments,
+	                                     named_arguments, depth, expr->GetQueryLocation());
 	if (!bind_result.error.empty()) {
 		throw BinderException(*expr, bind_result.error);
 	}
@@ -191,7 +193,10 @@ MacroFunction &ExpressionBinder::UnfoldMacroExpression(FunctionExpression &funct
 	if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
 		UnfoldWindowMacroExpression(expr, macro_def);
 	} else {
+		// relocated before the parameters are replaced, so the arguments keep their locations in the calling query
+		auto call_location = expr->GetQueryLocation();
 		expr = macro_def.expression->Copy();
+		ParsedExpressionIterator::ReplaceQueryLocations(*expr, call_location);
 	}
 
 	// qualify only the macro parameters with a new empty binder that only knows the macro binding
