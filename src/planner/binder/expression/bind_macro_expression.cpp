@@ -158,10 +158,12 @@ static void CollectWrittenNames(ParsedExpression &expr, identifier_set_t &names)
 }
 
 static void CollectTableName(TableRef &ref, identifier_set_t &names) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		auto &path = ref.Cast<BaseTableRef>().GetQualifiedName().Path();
+		names.insert(path.begin(), path.end());
+	}
 	if (!ref.alias.empty()) {
 		names.insert(ref.alias);
-	} else if (ref.type == TableReferenceType::BASE_TABLE) {
-		names.insert(ref.Cast<BaseTableRef>().Table());
 	} else if (ref.type == TableReferenceType::TABLE_FUNCTION) {
 		auto &function = *ref.Cast<TableFunctionRef>().function;
 		if (function.GetExpressionClass() == ExpressionClass::FUNCTION) {
@@ -179,6 +181,24 @@ static void CollectTableNames(ParsedExpression &expr, identifier_set_t &names) {
 	}
 	ParsedExpressionIterator::EnumerateChildren(expr,
 	                                            [&](ParsedExpression &child) { CollectTableNames(child, names); });
+}
+
+// The qualifier reads the receiver of x.v.f() as the qualified reference x.v.
+static bool HasQualifiedReference(const ParsedExpression &expr, const Identifier &name) {
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &column_ref = expr.Cast<ColumnRefExpression>();
+		return column_ref.IsQualified() && column_ref.ColumnNames()[0] == name;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &path = expr.Cast<FunctionExpression>().GetQualifiedName().Path();
+		if (path.size() >= 3 && path[0] == name) {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasQualifiedReference(child, name); });
+	return found;
 }
 
 namespace {
@@ -405,7 +425,7 @@ private:
 		}
 		for (idx_t suffix = 1;; suffix++) {
 			Identifier candidate("0_" + to_string(suffix) + "_" + name.GetIdentifierName());
-			if (used_names->insert(candidate).second) {
+			if (!BodyTableNames().count(candidate) && used_names->insert(candidate).second) {
 				new_names.emplace(name, candidate);
 				return candidate;
 			}
@@ -582,6 +602,11 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
 	}
 
+	// x.v may name a body table x by scopes and columns unknown here, so such an x keeps its name.
+	bool ReadsBodyTable(LambdaScope &scope, const Identifier &name) {
+		return BodyTableNames().count(name) && HasQualifiedReference(*scope.lambda_expr.get().RightMutable(), name);
+	}
+
 	void RenameCaptured(LambdaScope &scope) {
 		if (scope.captured.empty()) {
 			return;
@@ -589,8 +614,7 @@ private:
 		identifier_map_t<Identifier> renames;
 		for (auto &parameter : scope.parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
-			// x.v binds by scopes and columns unseen here, so a parameter named like a body table keeps main's reading
-			if (scope.captured.find(name) == scope.captured.end() || BodyTableNames().count(name)) {
+			if (scope.captured.find(name) == scope.captured.end() || ReadsBodyTable(scope, name)) {
 				continue;
 			}
 			// a repeated parameter keeps one name, so the binder still rejects it as a duplicate
