@@ -16,6 +16,7 @@
 #include "test_result_format.hpp"
 
 #include <chrono>
+#include <future>
 #include <thread>
 
 using namespace duckdb;
@@ -70,6 +71,34 @@ QueryResultState StepToEnd(QueryResult &handle) {
 		}
 	}
 	return state;
+}
+
+//! False when Materialize did not return in time; the helper thread is then left behind, so a deadlock fails the
+//! test instead of hanging the suite
+bool MaterializesInTime(const shared_ptr<QueryResult> &handle) {
+	auto returned = make_shared_ptr<std::promise<void>>();
+	auto future = returned->get_future();
+	std::thread helper([handle, returned]() {
+		try {
+			handle->Materialize();
+			returned->set_value();
+		} catch (...) {
+			returned->set_exception(std::current_exception());
+		}
+	});
+	if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+		helper.detach();
+		return false;
+	}
+	helper.join();
+	future.get();
+	return true;
+}
+
+void RequireCancelled(QueryResult &handle) {
+	REQUIRE(handle.HasError());
+	REQUIRE(handle.GetErrorType() == ExceptionType::INTERRUPT);
+	REQUIRE(handle.GetErrorObject().RawMessage() == "The execution of the query was cancelled before it could finish");
 }
 
 //! Stands in for an out-of-tree streaming collector: it builds its own result object and keeps the
@@ -972,6 +1001,76 @@ TEST_CASE("Cancelling the transaction abandons an open result", "[api][query_res
 
 	auto count = con.Query("SELECT count(*) FROM t");
 	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}
+
+TEST_CASE("Materialize on a cancelled result that holds the last reference to its context returns",
+          "[api][query_result]") {
+	DuckDB db(nullptr);
+	auto con = make_uniq<Connection>(db);
+	REQUIRE_NO_FAIL(con->Query("SET threads=2"));
+	auto context = con->context;
+	shared_ptr<QueryResult> handle = Submit(*con, "SELECT i FROM range(1000000) t(i)");
+	con.reset();
+	context->CancelTransaction();
+	context.reset();
+
+	REQUIRE(MaterializesInTime(handle));
+	RequireCancelled(*handle);
+	REQUIRE(MaterializesInTime(handle));
+	RequireCancelled(*handle);
+	handle.reset();
+
+	Connection after(db);
+	auto next = after.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("Materialize on a cancelled result whose connection lives on ends it", "[api][query_result]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=2"));
+	shared_ptr<QueryResult> handle = Submit(con, "SELECT i FROM range(1000000) t(i)");
+	con.context->CancelTransaction();
+
+	REQUIRE(MaterializesInTime(handle));
+	RequireCancelled(*handle);
+	REQUIRE(MaterializesInTime(handle));
+	RequireCancelled(*handle);
+
+	auto next = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(next, 0, {42}));
+}
+
+TEST_CASE("Materialize on a failed result whose connection is gone keeps its error", "[api][query_result]") {
+	DuckDB db(nullptr);
+	auto con = make_uniq<Connection>(db);
+	shared_ptr<QueryResult> handle = con->Submit("SELECT i FROM missing_table");
+	REQUIRE(handle->HasError());
+	auto error = handle->GetError();
+	con.reset();
+
+	REQUIRE(MaterializesInTime(handle));
+	REQUIRE(MaterializesInTime(handle));
+	REQUIRE(handle->GetErrorType() == ExceptionType::CATALOG);
+	REQUIRE(handle->GetError() == error);
+}
+
+TEST_CASE("Materialize twice on an open result whose connection is gone completes the query", "[api][query_result]") {
+	DuckDB db(nullptr);
+	auto con = make_uniq<Connection>(db);
+	REQUIRE_NO_FAIL(con->Query("SET threads=2"));
+	shared_ptr<QueryResult> handle = Submit(*con, "SELECT i FROM range(1000000) t(i)");
+	con.reset();
+
+	REQUIRE(MaterializesInTime(handle));
+	REQUIRE(MaterializesInTime(handle));
+	Deadline deadline;
+	while (handle->Poll() != QueryResultState::FINISHED) {
+		REQUIRE(!deadline.Passed());
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	REQUIRE(handle->Collection().Count() == 1000000);
+	REQUIRE(handle->GetBufferedData().Lifetime() == ResultLifetime::RETAINED);
 }
 
 TEST_CASE("An unfinished statement that expands into several rolls back as a whole when closed",
