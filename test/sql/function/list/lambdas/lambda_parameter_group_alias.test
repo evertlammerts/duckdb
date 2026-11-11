@@ -176,6 +176,28 @@ SELECT (SELECT list_transform([1], lambda k: k IN (SELECT 1)) FROM range(1) GROU
 ----
 subqueries in lambda expressions are not supported
 
+# a subquery whose body may read the parameter is no group either, so the lambda refuses it as without GROUP BY
+
+statement error
+SELECT list_transform([1], lambda s: (SELECT s)) FROM t GROUP BY (SELECT s);
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT (SELECT list_transform([1], lambda k: (SELECT k)) FROM range(1) GROUP BY (SELECT k)) FROM (SELECT 99 AS k) o;
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT list_transform([1], lambda s: (SELECT 1 WHERE s > 0)) FROM t GROUP BY (SELECT 1 WHERE s > 0);
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT list_transform([1], lambda s: (SELECT (SELECT s))) FROM t GROUP BY (SELECT (SELECT s));
+----
+subqueries in lambda expressions are not supported
+
 # the other clauses of a grouped query
 
 query I
@@ -268,7 +290,51 @@ SELECT p_, (SELECT list_transform([1], lambda p_: grouping(p_)) FROM range(1) GR
 ----
 GROUPING child "p_" must be a grouping column
 
-# unchanged: no group of that name, or a name that is not a parameter
+# a field access on a parameter is the parameter's field, not a group of the same text
+
+query I
+SELECT (SELECT list_transform([{'f': 1}], lambda k: k.f) FROM range(1) GROUP BY k.f) FROM (SELECT {'f': 99} AS k) o;
+----
+[1]
+
+query I
+SELECT (SELECT list_transform([{'f': 1}], lambda k: k.f + 1) FROM range(1) GROUP BY k.f + 1) FROM (SELECT {'f': 99} AS k) o;
+----
+[2]
+
+query I
+SELECT (SELECT list_transform([{'f': {'g': 1}}], lambda k: k.f.g) FROM range(1) GROUP BY k.f.g) FROM (SELECT {'f': {'g': 99}} AS k) o;
+----
+[1]
+
+query I
+SELECT (SELECT list_transform([{'f': 'ab'}], lambda k: k.f.upper()) FROM range(1) GROUP BY upper(k.f)) FROM (SELECT {'f': 'zz'} AS k) o;
+----
+[AB]
+
+query I
+SELECT (SELECT 1 FROM range(1) GROUP BY k.f HAVING list_transform([{'f': 1}], lambda k: k.f) = [1]) FROM (SELECT {'f': 99} AS k) o;
+----
+1
+
+statement error
+SELECT list_transform([{'f': 1}], lambda k: grouping(k.f)) FROM (SELECT {'f': 99} AS k) t GROUP BY k.f;
+----
+GROUPING child "f" must be a grouping column
+
+statement error
+SELECT (SELECT list_transform([{'f': 1}], lambda k: grouping(k.f))) FROM (SELECT {'f': 99} AS k) o GROUP BY k.f;
+----
+GROUPING statement cannot be used without groups
+
+# a table named like the parameter that has the column provides the reference, as without GROUP BY
+
+query I
+SELECT list_transform([{'f': 1}], lambda k: k.f) FROM (SELECT 99 AS f) k GROUP BY k.f;
+----
+[99]
+
+# a name with no group, or a name that is not a parameter, keeps its binding
 
 statement error
 SELECT list_transform([{'x': 1}], lambda p_: grouping(p_.x)) FROM t GROUP BY s;
@@ -366,6 +432,24 @@ query I
 SELECT list_transform([1], lambda x: s IN (SELECT 99)) FROM t GROUP BY s IN (SELECT 99);
 ----
 [true]
+
+query I
+SELECT list_transform([1], lambda x: (SELECT s)) FROM t GROUP BY (SELECT s);
+----
+[99]
+
+query I
+SELECT list_transform([1], lambda s: (SELECT list_transform([1], lambda s: s))) FROM t GROUP BY (SELECT list_transform([1], lambda s: s));
+----
+[[1]]
+
+statement ok
+CREATE MACRO apply_each(l, f) AS list_transform(l, f);
+
+query I
+SELECT list_transform([1], lambda x: apply_each([s], lambda x: x + 1)) FROM t GROUP BY apply_each([s], lambda x: x + 1);
+----
+[[100]]
 
 query II
 SELECT s AS p_, max(list_transform([1], lambda p_: p_)) FROM t GROUP BY p_;

@@ -191,8 +191,9 @@ public:
 	//! arguments resolves a column. Invalid when no argument resolves a column at or beyond `start` -
 	//! at `start == 0` that pins a constant-only aggregate to the scope it appears in.
 	optional_idx ResolveAggregateOwner(FunctionExpression &aggregate, idx_t start);
-	//! Whether a bare name of the expression is a parameter of a lambda whose body is being bound. Names that a lambda
-	//! inside the expression declares, and names inside a subquery, do not count; the IN or ANY operand of one does.
+	//! Whether the expression may reference a parameter of a lambda whose body is being bound: a reference whose first
+	//! name part is such a parameter, unless a table of the scope provides it. Names that a lambda inside the
+	//! expression declares do not count; names inside a subquery, and both sides of an arrow passed to a macro, do.
 	bool ReferencesLambdaParameter(ParsedExpression &expr);
 	//! The innermost scope at or beyond `start` in which any column of the expression resolves
 	optional_idx ResolveExpressionOwner(ParsedExpression &expr, idx_t start);

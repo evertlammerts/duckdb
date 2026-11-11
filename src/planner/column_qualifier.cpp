@@ -320,27 +320,35 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	return func;
 }
 
+optional_ptr<CatalogEntry> ColumnQualifier::FindCallEntry(Binder &binder, const FunctionExpression &function,
+                                                          bool from_item, bool &dot_call) {
+	dot_call = false;
+	auto name = function.GetQualifiedName();
+	binder.BindSchemaOrCatalog(name);
+	if (!from_item) {
+		return FindFunction(binder, function, name, dot_call);
+	}
+	QueryErrorContext error_context(function.GetQueryLocation());
+	EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(name.Name()), error_context);
+	auto bound_name = Binder::BindTableName(binder.EntryRetriever(), name);
+	return binder.GetCatalogEntry(EntryLookupInfo(table_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
+}
+
+static bool PlacesArgumentsOnExpansion(optional_ptr<CatalogEntry> entry, bool from_item) {
+	return !entry || entry->type == (from_item ? CatalogType::TABLE_MACRO_ENTRY : CatalogType::MACRO_ENTRY);
+}
+
+bool ColumnQualifier::ReadsArrowsProvisionally(Binder &binder, const FunctionExpression &function, bool from_item) {
+	bool dot_call;
+	return PlacesArgumentsOnExpansion(FindCallEntry(binder, function, from_item, dot_call), from_item);
+}
+
 bool ColumnQualifier::IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index,
                                        optional_ptr<CatalogEntry> entry, bool from_item) {
-	auto name = function.GetQualifiedName();
-	if (from_item) {
-		D_ASSERT(!entry);
-		binder.BindSchemaOrCatalog(name);
-		QueryErrorContext error_context(function.GetQueryLocation());
-		EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(name.Name()), error_context);
-		auto bound_name = Binder::BindTableName(binder.EntryRetriever(), name);
-		auto table_function =
-		    binder.GetCatalogEntry(EntryLookupInfo(table_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
-		// a table macro places an argument only when it expands, so an arrow passed to one keeps the lambda reading
-		return !table_function || table_function->type == CatalogType::TABLE_MACRO_ENTRY;
-	}
+	D_ASSERT(!from_item || !entry);
 	bool dot_call = false;
-	auto func = entry;
-	if (!func) {
-		binder.BindSchemaOrCatalog(name);
-		func = FindFunction(binder, function, name, dot_call);
-	}
-	if (!func || func->type == CatalogType::MACRO_ENTRY) {
+	auto func = entry ? entry : FindCallEntry(binder, function, from_item, dot_call);
+	if (PlacesArgumentsOnExpansion(func, from_item)) {
 		// a macro places an argument only when it expands, so an arrow passed to one keeps the lambda reading
 		return true;
 	}

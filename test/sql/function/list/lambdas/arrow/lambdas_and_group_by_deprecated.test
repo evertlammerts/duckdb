@@ -56,3 +56,13 @@ query II
 SELECT s AS p_, list_transform([1], p_ -> p_) FROM (SELECT 99 AS s) t GROUP BY p_;
 ----
 99	[1]
+
+# an arrow passed to a macro is read as a value by the group check, which blocks only a name of an enclosing lambda
+
+statement ok
+CREATE MACRO apply_each(l, f) AS list_transform(l, f);
+
+query I
+SELECT list_transform([1], y -> apply_each([s], x -> x + 1)) FROM (SELECT 99 AS s) t GROUP BY apply_each([s], x -> x + 1);
+----
+[[100]]

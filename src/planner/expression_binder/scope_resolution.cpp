@@ -8,6 +8,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/lambdaref_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_qualifier.hpp"
 
@@ -178,18 +179,31 @@ ColumnResolution ExpressionBinder::ResolveColumn(ColumnRefExpression &colref, id
 //! Whether `predicate` holds for a column reference of the expression that the expression does not declare itself.
 //! An argument declares lambda parameters only where `ColumnQualifier::EnumerateCallChildren` reads it as a lambda,
 //! and any other arrow is the JSON operator, whose sides are ordinary expressions. A field access on a parameter is
-//! declared too, unless a table of the query the lambda is written in provides the reference. A subquery binds in a
-//! chain of its own and is skipped; its IN or ANY operand is walked only with `subquery_operands`, since for ownership
-//! the subquery's correlated columns would count as well.
+//! declared too, unless a table of the query the lambda is written in provides the reference. Without
+//! `every_binding` a subquery is skipped, since it binds in a chain of its own and for ownership its correlated
+//! columns would count as well. With it the walk reads every name the expression may yet bind: the operand and the
+//! body of a subquery, and both sides of an arrow that a call reads as a lambda only until it expands.
 template <class PREDICATE>
 static bool AnyFreeColumn(Binder &binder, ColumnQualifier &qualifier, ParsedExpression &expr,
-                          vector<identifier_set_t> &lambda_params, bool subquery_operands, PREDICATE &predicate) {
+                          vector<identifier_set_t> &lambda_params, bool every_binding, PREDICATE &predicate,
+                          bool from_item = false) {
 	switch (expr.GetExpressionClass()) {
-	case ExpressionClass::SUBQUERY:
-		if (!subquery_operands) {
+	case ExpressionClass::SUBQUERY: {
+		if (!every_binding) {
 			return false;
 		}
+		auto &node = *expr.Cast<SubqueryExpression>().SubqueryMutable()->node;
+		bool found = false;
+		auto walk = [&](unique_ptr<ParsedExpression> &child, bool child_from_item) {
+			found = found ||
+			        AnyFreeColumn(binder, qualifier, *child, lambda_params, every_binding, predicate, child_from_item);
+		};
+		ColumnQualifier::EnumerateQueryNodeExpressions(node, walk);
+		if (found) {
+			return true;
+		}
 		break;
+	}
 	case ExpressionClass::COLUMN_REF: {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
 		if (qualifier.IsLambdaParameterReference(lambda_params, col_ref)) {
@@ -206,24 +220,33 @@ static bool AnyFreeColumn(Binder &binder, ColumnQualifier &qualifier, ParsedExpr
 		ColumnQualifier::EnumerateCallChildren(
 		    binder, function,
 		    [&](unique_ptr<ParsedExpression> &child) {
-			    found = found || AnyFreeColumn(binder, qualifier, *child, lambda_params, subquery_operands, predicate);
+			    found = found || AnyFreeColumn(binder, qualifier, *child, lambda_params, every_binding, predicate);
 		    },
 		    [&](LambdaExpression &lambda, identifier_set_t &parameters) {
 			    if (found) {
 				    return;
 			    }
+			    if (every_binding && lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD &&
+			        ColumnQualifier::ReadsArrowsProvisionally(binder, function, from_item)) {
+				    found = AnyFreeColumn(binder, qualifier, *lambda.LeftMutable(), lambda_params, every_binding,
+				                          predicate) ||
+				            AnyFreeColumn(binder, qualifier, *lambda.RightMutable(), lambda_params, every_binding,
+				                          predicate);
+				    return;
+			    }
 			    lambda_params.push_back(std::move(parameters));
-			    found = AnyFreeColumn(binder, qualifier, *lambda.RightMutable(), lambda_params, subquery_operands,
-			                          predicate);
+			    found =
+			        AnyFreeColumn(binder, qualifier, *lambda.RightMutable(), lambda_params, every_binding, predicate);
 			    lambda_params.pop_back();
-		    });
+		    },
+		    nullptr, from_item);
 		return found;
 	}
 	default:
 		break;
 	}
 	for (auto &child : expr.ChildrenMutable()) {
-		if (AnyFreeColumn(binder, qualifier, *child, lambda_params, subquery_operands, predicate)) {
+		if (AnyFreeColumn(binder, qualifier, *child, lambda_params, every_binding, predicate)) {
 			return true;
 		}
 	}
@@ -250,8 +273,8 @@ bool ExpressionBinder::ReferencesLambdaParameter(ParsedExpression &expr) {
 	ColumnQualifier qualifier(binder);
 	vector<identifier_set_t> lambda_params;
 	auto is_parameter = [&](ColumnRefExpression &col_ref) {
-		return !col_ref.IsQualified() &&
-		       LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.GetColumnName());
+		return LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.ColumnNames()[0]) &&
+		       !qualifier.TableProvidesReference(col_ref);
 	};
 	return AnyFreeColumn(binder, qualifier, expr, lambda_params, true, is_parameter);
 }

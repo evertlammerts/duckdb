@@ -62,6 +62,9 @@ public:
 	static bool TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
 	                                   identifier_set_t &parameters, optional_ptr<CatalogEntry> entry = nullptr,
 	                                   bool from_item = false);
+	//! Whether the call reads an arrow argument as a lambda only until it expands: it binds to a macro, which places
+	//! its arguments only then, or to no function the catalog knows. from_item is as for TryGetLambdaParameters
+	static bool ReadsArrowsProvisionally(Binder &binder, const FunctionExpression &function, bool from_item);
 	//! Visits the children of a call, handing each argument that binds as a lambda to lambda_callback instead
 	static void EnumerateCallChildren(
 	    Binder &binder, FunctionExpression &function,
@@ -99,6 +102,9 @@ private:
 	//! The function entry of the call; dot_call says it is written on a column, as in "x.lower()"
 	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function,
 	                                               const QualifiedName &name, bool &dot_call);
+	//! The entry the call binds to: a table function for a FROM clause item, otherwise as FindFunction finds it
+	static optional_ptr<CatalogEntry> FindCallEntry(Binder &binder, const FunctionExpression &function, bool from_item,
+	                                                bool &dot_call);
 };
 
 } // namespace duckdb

@@ -88,3 +88,18 @@ query I
 SELECT (SELECT list_transform([1], lambda x: concat(k -> 'f', '')) FROM range(1) GROUP BY concat(k -> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
 ----
 ['"bbbb"']
+
+# an arrow passed to a macro may be the JSON operator once the macro expands, so its left side may be the parameter
+
+statement ok
+CREATE MACRO passthrough(a) AS a;
+
+query I
+SELECT list_transform(['{"f":1}'::JSON], lambda k: passthrough(k -> 'f')) FROM (VALUES ('{"f":99}'::JSON)) t(k) GROUP BY passthrough(k -> 'f');
+----
+[1]
+
+query I
+SELECT (SELECT list_transform(['{"f":1}'::JSON], lambda k: passthrough(k -> 'f')) FROM range(1) GROUP BY passthrough(k -> 'f')) FROM (VALUES ('{"f":99}'::JSON)) o(k);
+----
+[1]
