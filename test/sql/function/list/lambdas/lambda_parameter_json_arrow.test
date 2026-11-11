@@ -492,5 +492,49 @@ SELECT * FROM lower_rows_shifted(100);
 statement ok
 DROP MACRO TABLE lower;
 
+# a FROM clause item is never a scalar call, so a table macro of another schema named like a built in scalar function
+# is not read as a dot call on a column named like the schema
+
+statement ok
+CREATE SCHEMA tms;
+
+statement ok
+CREATE MACRO tms.lower(l, f) AS TABLE SELECT list_transform(l, f) AS r;
+
+statement ok
+CREATE MACRO tms_lower_rows(x) AS TABLE SELECT r FROM tms.lower([1, 2], lambda y: y + x);
+
+query I
+SELECT * FROM tms_lower_rows(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms_lower_rows_arrow(x) AS TABLE SELECT r FROM tms.lower([1, 2], y -> y + x);
+
+query I
+SELECT * FROM tms_lower_rows_arrow(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms_lower_rows_catalog(x) AS TABLE SELECT r FROM memory.tms.lower([1, 2], lambda y: y + x);
+
+query I
+SELECT * FROM tms_lower_rows_catalog(100);
+----
+[101, 102]
+
+statement ok
+CREATE MACRO tms.concat(a, b) AS TABLE SELECT a || b AS r;
+
+statement ok
+CREATE MACRO tms_concat_rows(x) AS TABLE SELECT r FROM tms.concat(x, 'b');
+
+query I
+SELECT * FROM tms_concat_rows('a');
+----
+ab
+
 statement ok
 RESET lambda_syntax;

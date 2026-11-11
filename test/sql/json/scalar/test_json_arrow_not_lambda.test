@@ -225,3 +225,31 @@ SELECT v FROM ul;
 
 statement ok
 DROP MACRO TABLE lower;
+
+# a built in table function takes no lambda, so an arrow passed to one in a FROM clause is the JSON operator, in a
+# table macro body, in a scalar macro body's subquery and in a CTE of a table macro body
+
+statement ok
+CREATE MACRO count_each_a(v) AS TABLE SELECT count(*) AS n FROM json_each(v -> '$.a');
+
+query I
+SELECT * FROM count_each_a('{"a": [1, 2, 3]}'::JSON);
+----
+3
+
+statement ok
+CREATE MACRO count_each_a_scalar(v) AS (SELECT count(*) FROM json_each(v -> '$.a'));
+
+query I
+SELECT count_each_a_scalar('{"a": [1, 2, 3]}'::JSON);
+----
+3
+
+statement ok
+CREATE MACRO each_a(j) AS TABLE WITH c AS (SELECT value FROM json_each(j -> '$.a')) SELECT value FROM c;
+
+query I
+SELECT value FROM each_a('{"a": [1, 2]}'::JSON) ORDER BY value;
+----
+1
+2

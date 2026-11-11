@@ -38,7 +38,7 @@ public:
 	//! Returns a qualified column reference from a column reference
 	unique_ptr<ParsedExpression> QualifyColumnName(ColumnRefExpression &col_ref, ErrorData &error);
 	//! Enables special-handling of lambda parameters by tracking them in lambda_params; entry is what QualifyFunction
-	//! found for the call
+	//! found for the call, null for a FROM clause item, which QualifyFunction does not see
 	void QualifyColumnNamesInLambda(FunctionExpression &function, optional_ptr<CatalogEntry> entry, bool from_item);
 	//! Recursively qualifies the column references in the (children) of the expression. Passes on the
 	//! within_function_expression state from outer expressions, or sets it. from_item says that the expression is
@@ -56,8 +56,9 @@ public:
 	//! that provides the reference wins, because that is the order in which the binder resolves it
 	bool IsLambdaParameterReference(const vector<identifier_set_t> &lambdas, const ColumnRefExpression &col_ref);
 	//! Whether argument index of the call binds as a lambda, filling in the parameter names it declares. from_item
-	//! says that the call is a FROM clause item, which binds to a table function; otherwise a non null entry is the
-	//! scalar function the call was found as after its dot call rewrite, which saves looking it up again
+	//! says that the call is a FROM clause item, which binds to a table function and comes without an entry;
+	//! otherwise a non null entry is the scalar function the call was found as after its dot call rewrite, which
+	//! saves looking it up again
 	static bool TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
 	                                   identifier_set_t &parameters, optional_ptr<CatalogEntry> entry = nullptr,
 	                                   bool from_item = false);

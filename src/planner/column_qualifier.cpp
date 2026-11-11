@@ -241,11 +241,12 @@ void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, con
 		// Special-handling for lambdas, which are inside function expressions.
 		auto &function = expr->Cast<FunctionExpression>();
 		optional_ptr<CatalogEntry> entry;
-		if (!ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
+		// a FROM clause item binds to a table function, so it is neither looked up nor rewritten as a scalar call
+		if (!from_item && !ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
 			entry = QualifyFunction(function, lambda_params);
 		}
 		if (function.IsLambdaFunction()) {
-			return QualifyColumnNamesInLambda(function, from_item ? nullptr : entry, from_item);
+			return QualifyColumnNamesInLambda(function, entry, from_item);
 		}
 
 		next_within_function_expression = true;
@@ -323,6 +324,7 @@ bool ColumnQualifier::IsLambdaArgument(Binder &binder, const FunctionExpression 
                                        optional_ptr<CatalogEntry> entry, bool from_item) {
 	auto name = function.GetQualifiedName();
 	if (from_item) {
+		D_ASSERT(!entry);
 		binder.BindSchemaOrCatalog(name);
 		QueryErrorContext error_context(function.GetQueryLocation());
 		EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(name.Name()), error_context);
