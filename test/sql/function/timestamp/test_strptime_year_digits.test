@@ -173,14 +173,14 @@ SELECT d FROM read_csv('{TEST_DIR}/year_digits_dmy2.csv', dateformat = '%d-%m-%y
 2024-12-31
 2024-02-01
 
-# without declared types, a user date format that fails on the sample is dropped and the column falls back to the
-# plain TIMESTAMP cast, which reads the fields as year, month and day
+# without declared types, a user date format that fails on the sample is dropped, and the plain TIMESTAMP cast does
+# not read a value that a date template reads, so the column is VARCHAR
 
 query II
 SELECT typeof(d), d FROM read_csv('{TEST_DIR}/year_digits_dmy2.csv', dateformat = '%d-%m-%Y');
 ----
-TIMESTAMP	0031-12-24 00:00:00
-TIMESTAMP	0001-02-24 00:00:00
+VARCHAR	31-12-24
+VARCHAR	01-02-24
 
 # readers detecting a format: files of two digit years detect a %y format
 

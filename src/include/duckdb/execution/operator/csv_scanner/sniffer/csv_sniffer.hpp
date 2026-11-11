@@ -178,6 +178,8 @@ private:
 	const vector<StrpTimeFormat> &GetFormatTemplates(const string &separator, const LogicalTypeId sql_type);
 	//! Whether a template for the value's own separator reads it
 	bool TemplateReadsValue(const string_t &value, const LogicalTypeId sql_type);
+	//! Whether the sniffer casts a value of the type without a format
+	bool ReadsWithPlainCast(const CSVStateMachine &state_machine, const LogicalTypeId sql_type) const;
 	//! Sets user defined date and time formats (if any)
 	void SetUserDefinedDateTimeFormat(CSVStateMachine &candidate) const;
 	//! Detects the date or timestamp format from the value at row_idx and the column's earlier values, and returns

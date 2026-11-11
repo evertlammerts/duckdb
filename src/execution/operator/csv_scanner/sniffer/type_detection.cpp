@@ -415,7 +415,25 @@ bool CSVSniffer::TemplateReadsValue(const string_t &value, const LogicalTypeId s
 	if (!StartsLikeTemplateValue(separator, value)) {
 		return false;
 	}
-	return AnyFormatReadsValue(GetFormatTemplates(separator, sql_type), value, sql_type);
+	if (AnyFormatReadsValue(GetFormatTemplates(separator, sql_type), value, sql_type)) {
+		return true;
+	}
+	// The plain timestamp cast also reads a date without a time
+	return sql_type == LogicalTypeId::TIMESTAMP &&
+	       AnyFormatReadsValue(GetFormatTemplates(separator, LogicalTypeId::DATE), value, LogicalTypeId::DATE);
+}
+
+bool CSVSniffer::ReadsWithPlainCast(const CSVStateMachine &state_machine, const LogicalTypeId sql_type) const {
+	switch (sql_type) {
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+		return !options.dialect_options.date_format.at(sql_type).IsSetByUser() &&
+		       state_machine.dialect_options.date_format.at(sql_type).GetValue().Empty();
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return !options.dialect_options.date_format.at(LogicalTypeId::TIMESTAMP).IsSetByUser();
+	default:
+		return false;
+	}
 }
 
 bool CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
@@ -462,7 +480,7 @@ bool CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const
 	if (!format_candidate.initialized || !format_candidate.format.empty()) {
 		return true;
 	}
-	// The plain cast reads the column only if it reads every sampled value and no template reads any of them
+	// The plain cast reads the column only if it reads every value detection samples and no template reads any of them
 	if (!plain_cast_before) {
 		for (idx_t earlier_row = first_row; earlier_row < row_idx; earlier_row++) {
 			const auto earlier_value = values[earlier_row];
@@ -496,6 +514,11 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 		}
 		auto column_start_format_candidates = format_candidates;
 		auto column_start_date_formats = state_machine.dialect_options.date_format;
+		// A type an earlier column settled keeps its format for the whole column
+		const bool date_plain_cast = has_type.date && ReadsWithPlainCast(state_machine, LogicalTypeId::DATE);
+		const bool timestamp_plain_cast =
+		    has_type.timestamp && ReadsWithPlainCast(state_machine, LogicalTypeId::TIMESTAMP);
+		const bool timestamp_tz_plain_cast = ReadsWithPlainCast(state_machine, LogicalTypeId::TIMESTAMP_TZ);
 		for (idx_t row_idx = start_idx_detection; row_idx < chunk_size; row_idx++) {
 			// col_type_candidates can't be empty since anything in a CSV file should at least be a string
 			// and we validate utf-8 compatibility when creating the type
@@ -511,10 +534,13 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 				                 (col_type_candidates.back().id() == LogicalTypeId::DATE && !has_type.date))) {
 					format_reads = DetectDateAndTimeStampFormats(state_machine, sql_type, column_values,
 					                                             start_idx_detection, row_idx);
-				} else if (!is_null && sql_type.id() == LogicalTypeId::TIMESTAMP_TZ &&
-				           !options.dialect_options.date_format.at(LogicalTypeId::TIMESTAMP).IsSetByUser()) {
-					// The plain cast reads a timestamp in a template layout with a year of one or two digits
-					format_reads = !TemplateReadsValue(column_values.GetValueUnsafe(row_idx), LogicalTypeId::TIMESTAMP);
+				} else if (!is_null && ((sql_type.id() == LogicalTypeId::DATE && date_plain_cast) ||
+				                        (sql_type.id() == LogicalTypeId::TIMESTAMP && timestamp_plain_cast) ||
+				                        (sql_type.id() == LogicalTypeId::TIMESTAMP_TZ && timestamp_tz_plain_cast))) {
+					// The plain cast reads a date or timestamp in a template layout with a year of one or two digits
+					const auto template_type =
+					    sql_type.id() == LogicalTypeId::DATE ? LogicalTypeId::DATE : LogicalTypeId::TIMESTAMP;
+					format_reads = !TemplateReadsValue(column_values.GetValueUnsafe(row_idx), template_type);
 				}
 				// try cast from string to sql_type
 				if (sql_type == LogicalType::VARCHAR) {
