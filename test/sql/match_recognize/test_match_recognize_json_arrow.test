@@ -1,0 +1,39 @@
+# name: test/sql/match_recognize/test_match_recognize_json_arrow.test
+# description: MATCH_RECOGNIZE - the arrow is the JSON operator unless the deprecated lambda arrow is enabled
+# group: [match_recognize]
+
+require json
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE j AS SELECT i, ('{"k": ' || i || '}')::JSON AS v FROM range(1, 5) r(i);
+
+statement ok
+CREATE TABLE jp AS SELECT * FROM (VALUES (1, '[10,20]'::JSON, 0)) t(i, A, pos);
+
+# under the default setting the arrow binds no name, so a step over it still reads the lambda's parameter
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(v -> '$.k')) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+# and a pattern variable on its right still scopes the navigation
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(A -> A.pos) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+# with the deprecated arrow an arrow is a lambda as well, whose parameter is its own
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+query I rowsort
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda w: PREV(list_sum(list_transform([i], w -> w)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[3]
+
+statement ok
+RESET lambda_syntax

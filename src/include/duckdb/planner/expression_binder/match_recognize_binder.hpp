@@ -242,7 +242,8 @@ using MatchRecognizeIsSymbol = std::function<bool(const string &)>;
 //! and the whole match. The qualifiers are dropped and the variable reported back, empty for the match
 //! as a whole.
 string MatchRecognizeNavigationVariable(unique_ptr<ParsedExpression> &inner, const MatchRecognizeIsSymbol &symbols,
-                                        const case_insensitive_map_t<string> &universal, const string &function_name);
+                                        const case_insensitive_map_t<string> &universal, const string &function_name,
+                                        bool arrow_lambdas);
 
 //! FIRST() and LAST() count from the end of the match they read from, by a constant the two clauses
 //! spell the same way.
@@ -254,7 +255,10 @@ unique_ptr<ParsedExpression> MatchRecognizeStateField(const string &state, const
 //! The names a lambda binds for its body, or false when the expression is only spelled like one: the
 //! arrow form is also the JSON operator, and which it is only settles when the function is bound.
 bool MatchRecognizeLambdaParameters(const ParsedExpression &expr, identifier_set_t &parameters);
+//! Whether the arrow form can be a lambda, which only the deprecated single arrow setting allows: otherwise it is
+//! the JSON operator
+bool MatchRecognizeArrowLambdas(ClientContext &context);
 //! The names the arrow form would bind if it turns out to be a lambda
-bool MatchRecognizeArrowParameters(const ParsedExpression &expr, identifier_set_t &parameters);
+bool MatchRecognizeArrowParameters(const ParsedExpression &expr, bool arrow_lambdas, identifier_set_t &parameters);
 
 } // namespace duckdb

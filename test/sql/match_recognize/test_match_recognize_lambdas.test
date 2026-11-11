@@ -481,6 +481,17 @@ SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'w': 'Z'}]
 ----
 window functions cannot reference lambda parameters
 
+# and the whole path in front of the call is the parameter's field path
+query I
+SELECT * FROM (SELECT i, {'g': w} AS st FROM u) MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'st': {'g': 'Z'}}], lambda A: A.st.g.lower()) AS m PATTERN (A B+) DEFINE B AS true);
+----
+[z]
+
+query I
+SELECT * FROM (SELECT i, {'g': w} AS st FROM u) MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'st': {'g': 'Z'}}], lambda A: A.st.g.lower() = 'z')));
+----
+4
+
 # CLASSIFIER() of a name a lambda binds names no pattern variable, inside an aggregate or a navigation too
 statement error
 SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(list_transform([0], lambda A: CLASSIFIER(A))[1]) AS c PATTERN (A+) DEFINE A AS true);
@@ -511,6 +522,11 @@ query I
 SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(list_transform([{'x': 100}], A -> A.x)[1]) AS m PATTERN (A+) DEFINE A AS true);
 ----
 400
+
+query I
+SELECT * FROM (SELECT i, {'g': w} AS st FROM u) MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'st': {'g': 'Z'}}], A -> A.st.g.lower()) AS m PATTERN (A B+) DEFINE B AS true);
+----
+[z]
 
 statement ok
 RESET lambda_syntax

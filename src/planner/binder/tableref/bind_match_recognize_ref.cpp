@@ -104,9 +104,19 @@ static unique_ptr<MatchRecognizePattern> BuildPattern(const ParsedExpression &ex
 //! of its own. Computing rather than rewriting is what keeps two tables' columns of the same name
 //! apart, and a struct field behind a qualifier from reading as a column.
 struct HoistedInputRefs {
-	HoistedInputRefs(GeneratedNames &names_p, const case_insensitive_set_t &input_columns_p,
+	HoistedInputRefs(Binder &binder_p, GeneratedNames &names_p, const case_insensitive_set_t &input_columns_p,
 	                 const case_insensitive_set_t &input_tables_p)
-	    : names(names_p), input_columns(input_columns_p), input_tables(input_tables_p) {
+	    : binder(binder_p), arrow_lambdas(MatchRecognizeArrowLambdas(binder_p.context)), names(names_p),
+	      input_columns(input_columns_p), input_tables(input_tables_p) {
+	}
+
+	//! Whether a qualified call names a function in the catalog, which the engine prefers to a method call
+	bool IsCatalogFunction(const FunctionExpression &function) {
+		QueryErrorContext error_context(function.GetQueryLocation());
+		EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, QualifiedName(function.FunctionName()),
+		                       error_context);
+		auto bound_name = Binder::BindTableName(binder.EntryRetriever(), function.GetQualifiedName());
+		return binder.GetCatalogEntry(EntryLookupInfo(lookup, bound_name), OnEntryNotFound::RETURN_NULL) != nullptr;
 	}
 
 	//! The subquery column standing for this reference, allocated on first use. Behind a pattern
@@ -137,6 +147,9 @@ struct HoistedInputRefs {
 		return columns.emplace(std::move(key), std::move(column)).first->second;
 	}
 
+	Binder &binder;
+	//! Whether an arrow can be a lambda at all, which only the deprecated single arrow setting allows
+	const bool arrow_lambdas;
 	GeneratedNames &names;
 	const case_insensitive_set_t &input_columns;
 	const case_insensitive_set_t &input_tables;
@@ -166,7 +179,7 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 		}
 		// The arrow is a lambda or the JSON operator, and only binding the function around it settles which. Its
 		// references are hoisted as if it were the operator, but a qualifier it may bind is not dropped.
-		if (MatchRecognizeArrowParameters(*expr, parameters)) {
+		if (MatchRecognizeArrowParameters(*expr, refs.arrow_lambdas, parameters)) {
 			arrow_parameters.push_back(std::move(parameters));
 			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
 				HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
@@ -178,12 +191,10 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto &path = function.GetQualifiedName().Path();
-		// The parser keeps the receiver of X.c.f() in the function's name. A pattern variable in front of it
-		// qualifies a column as it does anywhere else, so the call is the method call on that column, whose
-		// reference is then resolved below like any other.
-		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) &&
-		    !LambdaExpression::IsLambdaParameter(lambda_parameters, path[0]) &&
-		    !LambdaExpression::IsLambdaParameter(arrow_parameters, path[0])) {
+		// The parser keeps the receiver of X.c.f() in the function's name, and the engine reads it as a method
+		// call when no catalog function has that name. Turned into the call on the column path here, the
+		// reference is resolved below like any other, as the variable's column or a lambda parameter's field.
+		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) && !refs.IsCatalogFunction(function)) {
 			unique_ptr<ParsedExpression> receiver =
 			    make_uniq<ColumnRefExpression>(vector<Identifier>(path.begin(), path.end() - 1));
 			receiver->SetQueryLocation(function.GetQueryLocation());
@@ -244,22 +255,24 @@ static bool HasExclusion(const ParsedExpression &expr) {
 //! A reference to a parameter of a lambda the expression is written in, rather than of one inside it
 static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const ParsedExpression &expr,
                                                                          const vector<identifier_set_t> &enclosing,
-                                                                         vector<identifier_set_t> &inner) {
+                                                                         vector<identifier_set_t> &inner,
+                                                                         bool arrow_lambdas) {
 	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(expr, parameters)) {
 			inner.push_back(std::move(parameters));
-			auto found = FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner);
+			auto found =
+			    FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner, arrow_lambdas);
 			inner.pop_back();
 			return found;
 		}
 		// an arrow may be a lambda of its own, whose parameters then shadow the enclosing ones
-		if (MatchRecognizeArrowParameters(expr, parameters)) {
+		if (MatchRecognizeArrowParameters(expr, arrow_lambdas, parameters)) {
 			inner.push_back(std::move(parameters));
 			optional_ptr<const ParsedExpression> found;
 			ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
 				if (!found) {
-					found = FindEnclosingLambdaParameter(child, enclosing, inner);
+					found = FindEnclosingLambdaParameter(child, enclosing, inner, arrow_lambdas);
 				}
 			});
 			inner.pop_back();
@@ -275,7 +288,7 @@ static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const P
 	optional_ptr<const ParsedExpression> found;
 	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
 		if (!found) {
-			found = FindEnclosingLambdaParameter(child, enclosing, inner);
+			found = FindEnclosingLambdaParameter(child, enclosing, inner, arrow_lambdas);
 		}
 	});
 	return found;
@@ -287,13 +300,13 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
                                    vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
-                                   vector<identifier_set_t> &lambda_parameters) {
+                                   bool arrow_lambdas, vector<identifier_set_t> &lambda_parameters) {
 	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
 			lambda_parameters.push_back(std::move(parameters));
 			HoistMeasureNavigation(expr->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
-			                       hoisted, names, lambda_parameters);
+			                       hoisted, names, arrow_lambdas, lambda_parameters);
 			lambda_parameters.pop_back();
 			return;
 		}
@@ -328,14 +341,14 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			}
 			// the step is computed below the matcher, outside every lambda it is written in
 			vector<identifier_set_t> inner_parameters;
-			auto parameter =
-			    FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters, inner_parameters);
+			auto parameter = FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters,
+			                                              inner_parameters, arrow_lambdas);
 			if (parameter) {
 				throw BinderException(*parameter, "window functions cannot reference lambda parameters");
 			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, universal, hoisted,
-				                       names, lambda_parameters);
+				                       names, arrow_lambdas, lambda_parameters);
 			}
 			// a step is a fixed distance through the partition, so the offset is a non-negative
 			// constant - a negative one would step the other way and a column a different way per row
@@ -345,7 +358,7 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			auto inner = std::move(arguments[0].GetExpressionMutable());
 			auto variable = MatchRecognizeNavigationVariable(
 			    inner, [&](const string &name) { return symbols.find(name) != symbols.end(); }, universal,
-			    function_name);
+			    function_name, arrow_lambdas);
 			// A step names the row it starts from rather than the one it reaches: a pattern variable in
 			// front of it is the row that variable denotes (5.6.2), and FIRST or LAST within it says
 			// which of that variable's rows (5.6.4). Stepping and then reading the row reached is the
@@ -375,16 +388,18 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 		}
 	}
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, lambda_parameters);
+		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, arrow_lambdas,
+		                       lambda_parameters);
 	});
 }
 
 static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
-                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names) {
+                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
+                                   bool arrow_lambdas) {
 	vector<identifier_set_t> lambda_parameters;
-	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, lambda_parameters);
+	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, arrow_lambdas, lambda_parameters);
 }
 
 //! The conditions and the frame are bound against the input but evaluated over the projection above
@@ -1052,7 +1067,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	GeneratedNames names(std::move(input_names));
 	const string state_column = names.Reserve("__pattern_window");
 	const string spans_column = names.Reserve(state_column + "_spans");
-	HoistedInputRefs input_refs(names, input_column_names, input_tables);
+	HoistedInputRefs input_refs(*this, names, input_column_names, input_tables);
 
 	const auto symbols = CollectSymbols(*ref.config);
 	// {- -} only decides which of a match's rows reach the output, so it is also read again below
@@ -1123,8 +1138,8 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	// PREV() and NEXT() in MEASURES walk the matcher's input, so they are computed down here too
 	vector<unique_ptr<ParsedExpression>> measure_navigation;
 	for (auto &expr : ref.config->measures_expression_list) {
-		HoistMeasureNavigation(expr, *window_template, measure_symbols, input_refs.universal, measure_navigation,
-		                       names);
+		HoistMeasureNavigation(expr, *window_template, measure_symbols, input_refs.universal, measure_navigation, names,
+		                       input_refs.arrow_lambdas);
 	}
 	if (!measure_navigation.empty()) {
 		SelectBinder navigation_binder(*define_binder, context, define_node);

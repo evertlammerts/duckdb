@@ -5,6 +5,7 @@
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/query_node/bound_select_node.hpp"
@@ -216,9 +217,14 @@ bool MatchRecognizeLambdaParameters(const ParsedExpression &expr, identifier_set
 	return lambda.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD && LambdaParameterNames(lambda, parameters);
 }
 
-bool MatchRecognizeArrowParameters(const ParsedExpression &expr, identifier_set_t &parameters) {
+bool MatchRecognizeArrowLambdas(ClientContext &context) {
+	return Settings::Get<LambdaSyntaxSetting>(context) == LambdaSyntax::ENABLE_SINGLE_ARROW;
+}
+
+bool MatchRecognizeArrowParameters(const ParsedExpression &expr, bool arrow_lambdas, identifier_set_t &parameters) {
 	auto &lambda = expr.Cast<LambdaExpression>();
-	return lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD && LambdaParameterNames(lambda, parameters);
+	return arrow_lambdas && lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD &&
+	       LambdaParameterNames(lambda, parameters);
 }
 
 //! What a value that is not the candidate row is being computed for, for the message that says so
@@ -300,20 +306,22 @@ bool MatchRecognizeContainsClassifier(const ParsedExpression &expr) {
 }
 
 static void ScopeToVariable(unique_ptr<ParsedExpression> &expr, const MatchRecognizeIsSymbol &symbols,
-                            case_insensitive_set_t &scope, vector<identifier_set_t> &lambda_parameters) {
+                            case_insensitive_set_t &scope, bool arrow_lambdas,
+                            vector<identifier_set_t> &lambda_parameters) {
 	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
 			lambda_parameters.push_back(std::move(parameters));
-			ScopeToVariable(expr->Cast<LambdaExpression>().RightMutable(), symbols, scope, lambda_parameters);
+			ScopeToVariable(expr->Cast<LambdaExpression>().RightMutable(), symbols, scope, arrow_lambdas,
+			                lambda_parameters);
 			lambda_parameters.pop_back();
 			return;
 		}
 		// an arrow may be a lambda too, and then a name it binds is its own rather than a variable's
-		if (MatchRecognizeArrowParameters(*expr, parameters)) {
+		if (MatchRecognizeArrowParameters(*expr, arrow_lambdas, parameters)) {
 			lambda_parameters.push_back(std::move(parameters));
 			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-				ScopeToVariable(child, symbols, scope, lambda_parameters);
+				ScopeToVariable(child, symbols, scope, arrow_lambdas, lambda_parameters);
 			});
 			lambda_parameters.pop_back();
 			return;
@@ -344,14 +352,15 @@ static void ScopeToVariable(unique_ptr<ParsedExpression> &expr, const MatchRecog
 		expr = make_uniq<ColumnRefExpression>(Identifier(MATCH_RECOGNIZE_CLASSIFIER_FIELD));
 		return;
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    *expr, [&](unique_ptr<ParsedExpression> &child) { ScopeToVariable(child, symbols, scope, lambda_parameters); });
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		ScopeToVariable(child, symbols, scope, arrow_lambdas, lambda_parameters);
+	});
 }
 
 static void ScopeToVariable(unique_ptr<ParsedExpression> &expr, const MatchRecognizeIsSymbol &symbols,
-                            case_insensitive_set_t &scope) {
+                            case_insensitive_set_t &scope, bool arrow_lambdas) {
 	vector<identifier_set_t> lambda_parameters;
-	ScopeToVariable(expr, symbols, scope, lambda_parameters);
+	ScopeToVariable(expr, symbols, scope, arrow_lambdas, lambda_parameters);
 }
 
 //! A reference the input itself answers is the universal row pattern variable's, and so is
@@ -487,9 +496,10 @@ MatchRecognizeSteppedNavigation MatchRecognizePeelStep(unique_ptr<ParsedExpressi
 }
 
 string MatchRecognizeNavigationVariable(unique_ptr<ParsedExpression> &inner, const MatchRecognizeIsSymbol &symbols,
-                                        const case_insensitive_map_t<string> &universal, const string &function_name) {
+                                        const case_insensitive_map_t<string> &universal, const string &function_name,
+                                        bool arrow_lambdas) {
 	case_insensitive_set_t scope;
-	ScopeToVariable(inner, symbols, scope);
+	ScopeToVariable(inner, symbols, scope, arrow_lambdas);
 	if (scope.size() > 1) {
 		throw BinderException("%s() reads one row of the match, so \"%s\" cannot also read a row of \"%s\"",
 		                      function_name, *scope.begin(), *std::next(scope.begin()));
@@ -572,7 +582,8 @@ BindResult MatchRecognizeDefineBinder::BindExpression(unique_ptr<ParsedExpressio
 		if (function_name == "CLASSIFIER" && function.GetArguments().size() == 1) {
 			// the classifier of the last row mapped to the variable so far, which is what LAST() reads
 			auto variable = MatchRecognizeNavigationVariable(
-			    expr_ptr, [&](const string &name) { return IsPatternVariable(name); }, universal, "CLASSIFIER");
+			    expr_ptr, [&](const string &name) { return IsPatternVariable(name); }, universal, "CLASSIFIER",
+			    MatchRecognizeArrowLambdas(context));
 			return BindNavigated(std::move(expr_ptr), MatchRecognizeDefineColumn(variable), true, 0, depth);
 		}
 		if (function_name == "MATCH_NUMBER" && function.GetArguments().empty()) {
@@ -656,7 +667,8 @@ BindResult MatchRecognizeDefineBinder::BindAggregate(FunctionExpression &expr, A
 	if (!arguments.empty()) {
 		MatchRecognizeRejectNavigationInAggregate(arguments[0].GetExpression(), function_name);
 		inner = std::move(arguments[0].GetExpressionMutable());
-		variable = MatchRecognizeNavigationVariable(inner, is_symbol, universal, function_name);
+		variable = MatchRecognizeNavigationVariable(inner, is_symbol, universal, function_name,
+		                                            MatchRecognizeArrowLambdas(context));
 	}
 
 	// the matcher folds rows into the aggregate itself, so what is bound here is the function rather
@@ -728,7 +740,8 @@ BindResult MatchRecognizeDefineBinder::BindNeighbour(FunctionExpression &functio
 	// and a navigation reads it from there.
 	auto inner = std::move(arguments[0].GetExpressionMutable());
 	auto variable = MatchRecognizeNavigationVariable(
-	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name);
+	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name,
+	    MatchRecognizeArrowLambdas(context));
 	auto stepped = MatchRecognizePeelStep(inner);
 	if (stepped.final_semantics) {
 		throw BinderException("FINAL reads the whole match, which a DEFINE condition is still assembling, so "
@@ -784,7 +797,8 @@ BindResult MatchRecognizeDefineBinder::BindNavigation(FunctionExpression &functi
 	}
 	auto inner = std::move(arguments[0].GetExpressionMutable());
 	auto variable = MatchRecognizeNavigationVariable(
-	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name);
+	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name,
+	    MatchRecognizeArrowLambdas(context));
 	// the qualifiers are gone, so what is left is read off the row this navigates to
 	auto symbol = variable.empty() ? string() : MatchRecognizeDefineColumn(variable);
 	return BindNavigated(std::move(inner), std::move(symbol), function_name == "LAST", offset, depth);
@@ -868,7 +882,8 @@ BindResult MatchRecognizeMeasureBinder::BindExpression(unique_ptr<ParsedExpressi
 		if (function_name == "CLASSIFIER" && function.GetArguments().size() == 1) {
 			// the classifier of the last row mapped to the variable, which is what LAST() reads (5.9)
 			auto variable = MatchRecognizeNavigationVariable(
-			    expr_ptr, [&](const string &name) { return IsPatternVariable(name); }, universal, "CLASSIFIER");
+			    expr_ptr, [&](const string &name) { return IsPatternVariable(name); }, universal, "CLASSIFIER",
+			    MatchRecognizeArrowLambdas(context));
 			auto entry = symbols.find(variable);
 			D_ASSERT(entry != symbols.end());
 			expr_ptr = MatchScopedValue(
@@ -944,17 +959,17 @@ BindResult MatchRecognizeMeasureBinder::BindOverMatch(FunctionExpression &expr, 
 	};
 	for (auto &argument : expr.GetArgumentsMutable()) {
 		MatchRecognizeRejectNavigationInAggregate(argument.GetExpression(), expr.FunctionName().GetIdentifierName());
-		ScopeToVariable(argument.GetExpressionMutable(), is_symbol, scope);
+		ScopeToVariable(argument.GetExpressionMutable(), is_symbol, scope, MatchRecognizeArrowLambdas(context));
 	}
 	if (expr.OrderByMutable()) {
 		for (auto &order : expr.OrderByMutable()->orders) {
-			ScopeToVariable(order.expression, is_symbol, scope);
+			ScopeToVariable(order.expression, is_symbol, scope, MatchRecognizeArrowLambdas(context));
 		}
 	}
 	// the filter decides which of the match's rows the aggregate sees, so it reads the match the
 	// same way the arguments do
 	if (expr.FilterMutable()) {
-		ScopeToVariable(expr.FilterMutable(), is_symbol, scope);
+		ScopeToVariable(expr.FilterMutable(), is_symbol, scope, MatchRecognizeArrowLambdas(context));
 	}
 	if (scope.size() > 1) {
 		throw BinderException("An aggregate in MEASURES reads the rows of one pattern variable, so \"%s\" "
@@ -1035,7 +1050,8 @@ BindResult MatchRecognizeMeasureBinder::BindClassifierStep(FunctionExpression &f
 	}
 	auto inner = std::move(arguments[0].GetExpressionMutable());
 	auto variable = MatchRecognizeNavigationVariable(
-	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name);
+	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name,
+	    MatchRecognizeArrowLambdas(context));
 	auto stepped = MatchRecognizePeelStep(inner);
 	if (!IsClassifierRead(*inner)) {
 		throw BinderException("%s() over CLASSIFIER() reads the classifier of the row it steps to, and nothing else "
@@ -1112,7 +1128,8 @@ BindResult MatchRecognizeMeasureBinder::BindNavigation(FunctionExpression &funct
 	}
 	auto inner = std::move(function.GetArgumentsMutable()[0].GetExpressionMutable());
 	auto variable = MatchRecognizeNavigationVariable(
-	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name);
+	    inner, [&](const string &name) { return IsPatternVariable(name); }, universal, function_name,
+	    MatchRecognizeArrowLambdas(context));
 	vector<string> symbol;
 	if (!variable.empty()) {
 		auto entry = symbols.find(variable);
