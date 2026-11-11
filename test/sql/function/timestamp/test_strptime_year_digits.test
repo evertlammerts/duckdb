@@ -217,6 +217,28 @@ SELECT typeof(d), d FROM read_csv('{TEST_DIR}/year_digits_iso_ts.csv');
 ----
 TIMESTAMP	0024-01-31 10:11:12
 
+# sniff_csv reports no format for columns the plain cast read, so its Prompt replays the cast
+
+statement ok
+COPY (SELECT * FROM (VALUES ('476-09-04', '476-09-04 10:11:12'), ('1492-10-12', '1492-10-12 01:02:03')) t(d, t)) TO '{TEST_DIR}/year_digits_iso_three.csv' (HEADER);
+
+query IIII
+SELECT typeof(d), d, typeof(t), t FROM read_csv('{TEST_DIR}/year_digits_iso_three.csv');
+----
+DATE	0476-09-04	TIMESTAMP	0476-09-04 10:11:12
+DATE	1492-10-12	TIMESTAMP	1492-10-12 01:02:03
+
+query III
+SELECT DateFormat, TimestampFormat, Prompt FROM sniff_csv('{TEST_DIR}/year_digits_iso_three.csv');
+----
+NULL	NULL	FROM read_csv('{TEST_DIR}/year_digits_iso_three.csv', auto_detect=false, delim=',', quote='', escape='', new_line='\n', skip=0, comment='', header=true, columns={'d': 'DATE', 't': 'TIMESTAMP'});
+
+query IIII
+SELECT typeof(d), d, typeof(t), t FROM read_csv('{TEST_DIR}/year_digits_iso_three.csv', auto_detect=false, delim=',', quote='', escape='', new_line='\n', skip=0, comment='', header=true, columns={'d': 'DATE', 't': 'TIMESTAMP'});
+----
+DATE	0476-09-04	TIMESTAMP	0476-09-04 10:11:12
+DATE	1492-10-12	TIMESTAMP	1492-10-12 01:02:03
+
 # a column mixing two and four digit years reads no year 24; the outcome depends on the order of the values, because
 # the sniffer narrows its candidates one value at a time and never checks an earlier value again
 
