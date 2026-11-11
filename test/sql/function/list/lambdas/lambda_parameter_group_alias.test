@@ -198,6 +198,31 @@ SELECT list_transform([1], lambda s: (SELECT (SELECT s))) FROM t GROUP BY (SELEC
 ----
 subqueries in lambda expressions are not supported
 
+# ... also as the receiver of a dot call or the relation of a star, which the subquery has not qualified yet
+
+statement ok
+CREATE TABLE ts AS SELECT 'zz' AS s, [1, 2] AS l, {'f': 5} AS st;
+
+statement error
+SELECT list_transform(['ab'], lambda s: (SELECT s.upper())) FROM ts GROUP BY (SELECT s.upper());
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT (SELECT list_transform([{'f': 'ab'}], lambda k: (SELECT k.f.upper())) FROM range(1) GROUP BY (SELECT k.f.upper())) FROM (SELECT {'f': 'zz'} AS k) o;
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT list_transform([[5]], lambda l: (SELECT l.list_transform(lambda x: x + 1))) FROM ts GROUP BY (SELECT l.list_transform(lambda x: x + 1));
+----
+subqueries in lambda expressions are not supported
+
+statement error
+SELECT list_transform([{'f': 1}], lambda st: (SELECT st.*)) FROM ts GROUP BY (SELECT st.*);
+----
+subqueries in lambda expressions are not supported
+
 # the other clauses of a grouped query
 
 query I
@@ -442,6 +467,43 @@ query I
 SELECT list_transform([1], lambda s: (SELECT list_transform([1], lambda s: s))) FROM t GROUP BY (SELECT list_transform([1], lambda s: s));
 ----
 [[1]]
+
+query I
+SELECT list_transform(['ab'], lambda x: (SELECT s.upper())) FROM ts GROUP BY (SELECT s.upper());
+----
+[ZZ]
+
+query I
+SELECT list_transform([{'f': 1}], lambda x: (SELECT st.*)) FROM ts GROUP BY (SELECT st.*);
+----
+[5]
+
+query I
+SELECT list_transform(['ab'], lambda s: (SELECT list_transform(['q'], lambda s: s.upper()))) FROM ts GROUP BY (SELECT list_transform(['q'], lambda s: s.upper()));
+----
+[[Q]]
+
+# a schema named like the parameter qualifies a call that is no dot call, and a table named like it provides a star
+statement ok
+CREATE SCHEMA sc;
+
+statement ok
+CREATE MACRO sc.f(x) AS x + 1;
+
+query I
+SELECT list_transform([1], lambda sc: sc.f(c)) FROM (SELECT 3 AS c) q GROUP BY sc.f(c);
+----
+[4]
+
+query I
+SELECT list_transform([1], lambda sc: (SELECT sc.f(c))) FROM (SELECT 3 AS c) q GROUP BY (SELECT sc.f(c));
+----
+[4]
+
+query I
+SELECT list_transform([1], lambda t: (SELECT t.*)) FROM t GROUP BY (SELECT t.*);
+----
+[99]
 
 statement ok
 CREATE MACRO apply_each(l, f) AS list_transform(l, f);

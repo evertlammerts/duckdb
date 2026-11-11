@@ -66,3 +66,9 @@ query I
 SELECT list_transform([1], y -> apply_each([s], x -> x + 1)) FROM (SELECT 99 AS s) t GROUP BY apply_each([s], x -> x + 1);
 ----
 [[100]]
+
+# an arrow passed to a function that takes a lambda declares its parameter, also with the enclosing lambda's name
+query I
+SELECT list_transform([1], x -> list_transform([s], x -> x + 1)) FROM (SELECT 99 AS s) t GROUP BY list_transform([s], x -> x + 1);
+----
+[[100]]

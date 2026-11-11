@@ -52,6 +52,8 @@ public:
 	                                           const vector<identifier_set_t> &enclosing_lambdas);
 	//! Whether a table of this scope has the qualified reference as [catalog.][schema path.]table.column[.field...]
 	bool TableProvidesReference(const ColumnRefExpression &col_ref);
+	//! Whether any binding in the current bind context has the given table name (ignoring catalog/schema)
+	bool TableNameExists(const Identifier &table_name);
 	//! Whether the reference is a parameter of one of the lambdas, or a field access on one. A table of this scope
 	//! that provides the reference wins, because that is the order in which the binder resolves it
 	bool IsLambdaParameterReference(const vector<identifier_set_t> &lambdas, const ColumnRefExpression &col_ref);
@@ -65,6 +67,10 @@ public:
 	//! Whether the call reads an arrow argument as a lambda only until it expands: it binds to a macro, which places
 	//! its arguments only then, or to no function the catalog knows. from_item is as for TryGetLambdaParameters
 	static bool ReadsArrowsProvisionally(Binder &binder, const FunctionExpression &function, bool from_item);
+	//! The column that QualifyFunction passes as the first argument of a call written on it, as in "x.lower()", or
+	//! null when QualifyFunction would not rewrite the call; from_item is as for TryGetLambdaParameters
+	static unique_ptr<ColumnRefExpression> DotCallReceiver(Binder &binder, const FunctionExpression &function,
+	                                                       bool from_item);
 	//! Visits the children of a call, handing each argument that binds as a lambda to lambda_callback instead
 	static void EnumerateCallChildren(
 	    Binder &binder, FunctionExpression &function,
@@ -89,8 +95,8 @@ private:
 	                                                                   idx_t &struct_extract_start);
 	//! Whether the given (possibly nested) table qualification matches a binding in the current bind context
 	bool TableBindingExists(const BindingAlias &alias);
-	//! Whether any binding in the current bind context has the given table name (ignoring catalog/schema)
-	bool TableNameExists(const Identifier &table_name);
+	//! The column a dot call reads from the schema, or the catalog and schema, of its name
+	static unique_ptr<ColumnRefExpression> Receiver(const QualifiedName &name);
 	//! The table binding that has names as [catalog.][schema path.]table.column[.field...], and the column's index
 	optional_ptr<Binding> FindTableColumn(const vector<Identifier> &names, idx_t &column_index,
 	                                      optional_ptr<ErrorData> error);

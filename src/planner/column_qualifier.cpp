@@ -298,13 +298,7 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 		return func;
 	}
 	ErrorData error;
-	unique_ptr<ColumnRefExpression> colref;
-	if (function.GetQualifiedName().Catalog().empty()) {
-		colref = make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema());
-	} else {
-		colref =
-		    make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema(), function.GetQualifiedName().Catalog());
-	}
+	auto colref = Receiver(function.GetQualifiedName());
 	unique_ptr<ParsedExpression> new_colref;
 	if (!IsLambdaParameterReference(enclosing_lambdas, *colref)) {
 		new_colref = QualifyColumnName(*colref, error);
@@ -318,6 +312,26 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(new_colref));
 	function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
 	return func;
+}
+
+unique_ptr<ColumnRefExpression> ColumnQualifier::Receiver(const QualifiedName &name) {
+	if (name.Catalog().empty()) {
+		return make_uniq<ColumnRefExpression>(name.Schema());
+	}
+	return make_uniq<ColumnRefExpression>(name.Schema(), name.Catalog());
+}
+
+unique_ptr<ColumnRefExpression> ColumnQualifier::DotCallReceiver(Binder &binder, const FunctionExpression &function,
+                                                                 bool from_item) {
+	if (function.GetQualifiedName().Schema().empty() || ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
+		return nullptr;
+	}
+	bool dot_call;
+	FindCallEntry(binder, function, from_item, dot_call);
+	if (!dot_call) {
+		return nullptr;
+	}
+	return Receiver(function.GetQualifiedName());
 }
 
 optional_ptr<CatalogEntry> ColumnQualifier::FindCallEntry(Binder &binder, const FunctionExpression &function,

@@ -8,6 +8,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/lambdaref_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_qualifier.hpp"
@@ -182,7 +183,8 @@ ColumnResolution ExpressionBinder::ResolveColumn(ColumnRefExpression &colref, id
 //! declared too, unless a table of the query the lambda is written in provides the reference. Without
 //! `every_binding` a subquery is skipped, since it binds in a chain of its own and for ownership its correlated
 //! columns would count as well. With it the walk reads every name the expression may yet bind: the operand and the
-//! body of a subquery, and both sides of an arrow that a call reads as a lambda only until it expands.
+//! body of a subquery, the receiver of a dot call and the relation of a star, which a subquery qualifies only when it
+//! binds, and both sides of an arrow that a call reads as a lambda only until it expands.
 template <class PREDICATE>
 static bool AnyFreeColumn(Binder &binder, ColumnQualifier &qualifier, ParsedExpression &expr,
                           vector<identifier_set_t> &lambda_params, bool every_binding, PREDICATE &predicate,
@@ -211,8 +213,24 @@ static bool AnyFreeColumn(Binder &binder, ColumnQualifier &qualifier, ParsedExpr
 		}
 		return predicate(col_ref);
 	}
+	case ExpressionClass::STAR: {
+		auto &star = expr.Cast<StarExpression>();
+		if (every_binding && !star.RelationName().empty() && !qualifier.TableNameExists(star.RelationName())) {
+			ColumnRefExpression relation(star.RelationName());
+			if (!qualifier.IsLambdaParameterReference(lambda_params, relation) && predicate(relation)) {
+				return true;
+			}
+		}
+		break;
+	}
 	case ExpressionClass::FUNCTION: {
 		auto &function = expr.Cast<FunctionExpression>();
+		if (every_binding) {
+			auto receiver = ColumnQualifier::DotCallReceiver(binder, function, from_item);
+			if (receiver && !qualifier.IsLambdaParameterReference(lambda_params, *receiver) && predicate(*receiver)) {
+				return true;
+			}
+		}
 		if (!function.IsLambdaFunction()) {
 			break;
 		}
