@@ -125,6 +125,11 @@ SELECT r FROM docs AS b, json_at_macro(b.p);
 ----
 5
 
+query I
+SELECT capture_b(txt(b -> '$.k')) FROM docs;
+----
+[5]
+
 statement ok
 CREATE MACRO nested_arrow(a) AS list_transform([1], lambda x: list_concat(list_transform([2], x -> x), [a]));
 

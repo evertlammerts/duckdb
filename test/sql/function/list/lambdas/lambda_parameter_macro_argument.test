@@ -640,7 +640,7 @@ SELECT body_subquery_lambda(y.z) FROM (VALUES (3)) AS y(z);
 ----
 [53]
 
-# a captured parameter named like a table of the body keeps its name, so the expansion reads as on main
+# a captured parameter named like a table of the body keeps its name when the lambda reads a dotted name led by it
 
 statement ok
 CREATE MACRO body_table_column(a) AS TABLE SELECT list_transform([{'v': 1, 'z': 9}], lambda x: x.v + a) FROM (VALUES (50, 9)) AS x(v, q);
@@ -836,3 +836,71 @@ query I
 SELECT * FROM db2.v2;
 ----
 [107]
+
+# a body table found as an unaliased base table, in a subquery, as a table function, or by its schema, keeps the
+# parameter named like it
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TABLE x AS SELECT 50 AS v, 7 AS z;
+
+statement ok
+CREATE MACRO base_table_body(a) AS TABLE SELECT list_transform([1], lambda x: x.v + a) AS r FROM x;
+
+query I
+SELECT r FROM x, base_table_body(x.z);
+----
+[57]
+
+statement ok
+CREATE MACRO subquery_table_body(a) AS TABLE SELECT (SELECT list_transform([1], lambda x: x.v + a) FROM x) AS r;
+
+query I
+SELECT r FROM x, subquery_table_body(x.z);
+----
+[57]
+
+statement ok
+CREATE MACRO table_function_body(a) AS TABLE SELECT list_transform([1], lambda range: range.range + a) AS r FROM range(5, 6);
+
+query I
+SELECT r FROM range(7, 8), table_function_body(range.range);
+----
+[10]
+
+statement ok
+CREATE SCHEMA sp;
+
+statement ok
+CREATE TABLE sp.data AS SELECT 50 AS v, 7 AS z;
+
+statement ok
+CREATE MACRO schema_body(a) AS TABLE SELECT list_transform([1], lambda sp: sp.data.v + a) AS r FROM sp.data;
+
+query I
+SELECT r FROM sp.data, schema_body(sp.data.z);
+----
+[57]
+
+# a parameter named like a body table but read only bare is renamed, and the new name skips a quoted body table
+
+statement ok
+CREATE MACRO bare_parameter(a) AS list_transform([10], lambda x: x + a) || (SELECT [0] FROM range(1) AS x);
+
+query II
+SELECT 1 AS x, bare_parameter(x);
+----
+1	[11, 0]
+
+statement ok
+CREATE TABLE "0_1_x" AS SELECT 50 AS d;
+
+statement ok
+CREATE MACRO quoted_table_body(a) AS (SELECT list_transform([{'d': 1}], lambda x: x.d + a) FROM "0_1_x");
+
+query II
+SELECT 7 AS x, quoted_table_body(x);
+----
+7	[8]
