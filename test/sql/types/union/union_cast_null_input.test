@@ -460,7 +460,8 @@ NULL
 statement ok
 RESET debug_verification_mode
 
-# every cast into a UNION gives a NULL union for a NULL input, which the function verifier checks
+# the casts into a UNION this block runs give a NULL union for a NULL input, which the function verifier checks; the
+# unimplemented VARIANT cast still raises for a NULL row
 statement ok
 SET debug_verification_mode = 'verify_functions'
 
