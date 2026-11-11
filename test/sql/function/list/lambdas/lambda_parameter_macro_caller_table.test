@@ -317,6 +317,63 @@ SELECT beside() FROM x;
 ----
 [1, 2]
 
+statement ok
+CREATE MACRO nested_beside() AS list_transform([{'d': 1}], lambda x: list_transform([{'d': 2}], lambda x: x.d)) || (SELECT [[3]] FROM (SELECT 1) x);
+
+query I
+SELECT nested_beside() FROM x;
+----
+[[2], [3]]
+
+# an argument that names the caller's table x is captured first; the caller scope still asks, so x.d reads the parameter
+
+statement ok
+CREATE MACRO arg_first(a) AS list_transform([{'d': 1}], lambda x: a + x.d) || (SELECT [0] FROM (SELECT 1) x);
+
+query I
+SELECT arg_first(x.z) FROM x AS x;
+----
+[8, 0]
+
+# a subquery in an aggregate argument inside the lambda binds, and its own table x wins over the renamed parameter
+
+statement ok
+CREATE MACRO agg_sub() AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)));
+
+query I
+SELECT agg_sub() FROM x;
+----
+[61]
+
+query I
+SELECT agg_sub() FROM x AS q;
+----
+[61]
+
+statement ok
+CREATE MACRO agg_sub_ref() AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT x.d FROM (SELECT 60 AS d) x)));
+
+query I
+SELECT agg_sub_ref() FROM x;
+----
+[61]
+
+statement ok
+CREATE MACRO agg_sub_sum() AS list_transform([{'d': 1}], lambda x: x.d + sum((SELECT x.d FROM (SELECT 40 AS d) x)));
+
+query I
+SELECT agg_sub_sum() FROM x;
+----
+[41]
+
+statement ok
+CREATE MACRO agg_sub_arg(a) AS list_transform([{'d': 1}], lambda x: first(a) + x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)));
+
+query I
+SELECT agg_sub_arg(x.d) FROM x;
+----
+[111]
+
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
 statement ok

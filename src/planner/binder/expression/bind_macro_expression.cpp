@@ -210,7 +210,7 @@ struct LambdaScope {
 	reference<LambdaExpression> lambda_expr;
 	vector<reference<ColumnRefExpression>> parameters;
 	identifier_set_t captured;
-	// A lambda holds no subquery, so no body table is in scope where the caller's scope captures a parameter.
+	// The top of a scalar body sees no body table, and RenameReferences stops at a subquery declaring the name.
 	identifier_set_t captured_by_caller_scope;
 };
 
@@ -656,11 +656,22 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
+			// a subquery in an aggregate argument binds, and there its own tables win over the parameter
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
+			identifier_set_t declared;
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    *sq->node, [&](unique_ptr<ParsedExpression> &) {},
+			    [&](TableRef &ref) { CollectTableName(ref, declared); });
+			identifier_map_t<Identifier> subquery_renames;
+			for (auto &entry : renames) {
+				if (declared.find(entry.first) == declared.end()) {
+					subquery_renames.emplace(entry.first, entry.second);
+				}
+			}
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
 			ParsedExpressionIterator::EnumerateQueryNodeChildren(
-			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
+			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, subquery_renames); });
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}
