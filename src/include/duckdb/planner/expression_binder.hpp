@@ -253,7 +253,8 @@ public:
 	                                                     Binder &binder, DummyBinding &macro_binding,
 	                                                     optional_ptr<Binder> dummy_binder,
 	                                                     optional_ptr<ParsedExpression> window_aggregate = nullptr,
-	                                                     optional_ptr<ParsedExpression> caller_window = nullptr);
+	                                                     optional_ptr<ParsedExpression> caller_window = nullptr,
+	                                                     optional_ptr<QueryNode> body_node = nullptr);
 
 	static LogicalType GetExpressionReturnType(const Expression &expr);
 
@@ -261,6 +262,8 @@ public:
 
 	//! Returns true if the function name is an alias for the UNNEST function
 	static bool IsUnnestFunction(const Identifier &function_name);
+	//! The argument position at which the function takes a lambda, if it takes one
+	static optional_idx GetLambdaArgumentIndex(ScalarFunctionCatalogEntry &function);
 
 	//! Continues the expression depth of the binder this one binds a nested expression for
 	void ContinueStackDepth(const ExpressionBinder &parent);

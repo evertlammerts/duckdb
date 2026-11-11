@@ -45,3 +45,114 @@ query I
 SELECT r FROM json_path_argument((SELECT '$.k' FROM (SELECT 1 AS b) WHERE b = 1));
 ----
 5
+
+# a JSON arrow in a function that takes no lambda declares nothing, so an argument naming its column renames nothing
+
+statement ok
+CREATE TABLE docs AS SELECT '{"k":5}'::JSON AS b, '$.k' AS p;
+
+statement ok
+CREATE MACRO json_at(p_arg) AS TABLE SELECT concat(b -> p_arg, '') AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at(b.p);
+----
+5
+
+# an arrow argument of a call is read as a lambda only where the function takes one
+
+statement ok
+CREATE MACRO json_in_call(a) AS list_transform([1], lambda x: concat(a, ''));
+
+query II
+SELECT '{"k":5}'::JSON AS x, json_in_call(concat(x -> '$.k', ''));
+----
+{"k":5}	[5]
+
+query II
+SELECT '{"k":5}'::JSON AS x, json_in_call(x -> '$.k');
+----
+{"k":5}	[5]
+
+# an arrow passed to a macro is the JSON operator, as the binder reads it
+
+statement ok
+CREATE MACRO txt(s) AS concat(s, '');
+
+statement ok
+CREATE MACRO json_at_macro(p_arg) AS TABLE SELECT txt(b -> p_arg) AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at_macro(b.p);
+----
+5
+
+statement ok
+CREATE MACRO keep_json(j) AS j;
+
+statement ok
+CREATE MACRO json_at_keep(p_arg) AS TABLE SELECT keep_json(b -> p_arg)::VARCHAR AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at_keep(b.p);
+----
+5
+
+statement ok
+CREATE MACRO inner_table(v) AS TABLE SELECT concat(v, '') AS r;
+
+statement ok
+CREATE MACRO outer_table(p_arg) AS TABLE SELECT r FROM docs AS b, inner_table(b -> p_arg);
+
+query III
+SELECT * FROM docs AS b, outer_table(b.p);
+----
+{"k":5}	$.k	5
+
+statement ok
+CREATE MACRO capture_b(a) AS list_transform([1], lambda b: a);
+
+query I
+SELECT capture_b(txt(b -> '$.k')) FROM docs;
+----
+[5]
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+query I
+SELECT r FROM docs AS b, json_at_macro(b.p);
+----
+5
+
+statement ok
+CREATE MACRO nested_arrow(a) AS list_transform([1], lambda x: list_concat(list_transform([2], x -> x), [a]));
+
+query II
+SELECT 100 AS x, nested_arrow(x);
+----
+100	[[2, 100]]
+
+statement ok
+CREATE MACRO dot_call_arrow(a, l) AS l.list_transform(x -> a);
+
+query II
+SELECT 99 AS x, dot_call_arrow(x, [1]);
+----
+99	[99]
+
+statement ok
+CREATE MACRO invoke_arrow(a) AS list_transform([1], lambda x: invoke(y -> a + y, 1));
+
+query II
+SELECT 10 AS y, invoke_arrow(y);
+----
+10	[11]
+
+statement ok
+CREATE MACRO arrow_table_macro(a) AS TABLE SELECT list_transform([1], lambda x: x + a);
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM arrow_table_macro(list_sum(list_transform([1], x -> x))));
+----
+list_transform(list_value(1), (lambda x: (x + list_sum(list_transform(list_value(1), (x -> x))))))

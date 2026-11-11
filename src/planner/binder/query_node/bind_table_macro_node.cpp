@@ -46,7 +46,8 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 	vector<reference<unique_ptr<ParsedExpression>>> body;
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    *node, [&](unique_ptr<ParsedExpression> &child) { body.push_back(child); });
-	ExpressionBinder::RenameLambdaParametersCapturingArguments(body, *this, *new_macro_binding, nullptr);
+	ExpressionBinder::RenameLambdaParametersCapturingArguments(body, *this, *new_macro_binding, nullptr, nullptr,
+	                                                           nullptr, node.get());
 	for (auto &child : body) {
 		eb.ReplaceMacroParameters(child.get(), lambda_params);
 	}

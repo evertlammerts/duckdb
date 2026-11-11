@@ -149,7 +149,7 @@ SELECT 100 AS x, unused_parameter(x, 1000);
 ----
 100	[101]
 
-# the new name cannot be the name of a table in scope
+# a table named like the parameter with a counter suffix does not capture the renamed reference
 
 statement ok
 CREATE TABLE x_1 AS SELECT 50 AS d;
@@ -452,6 +452,11 @@ SELECT 'ab' AS x, m(x.upper());
 ----
 ab	[AB]
 
+query I
+SELECT -5 AS x WHERE m(x.abs()) = [5];
+----
+-5
+
 # a schema qualified call in an argument names no column
 
 statement ok
@@ -531,6 +536,21 @@ SELECT * FROM (SELECT 'z' AS x) t2, table_dot_call(x);
 ----
 z	[ABz]
 
+# the receiver of a dot call in an argument names a lateral column
+
+statement ok
+CREATE MACRO table_receiver(a) AS TABLE SELECT list_transform(['q'], lambda x: a) AS r;
+
+query II
+SELECT * FROM (SELECT 'ab' AS x) t2, table_receiver(x.upper());
+----
+ab	[AB]
+
+query II
+SELECT * FROM (SELECT 'ab' AS x) t2, table_receiver(a := x.upper());
+----
+ab	[AB]
+
 statement ok
 CREATE MACRO table_unused_parameter(a, "0_1_x") AS TABLE SELECT list_transform([1], lambda x: x + a) AS r;
 
@@ -587,6 +607,11 @@ SELECT column_name FROM (DESCRIBE SELECT * FROM unnamed_table_macro(list_sum(lis
 ----
 list_transform(list_value(1), (lambda x: (x + list_sum(list_transform(list_value(1), (lambda x: x))))))
 
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM unnamed_table_macro(list_sum(list_transform([-1], lambda x: x.abs()))));
+----
+list_transform(list_value(1), (lambda x: (x + list_sum(list_transform(list_value(-1), (lambda x: x.abs()))))))
+
 # a table macro does not substitute a qualified reference named like its parameter, so nothing is renamed
 
 statement ok
@@ -596,6 +621,24 @@ query I
 SELECT column_name FROM (DESCRIBE SELECT * FROM (SELECT 5 AS x) t9, qualified_in_table_macro(x)) WHERE column_name LIKE 'list%';
 ----
 list_transform(list_value(1), (lambda x: (x + t2.s)))
+
+# a dotted reference that a table of the body provides is that table's column, not a field of the renamed parameter
+
+statement ok
+CREATE MACRO body_table_lambda(a) AS TABLE SELECT list_transform([1], lambda x: x.v + a) AS r FROM (VALUES (50, 7)) AS x(v, z);
+
+query I
+SELECT r FROM (VALUES (7)) AS x(z), body_table_lambda(x.z);
+----
+[57]
+
+statement ok
+CREATE MACRO body_subquery_lambda(a) AS (SELECT list_transform([1], lambda x: x.v + a) FROM (VALUES (50, 7)) AS x(v, z));
+
+query I
+SELECT body_subquery_lambda(x.z) FROM (VALUES (7)) AS x(z);
+----
+[57]
 
 # the window form, whose OVER clause the caller writes
 
@@ -689,6 +732,23 @@ query I
 SELECT * FROM defaults;
 ----
 [107]
+
+statement ok
+CREATE MACRO dep.g() AS 42;
+
+statement ok
+CREATE TABLE argument_defaults (v INTEGER[] DEFAULT m(ignore_argument(dep.g())));
+
+statement ok
+DROP MACRO dep.g;
+
+statement ok
+INSERT INTO argument_defaults DEFAULT VALUES;
+
+query I
+SELECT * FROM argument_defaults;
+----
+[100]
 
 # a view asks whether a qualified call is a dot call with its own database's search path
 
