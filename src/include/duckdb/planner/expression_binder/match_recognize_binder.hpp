@@ -136,6 +136,8 @@ private:
 	                         int64_t step = 0);
 	//! Reject something that only means anything while the matcher is assembling a match
 	void OutsideMatch(const string &what) const;
+	//! Whether a qualifier names a pattern variable rather than a parameter of an enclosing lambda
+	bool IsPatternVariable(const string &name) const;
 
 	MatchRecognizeConditionInputs &inputs;
 	const WindowExpression &window_template;
@@ -168,6 +170,8 @@ protected:
 private:
 	//! An aggregate in MEASURES aggregates the rows of the match, which is a window over them
 	BindResult BindOverMatch(FunctionExpression &expr, idx_t depth);
+	//! Whether a qualifier names a pattern variable or SUBSET rather than a parameter of an enclosing lambda
+	bool IsPatternVariable(const string &name) const;
 	//! One field of the matcher's state, as it stands where the measures are projected
 	unique_ptr<ParsedExpression> StateField(const string &field);
 	//! Bind an expression this binder built, whose own parts are not the clause's to interpret again
@@ -250,5 +254,7 @@ unique_ptr<ParsedExpression> MatchRecognizeStateField(const string &state, const
 //! The names a lambda binds for its body, or false when the expression is only spelled like one: the
 //! arrow form is also the JSON operator, and which it is only settles when the function is bound.
 bool MatchRecognizeLambdaParameters(const ParsedExpression &expr, identifier_set_t &parameters);
+//! The names the arrow form would bind if it turns out to be a lambda
+bool MatchRecognizeArrowParameters(const ParsedExpression &expr, identifier_set_t &parameters);
 
 } // namespace duckdb

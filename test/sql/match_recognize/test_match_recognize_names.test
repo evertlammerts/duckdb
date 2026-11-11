@@ -273,6 +273,50 @@ FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
 ----
 Ambiguous reference to column name "x"
 
+# and so does one behind a pattern variable, which reads the same column on that variable's rows
+statement error
+FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
+    ORDER BY t1.x MEASURES LAST(A.x) AS n PATTERN (A+)
+ DEFINE A AS true)
+----
+Ambiguous reference to column name "x"
+
+statement error
+FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
+    ORDER BY t1.x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS A.x > 0)
+----
+Ambiguous reference to column name "x"
+
+# A table's name read as a column is its row, behind a pattern variable as well as bare
+query III
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES LAST(ticks) AS m, LAST(A.ticks) AS n, A.ticks AS o PATTERN (A B+)
+ DEFINE B AS true)
+----
+{'x': 2}	{'x': 1}	{'x': 1}
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS ticks = {'x': 2})
+----
+2
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS B.ticks = {'x': 2})
+----
+2
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS A.ticks.x = 1)
+----
+2
+
 statement error
 FROM ticks MATCH_RECOGNIZE (
     ORDER BY nope MEASURES count(*) AS n PATTERN (A+)

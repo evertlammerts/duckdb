@@ -227,3 +227,200 @@ FROM (
  DEFINE X AS true)
 ----
 Ambiguous reference to column name "j"
+
+# nor is a pattern variable the arrow may bind taken for one, so as a lambda it reads its parameter
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+query I
+FROM (VALUES (10)) t(x) MATCH_RECOGNIZE (
+    MEASURES list_transform([{'x': 1}, {'x': 2}], A -> A.x + 1) AS s PATTERN (A)
+ DEFINE A AS true)
+----
+[2, 3]
+
+statement ok
+RESET lambda_syntax
+
+# A DEFINE aggregate or navigation is computed over the rows of the match, outside the lambda it is
+# written in, so it cannot read the lambda's parameter; a lambda inside it starts a scope of its own.
+
+statement ok
+CREATE TABLE t3 AS SELECT * FROM (VALUES (1, 10, 7), (2, 20, 8), (3, 30, 9)) v(i, s, x);
+
+statement error
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: sum(v) > 0)));
+----
+aggregate functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: count(v) > 0)));
+----
+aggregate functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: FIRST(v) > 0)));
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: LAST(s + v) > 0)));
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: PREV(v) IS NULL)));
+----
+window functions cannot reference lambda parameters
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: v + sum(s) > 0)));
+----
+3
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS sum(s) < 40);
+----
+1
+2
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: v + sum(list_sum(list_transform([s], lambda y: y + s))) < 70)));
+----
+1
+2
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: LAST(list_sum(list_transform([s], lambda y: y + s))) = 20 * v)));
+----
+1
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: coalesce(PREV(list_sum(list_transform([s], lambda y: y + s))), 0) < 30 * v)));
+----
+2
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1], lambda v: v + sum(list_sum(list_transform([s], lambda y: y + s)))) AS c PATTERN (A+) DEFINE A AS true);
+----
+[121]
+
+query I rowsort
+SELECT * FROM t3 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1], lambda v: v + LAST(list_sum(list_transform([s], lambda y: y + s)))) AS c PATTERN (A+) DEFINE A AS true);
+----
+[61]
+
+# A MEASURES step is computed per input row below the matcher, so it cannot read the parameter either,
+# even where the parameter is spelled like a column of the input.
+
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10, 7), (2, 20, 8), (3, 30, 9), (4, 5, 1)) v(i, s, x);
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda x: PREV(x)) AS m PATTERN (A+) DEFINE A AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda x: NEXT(x)) AS m ALL ROWS PER MATCH PATTERN (A+) DEFINE A AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda q: PREV(q)) AS m PATTERN (A+) DEFINE A AS true);
+----
+window functions cannot reference lambda parameters
+
+# a step may hold a lambda of its own, whose parameter may shadow the outer one, and may name the
+# column with its table or with a pattern variable
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda x: PREV(list_sum(list_transform([s], lambda x: x + 1)))) AS m PATTERN (A+) DEFINE A AS true);
+----
+[31]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda x: x + PREV(t4.x)) AS m PATTERN (A+) DEFINE A AS true);
+----
+[109]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], lambda x: x + PREV(A.x)) AS m PATTERN (A+) DEFINE A AS true);
+----
+[109]
+
+# A pattern variable in front of a column names the input's column, so a lambda parameter spelled like
+# the column does not claim it, in DEFINE and in MEASURES.
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([1000], lambda s: A.s < 15)));
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([1000], lambda s: LAST(A.s) < t4.s)));
+----
+3
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([1000], lambda s: sum(A.s) < 15)));
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1000], lambda s: A.s > 15)));
+----
+2
+
+query III
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1000], lambda s: s + A.s) AS m, list_transform([1000], lambda s: s + sum(A.s)) AS n, list_transform([1000], lambda s: s + LAST(B.s)) AS o PATTERN (A B+) DEFINE B AS true);
+----
+[1010]	[1010]	[1005]
+
+# another variable's column beside the parameter
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([1], lambda v: A.s + v < B.s)));
+----
+3
+
+# behind a variable, a name the input does not have is still not a column, whatever the lambda binds
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda q: A.q = 1)));
+----
+Referenced column "q" not found
+
+# A lambda parameter spelled like a pattern variable is the one in scope inside an aggregate or a
+# navigation as well, so those read a parameter of the lambda they are written in.
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'s': 100}], lambda A: A.s < s)));
+----
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'s': 100}], lambda A: sum(A.s) < s)));
+----
+aggregate functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'s': 100}], lambda A: FIRST(A.s) < s)));
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A B+) DEFINE B AS list_bool_or(list_transform([{'s': 100}], lambda A: PREV(A.s) < s)));
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'s': 100}], lambda A: sum(A.s)) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'s': 100}], lambda A: LAST(A.s)) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'s': 100}], lambda A: PREV(A.s)) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters

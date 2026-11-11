@@ -109,10 +109,11 @@ struct HoistedInputRefs {
 	    : names(names_p), input_columns(input_columns_p), input_tables(input_tables_p) {
 	}
 
-	//! The subquery column standing for this reference, allocated on first use
-	const string &Hoist(const ColumnRefExpression &colref) {
+	//! The subquery column standing for this reference, allocated on first use. Behind a pattern
+	//! variable it reads only that variable's rows, so it is kept apart from the same reference read bare.
+	const string &Hoist(const ColumnRefExpression &colref, bool behind_variable = false) {
 		// length prefixed, so a dot inside a quoted identifier cannot read as a component boundary
-		string key;
+		string key = behind_variable ? "@" : "";
 		for (auto &name : colref.ColumnNames()) {
 			const auto &identifier = name.GetIdentifierName();
 			key += to_string(identifier.size());
@@ -128,7 +129,7 @@ struct HoistedInputRefs {
 		// a reference the input itself answers reads the row pattern input, and so every row of the
 		// match; one it does not is the surrounding query's, and the same value on all of them
 		const auto &root = colref.ColumnNames()[0].GetIdentifierName();
-		if (input_columns.count(root) || input_tables.count(root)) {
+		if (!behind_variable && (input_columns.count(root) || input_tables.count(root))) {
 			universal.emplace(column, colref.ToString());
 		}
 		hoisted->SetAlias(Identifier(column));
@@ -147,19 +148,30 @@ struct HoistedInputRefs {
 	vector<unique_ptr<ParsedExpression>> select_list;
 };
 
-//! A reference whose first name is a pattern variable, or one a lambda binds, is not the input's.
-//! Everything else is computed against the input, which is also what makes an ambiguous reference say
-//! so rather than quietly taking the first of them.
+//! A name a lambda binds, a pattern variable and a measure are not the input's, but the column behind
+//! a pattern variable is. Everything else is computed against the input, which is also what makes an
+//! ambiguous reference say so rather than quietly taking the first of them.
 static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
                                  const case_insensitive_set_t &aliases, HoistedInputRefs &refs,
-                                 vector<identifier_set_t> &lambda_parameters) {
+                                 vector<identifier_set_t> &lambda_parameters,
+                                 vector<identifier_set_t> &arrow_parameters) {
 	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
 			auto &lambda = expr->Cast<LambdaExpression>();
 			lambda_parameters.push_back(std::move(parameters));
-			HoistInputReferences(lambda.RightMutable(), symbols, aliases, refs, lambda_parameters);
+			HoistInputReferences(lambda.RightMutable(), symbols, aliases, refs, lambda_parameters, arrow_parameters);
 			lambda_parameters.pop_back();
+			return;
+		}
+		// The arrow is a lambda or the JSON operator, and only binding the function around it settles which. Its
+		// references are hoisted as if it were the operator, but a qualifier it may bind is not dropped.
+		if (MatchRecognizeArrowParameters(*expr, parameters)) {
+			arrow_parameters.push_back(std::move(parameters));
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+				HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
+			});
+			arrow_parameters.pop_back();
 			return;
 		}
 	}
@@ -169,10 +181,21 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 		if (LambdaExpression::IsLambdaParameter(lambda_parameters, names[0])) {
 			return;
 		}
+		if (symbols.count(names[0].GetIdentifierName())) {
+			if (names.size() >= 2 && !LambdaExpression::IsLambdaParameter(arrow_parameters, names[0])) {
+				// The column behind a pattern variable is the input's too. Read back under a generated name,
+				// it stays that column once the variable is dropped, where a lambda parameter spelled like
+				// the column would otherwise claim it.
+				ColumnRefExpression column(names[1]);
+				column.SetQueryLocation(colref.GetQueryLocation());
+				colref.ColumnNamesMutable()[1] = Identifier(refs.Hoist(column, true));
+			}
+			return;
+		}
 		// alias.<name> names one of this clause's own measures rather than a column of the input
 		const auto is_alias = names.size() == 2 && StringUtil::CIEquals("alias", names[0].GetIdentifierName()) &&
 		                      aliases.count(names[1].GetIdentifierName()) > 0;
-		if (!is_alias && !symbols.count(names[0].GetIdentifierName())) {
+		if (!is_alias && !aliases.count(names[0].GetIdentifierName())) {
 			auto alias = expr->GetAlias();
 			expr = make_uniq<ColumnRefExpression>(Identifier(refs.Hoist(colref)));
 			expr->SetAlias(std::move(alias));
@@ -180,14 +203,15 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 		return;
 	}
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters);
+		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
 	});
 }
 
 static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
                                  const case_insensitive_set_t &aliases, HoistedInputRefs &refs) {
 	vector<identifier_set_t> lambda_parameters;
-	HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters);
+	vector<identifier_set_t> arrow_parameters;
+	HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters, arrow_parameters);
 }
 
 //! Whether any part of the pattern sits inside a {- -}
@@ -201,12 +225,51 @@ static bool HasExclusion(const ParsedExpression &expr) {
 	return found;
 }
 
+//! A reference to a parameter of a lambda the expression is written in, rather than of one inside it
+static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const ParsedExpression &expr,
+                                                                         const vector<identifier_set_t> &enclosing,
+                                                                         vector<identifier_set_t> &inner) {
+	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+		identifier_set_t parameters;
+		if (MatchRecognizeLambdaParameters(expr, parameters)) {
+			inner.push_back(std::move(parameters));
+			auto found = FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner);
+			inner.pop_back();
+			return found;
+		}
+	}
+	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &name = expr.Cast<ColumnRefExpression>().ColumnNames()[0];
+		const auto bound_outside =
+		    !LambdaExpression::IsLambdaParameter(inner, name) && LambdaExpression::IsLambdaParameter(enclosing, name);
+		return bound_outside ? &expr : nullptr;
+	}
+	optional_ptr<const ParsedExpression> found;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!found) {
+			found = FindEnclosingLambdaParameter(child, enclosing, inner);
+		}
+	});
+	return found;
+}
+
 //! PREV and NEXT walk the ordered partition rather than the match, so a measure's are computed per
 //! input row below the pattern window and read back from above it
 static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
-                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names) {
+                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
+                                   vector<identifier_set_t> &lambda_parameters) {
+	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
+		identifier_set_t parameters;
+		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			HoistMeasureNavigation(expr->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
+			                       hoisted, names, lambda_parameters);
+			lambda_parameters.pop_back();
+			return;
+		}
+	}
 	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
@@ -235,9 +298,16 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 				// no row is classified below the matcher, so this one is read off the finished match
 				return;
 			}
+			// the step is computed below the matcher, outside every lambda it is written in
+			vector<identifier_set_t> inner_parameters;
+			auto parameter =
+			    FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters, inner_parameters);
+			if (parameter) {
+				throw BinderException(*parameter, "window functions cannot reference lambda parameters");
+			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, universal, hoisted,
-				                       names);
+				                       names, lambda_parameters);
 			}
 			// a step is a fixed distance through the partition, so the offset is a non-negative
 			// constant - a negative one would step the other way and a column a different way per row
@@ -277,8 +347,16 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 		}
 	}
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names);
+		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, lambda_parameters);
 	});
+}
+
+static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
+                                   const case_insensitive_map_t<vector<string>> &symbols,
+                                   const case_insensitive_map_t<string> &universal,
+                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names) {
+	vector<identifier_set_t> lambda_parameters;
+	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, lambda_parameters);
 }
 
 //! The conditions and the frame are bound against the input but evaluated over the projection above
@@ -448,12 +526,8 @@ static void HoistClauseReferences(MatchRecognizeConfig &config, const MatchRecog
 	for (auto &expr : config.measures_expression_list) {
 		measure_aliases.insert(expr->GetAlias().GetIdentifierName());
 	}
-	auto measure_names = symbols.qualifying;
-	for (auto &alias : measure_aliases) {
-		measure_names.insert(alias);
-	}
 	for (auto &expr : config.measures_expression_list) {
-		HoistInputReferences(expr, measure_names, measure_aliases, input_refs);
+		HoistInputReferences(expr, symbols.qualifying, measure_aliases, input_refs);
 	}
 }
 

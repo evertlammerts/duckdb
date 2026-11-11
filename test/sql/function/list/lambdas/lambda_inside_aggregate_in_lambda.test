@@ -68,6 +68,12 @@ SELECT list_transform([[1]], lambda a: list_transform(a, lambda b: b + sum(list_
 ----
 [[307]]
 
+# three lambdas deep with the aggregate in the middle, where every capture changes the value
+query I
+SELECT list_transform([1], lambda a: a + sum(list_sum(list_transform([100], lambda b: list_sum(list_transform([10000], lambda c: c + b + s + 1000000*x)))))) FROM t;
+----
+[24030361]
+
 query I
 SELECT list_transform([1], lambda x: x + sum(list_reduce([s, i], lambda a, b: a + b + s))) FROM t;
 ----
@@ -175,66 +181,3 @@ query I
 SELECT add_count([1], s) FROM t;
 ----
 [4]
-
-# MATCH_RECOGNIZE: a DEFINE aggregate or navigation is computed over the rows of the match
-statement error
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: sum(v) > 0)));
-----
-aggregate functions cannot reference lambda parameters
-
-statement error
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: count(v) > 0)));
-----
-aggregate functions cannot reference lambda parameters
-
-statement error
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: FIRST(v) > 0)));
-----
-window functions cannot reference lambda parameters
-
-statement error
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: LAST(s + v) > 0)));
-----
-window functions cannot reference lambda parameters
-
-statement error
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: PREV(v) IS NULL)));
-----
-window functions cannot reference lambda parameters
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: v + sum(s) > 0)));
-----
-3
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS sum(s) < 40);
-----
-1
-2
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: v + sum(len(list_transform([s], lambda y: y + s))) < 4)));
-----
-1
-2
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: LAST(list_sum(list_transform([s], lambda y: y + s))) = 20 * v)));
-----
-1
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_bool_or(list_transform([1], lambda v: coalesce(PREV(list_sum(list_transform([s], lambda y: y + s))), 0) < 30 * v)));
-----
-2
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1], lambda v: v + sum(len(list_transform([s], lambda y: y + s)))) AS c PATTERN (A+) DEFINE A AS true);
-----
-[4]
-
-query I rowsort
-SELECT * FROM t MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1], lambda v: v + LAST(list_sum(list_transform([s], lambda y: y + s)))) AS c PATTERN (A+) DEFINE A AS true);
-----
-[61]
