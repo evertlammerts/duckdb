@@ -32,7 +32,7 @@ statement ok
 CREATE VIEW vs AS SELECT v FROM src;
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 query III
 SELECT s.m(), (SELECT v FROM s.tm()), (SELECT v FROM s.vs);
@@ -48,7 +48,7 @@ SELECT m(), (SELECT v FROM tm());
 s	s
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # a table that only the macro's schema holds
 
@@ -65,7 +65,7 @@ statement ok
 CREATE MACRO tmo() AS TABLE SELECT v FROM only_s;
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 query II
 SELECT s.mo(), (SELECT v FROM s.tmo());
@@ -105,7 +105,7 @@ SELECT main.mm(), main.callf_main(1), v, r FROM main.tmm();
 main	1000	main	1000
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # nested macros: a bare macro name in a body resolves in the body's schema
 
@@ -254,7 +254,7 @@ SELECT tmpm(), (SELECT v FROM ttmpm()), (SELECT v FROM tmpv);
 s	s	s
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # the caller's arguments at the expression level of a scalar body keep the caller's entries
 
@@ -361,7 +361,7 @@ SELECT main.outer_ident(), main.outer_window(), main.sub_ident(), main.nested_id
 1000	1000	10	1000	1000	100
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # a built-in in a nested argument, and the window clause of a nested window macro call, stay as written where the
 # caller reads them the same, so they still match the caller's GROUP BY key; so does a generated column's argument
@@ -474,7 +474,7 @@ SELECT main.outer_sum(), main.outer_scalar();
 main	main
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # CREATE checks a body with the same resolution, so a working definition can be replaced by itself
 
@@ -577,6 +577,47 @@ query II
 SELECT db2.s.m(), (SELECT v FROM db2.s.tm());
 ----
 db2 s	db2 s
+
+# a macro called by schema and name from a session whose current catalog is an attached one binds in the catalog it
+# was found in, not in the default catalog (on its own connection, so the other blocks keep their current catalog)
+
+statement ok
+ATTACH ':memory:' AS cur;
+
+statement ok con1
+USE cur;
+
+statement ok con1
+CREATE SCHEMA s;
+
+statement ok con1
+CREATE TABLE s.src AS SELECT 'cur s' AS v;
+
+statement ok con1
+CREATE TABLE main.src AS SELECT 'cur main' AS v;
+
+statement ok con1
+CREATE MACRO s.f(x) AS x * 3;
+
+statement ok con1
+CREATE MACRO main.f(x) AS x * 5;
+
+statement ok con1
+CREATE MACRO s.m() AS (SELECT v FROM src);
+
+statement ok con1
+CREATE MACRO s.tm() AS TABLE SELECT v FROM src;
+
+statement ok con1
+CREATE MACRO s.callf(x) AS f(x);
+
+statement ok con1
+CREATE MACRO s.subf(x) AS (SELECT f(x));
+
+query IIII con1
+SELECT s.m(), (SELECT v FROM s.tm()), s.callf(1), s.subf(1);
+----
+cur s	cur s	3	3
 
 # parameter types name the macro's type, and a dot call on a parameter calls the macro's function
 
@@ -739,7 +780,7 @@ SELECT s.mx(), (SELECT v FROM s.tmx()), (SELECT v FROM s.vx);
 x	x	x
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 # a sequence named in a body subquery and query_table in a table body resolve in s
 
@@ -795,7 +836,7 @@ statement ok
 CREATE MACRO tm() AS TABLE SELECT v FROM src;
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 query II
 SELECT function_name, macro_definition FROM duckdb_functions() WHERE schema_name = 's' ORDER BY function_name;
