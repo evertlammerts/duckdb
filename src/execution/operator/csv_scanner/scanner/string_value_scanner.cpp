@@ -1490,6 +1490,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 	string over_buffer_string;
 	auto previous_buffer = previous_buffer_handle->Ptr();
 	idx_t j = 0;
+	LinePosition marker_position;
 	if (!comment_before) {
 		result.quoted = false;
 	}
@@ -1518,6 +1519,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 			result.escaped = true;
 		}
 		if (states.IsComment()) {
+			if (!result.comment) {
+				marker_position = {previous_buffer_handle->buffer_idx, i, previous_buffer_handle->actual_size};
+			}
 			result.SetComment(result, j);
 		}
 		if (states.IsInvalid()) {
@@ -1626,6 +1630,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 			result.SetQuoted(result, j);
 		}
 		if (states.IsComment()) {
+			if (!result.comment) {
+				marker_position = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, cur_buffer_handle->actual_size};
+			}
 			result.SetComment(result, j);
 		}
 		if (states.IsEscaped() && result.state_machine.dialect_options.state_machine_options.escape != '\0') {
@@ -1770,9 +1777,11 @@ void StringValueScanner::ProcessOverBufferValue() {
 	}
 
 	if (result.IsCommentSet(result) && !comment_before) {
-		// a marker seen here is a position in over_buffer_string, which gave the value before it, so the value start
-		// UnsetComment compares it with is moved past it in that string
-		result.last_position.buffer_pos = result.position_before_comment + 1;
+		// the value before a marker seen here came from over_buffer_string, so the marker and the value start are put
+		// in the marker's buffer as adding that value leaves them, and UnsetComment adds only the row
+		result.position_before_comment = marker_position.buffer_pos;
+		result.last_position = {marker_position.buffer_idx, marker_position.buffer_pos + 1,
+		                        marker_position.buffer_size};
 	}
 	const bool file_ended =
 	    iterator.pos.buffer_pos >= cur_buffer_handle->actual_size && cur_buffer_handle->is_last_buffer;
