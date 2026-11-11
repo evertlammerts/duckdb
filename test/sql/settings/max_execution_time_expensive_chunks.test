@@ -1,0 +1,132 @@
+# name: test/sql/settings/max_execution_time_expensive_chunks.test
+# description: max_execution_time stops a query whose few chunks each take long
+# group: [settings]
+
+# a restart would recreate the named connections without their bound
+require skip_reload
+
+# the bounded queries run on their own connections, so no later query runs under a small bound
+statement ok con1
+SET max_execution_time=50
+
+# the decorrelated plan joins on the outer list of 6000 elements, so each chunk hashes and compares millions of elements
+statement error con1
+SELECT (SELECT count(*) FROM (SELECT unnest(l) AS k) a JOIN (SELECT unnest(l) AS k) b ON a.k = b.k)
+FROM (SELECT list(range) AS l FROM range(6000))
+----
+Query exceeded maximum execution time
+
+# the window partitions and sorts on the outer list
+statement error con1
+SELECT (
+	SELECT list(x ORDER BY pos)
+	FROM (SELECT x, row_number() OVER (ORDER BY x) AS pos FROM (SELECT unnest(l) AS x ORDER BY x))
+)
+FROM (SELECT list(range) AS l FROM range(6000))
+----
+Query exceeded maximum execution time
+
+# a query stops within one operator call of its deadline, so the bound has to pass before the first long probe call
+statement ok con2
+SET max_execution_time=10
+
+statement error con2
+WITH t AS (SELECT l, unnest(l) AS k FROM (SELECT list(range) AS l FROM range(6000)))
+SELECT count(*) FROM t a JOIN t b ON a.l = b.l AND a.k = b.k
+----
+Query exceeded maximum execution time
+
+# many cheap chunks
+statement error con1
+SELECT count(*) FROM range(20000) a, range(20000) b WHERE a.range + b.range = -1
+----
+Query exceeded maximum execution time
+
+# a deadline that does not pass leaves the result alone
+statement ok
+SET max_execution_time=600000
+
+query I
+SELECT (SELECT count(*) FROM (SELECT unnest(l) AS k) a JOIN (SELECT unnest(l) AS k) b ON a.k = b.k)
+FROM (SELECT list(range) AS l FROM range(1000))
+----
+1000
+
+query I
+SELECT len((
+	SELECT list(x ORDER BY pos)
+	FROM (SELECT x, row_number() OVER (ORDER BY x) AS pos FROM (SELECT unnest(l) AS x ORDER BY x))
+))
+FROM (SELECT list(range) AS l FROM range(1000))
+----
+1000
+
+statement ok
+SET max_execution_time=0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT unnest(l) AS k) a JOIN (SELECT unnest(l) AS k) b ON a.k = b.k)
+FROM (SELECT list(range) AS l FROM range(1000))
+----
+1000
+
+query I
+WITH t AS (SELECT l, unnest(l) AS k FROM (SELECT list(range) AS l FROM range(1000)))
+SELECT count(*) FROM t a JOIN t b ON a.l = b.l AND a.k = b.k
+----
+1000
+
+# a COMMIT that outlives its deadline is reported as committed
+statement ok
+ATTACH '{TEST_DIR}/max_execution_time_commit.db' AS commit_db
+
+statement ok
+CREATE TABLE commit_db.committed (i BIGINT, s VARCHAR)
+
+statement ok con3
+BEGIN
+
+statement ok con3
+INSERT INTO commit_db.committed SELECT range, repeat('x', 100000) FROM range(1000)
+
+statement ok con3
+SET max_execution_time=50
+
+statement ok con3
+COMMIT
+
+query I
+SELECT count(*) FROM commit_db.committed
+----
+1000
+
+# the next statement in the same call keeps its own bound
+statement error con4
+BEGIN; INSERT INTO commit_db.committed VALUES (1000, 'x'); COMMIT; SET max_execution_time=50;
+SELECT count(*) FROM range(20000) a, range(20000) b WHERE a.range + b.range = -1;
+----
+Query exceeded maximum execution time
+
+query I
+SELECT count(*) FROM commit_db.committed
+----
+1001
+
+# four runs on one thread, each a single long projection call, fail only if the deadline is read before every call
+statement ok
+SET threads=1
+
+statement ok con5
+PREPARE expensive_call AS SELECT length(md5(repeat('x', 50000000 + range))) FROM range(1)
+
+statement ok con5
+SET max_execution_time=10
+
+loop i 0 4
+
+statement error con5
+EXECUTE expensive_call
+----
+Query exceeded maximum execution time
+
+endloop
