@@ -450,7 +450,7 @@ static bool TryIntegerCast(const char *buf, idx_t len, T &result, bool strict) {
 	return IntegerCastLoop<T, false, ALLOW_EXPONENT, OP, decimal_separator>(buf, len, result, strict);
 }
 
-template <typename T, bool IS_SIGNED = true>
+template <typename T, bool IS_SIGNED = NumericLimits<T>::IsSigned()>
 static inline bool TrySimpleIntegerCast(const char *buf, idx_t len, T &result, bool strict) {
 	IntegerCastData<T> simple_data;
 	if (TryIntegerCast<IntegerCastData<T>, IS_SIGNED, false, IntegerCastOperation>(buf, len, simple_data, strict)) {

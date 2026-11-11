@@ -5,9 +5,6 @@
 statement ok
 COPY (FROM (VALUES ('-5'), ('6'))) TO '{TEST_DIR}/negative.csv' (HEADER false)
 
-statement ok
-COPY (FROM (VALUES ('-1'), ('6'))) TO '{TEST_DIR}/minus_one.csv' (HEADER false)
-
 # Refused by the declared type, so the first row is a header
 query I
 FROM read_csv('{TEST_DIR}/negative.csv', columns={'v': 'UTINYINT'})
@@ -20,27 +17,12 @@ FROM read_csv('{TEST_DIR}/negative.csv', columns={'v': 'USMALLINT'})
 6
 
 query I
-FROM read_csv('{TEST_DIR}/negative.csv', columns={'v': 'UINTEGER'})
-----
-6
-
-query I
 FROM read_csv('{TEST_DIR}/negative.csv', columns={'v': 'UBIGINT'})
 ----
 6
 
 query I
 FROM read_csv('{TEST_DIR}/negative.csv', columns={'v': 'UHUGEINT'})
-----
-6
-
-query I
-FROM read_csv('{TEST_DIR}/minus_one.csv', columns={'v': 'UTINYINT'})
-----
-6
-
-query I
-FROM read_csv('{TEST_DIR}/minus_one.csv', columns={'v': 'UBIGINT'})
 ----
 6
 

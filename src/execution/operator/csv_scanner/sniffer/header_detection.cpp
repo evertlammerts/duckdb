@@ -177,7 +177,8 @@ bool CSVSniffer::DetectHeaderWithSetColumn(ClientContext &context, vector<Header
 
 	if (!has_header) {
 		bool all_varchar = true;
-		// A row the scan reads is data; for any other row the type detection check decides, as before
+		// A row the scan reads is data; a row it refuses is data only when the strict type detection check reads it,
+		// which never happens over an unsigned column, since the strict parse accepts a subset of what the scan does
 		bool scan_reads_row = true;
 		bool type_detection_reads_row = true;
 		for (idx_t col = 0; col < set_columns.Size(); col++) {
