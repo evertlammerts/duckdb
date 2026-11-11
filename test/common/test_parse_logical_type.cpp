@@ -1,7 +1,10 @@
 #include "catch.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/main/config.hpp"
+
+#include <functional>
 
 using namespace duckdb;
 
@@ -78,4 +81,34 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 		REQUIRE(DBConfig::ParseLogicalType("STRUCT(my_list ANY[], my_array VARCHAR[2], my_map MAP(VARCHAR,VARCHAR))") ==
 		        LogicalType::STRUCT(mix_struct_children));
 	}
+}
+
+static string UnionError(const std::function<void()> &build) {
+	try {
+		build();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		return Exception::ExceptionTypeToString(error.Type()) + ": " + error.RawMessage();
+	}
+	return "no error";
+}
+
+TEST_CASE("A union type refuses duplicate member names", "[parse_logical_type]") {
+	child_list_t<LogicalType> duplicates {{"a", LogicalType::INTEGER}, {"a", LogicalType::INTEGER}};
+	REQUIRE(UnionError([&]() { LogicalType::UNION(duplicates); }) ==
+	        "Invalid Input: Duplicate member name \"a\" in UNION(a INTEGER, a INTEGER)");
+	REQUIRE(UnionError([&]() { Value::UNION(duplicates, 0, Value::INTEGER(1)); }) ==
+	        "Invalid Input: Duplicate member name \"a\" in UNION(a INTEGER, a INTEGER)");
+	REQUIRE(UnionError([&]() {
+		        LogicalType::UNION({{"x", LogicalType::INTEGER}, {"X", LogicalType::VARCHAR}});
+	        }) == "Invalid Input: Duplicate member name \"X\" in UNION(x INTEGER, X VARCHAR)");
+	REQUIRE(UnionError([&]() {
+		        LogicalType::UNION({{"", LogicalType::INTEGER}, {"", LogicalType::VARCHAR}});
+	        }) == "Invalid Input: Duplicate member name \"\" in UNION(\"\" INTEGER, \"\" VARCHAR)");
+	REQUIRE(UnionError([&]() { DBConfig::ParseLogicalType("UNION(a INTEGER, b VARCHAR, A FLOAT)"); }) ==
+	        "Invalid Input: Duplicate member name \"A\" in UNION(a INTEGER, b VARCHAR, A FLOAT)");
+
+	auto unnamed = Value::UNION({{"", LogicalType::INTEGER}, {"b", LogicalType::INTEGER}}, 0, Value::INTEGER(1));
+	REQUIRE(unnamed.ToString() == "1");
+	REQUIRE(UnionValue::GetTag(unnamed) == 0);
 }

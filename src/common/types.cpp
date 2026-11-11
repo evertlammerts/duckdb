@@ -1455,6 +1455,7 @@ void LogicalType::Serialize(Serializer &serializer) const {
 
 LogicalType LogicalType::Deserialize(Deserializer &deserializer) {
 	auto id = deserializer.ReadProperty<LogicalTypeId>(100, "id");
+	deserializer.CheckAllowed(id);
 	auto type_info = deserializer.ReadPropertyWithDefault<unique_ptr<LogicalTypeInfo>>(101, "type_info");
 	if (id == LogicalTypeId::LEGACY_AGGREGATE_STATE) {
 		// convert legacy aggregate state to blob on deserialize
@@ -1784,12 +1785,28 @@ const LogicalType &MapType::ValueType(const LogicalType &type) {
 // Union Type
 //===--------------------------------------------------------------------===//
 LogicalType LogicalType::UNION(child_list_t<LogicalType> members) {
+	return UNION(std::move(members), UnionMemberNames::CHECK_UNIQUE);
+}
+
+LogicalType LogicalType::UNION(child_list_t<LogicalType> members, UnionMemberNames names) {
 	D_ASSERT(!members.empty());
 	D_ASSERT(members.size() <= UnionType::MAX_UNION_MEMBERS);
 	// union types always have a hidden "tag" field in front
 	members.insert(members.begin(), {"", LogicalType::UTINYINT});
 	auto info = make_uniq<StructTypeInfo>(std::move(members));
-	return LogicalType(LogicalTypeId::UNION, std::move(info));
+	LogicalType result(LogicalTypeId::UNION, std::move(info));
+	if (names == UnionMemberNames::KEEP_EXISTING) {
+		return result;
+	}
+	identifier_set_t member_names;
+	for (idx_t member_idx = 0; member_idx < UnionType::GetMemberCount(result); member_idx++) {
+		auto &member_name = UnionType::GetMemberName(result, member_idx);
+		if (!member_names.insert(member_name).second) {
+			throw InvalidInputException("Duplicate member name \"%s\" in %s", member_name.GetIdentifierName(),
+			                            result.ToString());
+		}
+	}
+	return result;
 }
 
 const LogicalType &UnionType::GetMemberType(const LogicalType &type, idx_t index) {
@@ -1936,7 +1953,7 @@ LogicalType ArrayType::ConvertToList(const LogicalType &type) {
 		for (auto &child : children) {
 			child.second = ConvertToList(child.second);
 		}
-		return LogicalType::UNION(children);
+		return LogicalType::UNION(std::move(children), UnionMemberNames::KEEP_EXISTING);
 	}
 	default:
 		return type;

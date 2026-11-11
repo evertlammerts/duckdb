@@ -435,14 +435,22 @@ BoundCastInfo DefaultCasts::UnionCastSwitch(BindCastInput &input, const LogicalT
 	D_ASSERT(source.id() == LogicalTypeId::UNION);
 	switch (target.id()) {
 	case LogicalTypeId::VARCHAR: {
-		// bind a cast in which we convert all members to VARCHAR first
+		// Members map to the VARCHAR members by position, not by name, so a stored union whose members share a name
+		// renders each one.
 		child_list_t<LogicalType> varchar_members;
+		vector<union_tag_t> tag_map;
+		vector<BoundCastInfo> member_casts;
 		for (idx_t member_idx = 0; member_idx < UnionType::GetMemberCount(source); member_idx++) {
 			varchar_members.emplace_back(make_pair(UnionType::GetMemberName(source, member_idx), LogicalType::VARCHAR));
+			tag_map.push_back(static_cast<union_tag_t>(member_idx));
+			member_casts.push_back(
+			    input.GetCastFunction(UnionType::GetMemberType(source, member_idx), LogicalType::VARCHAR));
 		}
-		auto varchar_type = LogicalType::UNION(std::move(varchar_members));
-		return BoundCastInfo(UnionToVarcharCast, BindUnionToUnionCast(input, source, varchar_type),
-		                     InitToUnionLocalState);
+		auto varchar_type = LogicalType::UNION(std::move(varchar_members), UnionMemberNames::KEEP_EXISTING);
+		return BoundCastInfo(
+		    UnionToVarcharCast,
+		    make_uniq<UnionMemberBoundCastData>(std::move(tag_map), std::move(member_casts), varchar_type),
+		    InitToUnionLocalState);
 	}
 	case LogicalTypeId::UNION:
 		try {

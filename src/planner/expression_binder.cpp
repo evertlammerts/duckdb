@@ -252,7 +252,7 @@ LogicalType ExpressionBinder::ExchangeType(const LogicalType &type, LogicalTypeI
 		for (auto &member_type : member_types) {
 			member_type.second = ExchangeType(member_type.second, target, new_type);
 		}
-		return LogicalType::UNION(std::move(member_types));
+		return LogicalType::UNION(std::move(member_types), UnionMemberNames::KEEP_EXISTING);
 	}
 	case LogicalTypeId::LIST:
 		return LogicalType::LIST(ExchangeType(ListType::GetChildType(type), target, new_type));

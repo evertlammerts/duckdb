@@ -95,7 +95,7 @@ inline LogicalType TypeVisitor::RebuildType(const VisitorFrame &frame, vector<Lo
 		if (type.id() == LogicalTypeId::TUPLE) {
 			return LogicalType::TUPLE(std::move(children));
 		}
-		return LogicalType::UNION(std::move(children));
+		return LogicalType::UNION(std::move(children), UnionMemberNames::KEEP_EXISTING);
 	}
 	case LogicalTypeId::MAP: {
 		auto value_type = PopType(result_stack);

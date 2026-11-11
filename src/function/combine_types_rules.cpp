@@ -220,7 +220,7 @@ static bool CombineEqualUnion(LogicalTypeResolver &logical_type_resolver, const 
 			members.emplace_back(member_name, member_type);
 		}
 	}
-	result = LogicalType::UNION(std::move(members));
+	result = LogicalType::UNION(std::move(members), UnionMemberNames::KEEP_EXISTING);
 	return true;
 }
 

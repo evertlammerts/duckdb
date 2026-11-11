@@ -384,7 +384,7 @@ LogicalType ArrowType::GetDuckType(bool use_dictionary) const {
 			auto &child_name = UnionType::GetMemberName(type, i);
 			new_children.emplace_back(std::make_pair(child_name, child.GetDuckType(true)));
 		}
-		return LogicalType::UNION(std::move(new_children));
+		return LogicalType::UNION(std::move(new_children), UnionMemberNames::KEEP_EXISTING);
 	}
 	default: {
 		return type;

@@ -1333,7 +1333,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			}
 
 			const Value &value = children[tag].GetValue(row_idx);
-			vector.SetValue(row_idx, value.IsNull() ? Value() : Value::UNION(members, tag, value));
+			vector.SetValue(row_idx, value.IsNull() ? Value() : Value::UNION(vector.GetType(), tag, value));
 		}
 
 		break;

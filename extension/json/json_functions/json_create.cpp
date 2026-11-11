@@ -291,7 +291,7 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 			const_struct_names.Insert(member_name.GetIdentifierName());
 			member_types.emplace_back(member_name, GetJSONType(const_struct_names, member_type));
 		}
-		return LogicalType::UNION(member_types);
+		return LogicalType::UNION(std::move(member_types), UnionMemberNames::KEEP_EXISTING);
 	}
 	// All other types (e.g. date) are cast to VARCHAR
 	default:

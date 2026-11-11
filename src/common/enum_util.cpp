@@ -7392,6 +7392,24 @@ UnionInvalidReason EnumUtil::FromString<UnionInvalidReason>(const char *value) {
 	return static_cast<UnionInvalidReason>(StringUtil::StringToEnum(GetUnionInvalidReasonValues(), 6, "UnionInvalidReason", value));
 }
 
+const StringUtil::EnumStringLiteral *GetUnionMemberNamesValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(UnionMemberNames::CHECK_UNIQUE), "CHECK_UNIQUE" },
+		{ static_cast<uint32_t>(UnionMemberNames::KEEP_EXISTING), "KEEP_EXISTING" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<UnionMemberNames>(UnionMemberNames value) {
+	return StringUtil::EnumToString(GetUnionMemberNamesValues(), 2, "UnionMemberNames", static_cast<uint32_t>(value));
+}
+
+template<>
+UnionMemberNames EnumUtil::FromString<UnionMemberNames>(const char *value) {
+	return static_cast<UnionMemberNames>(StringUtil::StringToEnum(GetUnionMemberNamesValues(), 2, "UnionMemberNames", value));
+}
+
 const StringUtil::EnumStringLiteral *GetVacuumIndexStrategyValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(VacuumIndexStrategy::KEEP_ROW_IDS), "KEEP_ROW_IDS" },

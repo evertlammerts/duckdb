@@ -255,8 +255,8 @@ vector<TestType> TestAllTypesFun::GetTestTypes(const bool use_large_enum, const 
 	// union
 	child_list_t<LogicalType> members = {{"name", LogicalType::VARCHAR}, {"age", LogicalType::SMALLINT}};
 	auto union_type = LogicalType::UNION(members);
-	const Value &min = Value::UNION(members, 0, Value("Frank"));
-	const Value &max = Value::UNION(members, 1, Value::SMALLINT(5));
+	const Value &min = Value::UNION(union_type, 0, Value("Frank"));
+	const Value &max = Value::UNION(union_type, 1, Value::SMALLINT(5));
 	result.emplace_back(union_type, "union", min, max);
 
 	// fixed int array

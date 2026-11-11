@@ -984,8 +984,7 @@ static bool TransformObjectToMap(yyjson_val *objects[], yyjson_alc *alc, Vector 
 
 	// Transform keys
 	if (!JSONTransform::Transform(keys, alc, MapVector::GetKeys(result), list_size, options, nullptr)) {
-		throw ConversionException(
-		    StringUtil::Format("%s. Cannot default to NULL, because map keys cannot be NULL", options.error_message));
+		success = false;
 	}
 
 	// Transform values
@@ -1116,7 +1115,7 @@ static bool TransformValueIntoUnion(yyjson_val **vals, yyjson_alc *alc, Vector &
 			success = false;
 		}
 
-		result.SetValue(i, Value::UNION(fields, actual_tag, single.GetValue(0)));
+		result.SetValue(i, Value::UNION(type, NumericCast<uint8_t>(actual_tag), single.GetValue(0)));
 	}
 
 	return success;

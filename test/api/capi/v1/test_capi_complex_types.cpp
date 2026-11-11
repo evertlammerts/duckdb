@@ -282,6 +282,30 @@ TEST_CASE("Union type construction") {
 	duckdb_destroy_logical_type(&res);
 }
 
+TEST_CASE("Union type construction with duplicate member names", "[capi]") {
+	auto integer_type = duckdb_create_logical_type(DUCKDB_TYPE_INTEGER);
+	auto varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+	duckdb_logical_type member_types[] = {integer_type, varchar_type};
+
+	auto union_of = [&](const char *first, const char *second) {
+		const char *member_names[] = {first, second};
+		return duckdb_create_union_type(member_types, member_names, 2);
+	};
+	REQUIRE(union_of("a", "a") == nullptr);
+	REQUIRE(union_of("a", "A") == nullptr);
+	REQUIRE(union_of("", "") == nullptr);
+
+	auto res = union_of("", "b");
+	REQUIRE(res != nullptr);
+	auto name = duckdb_union_type_member_name(res, 0);
+	REQUIRE(string(name).empty());
+	duckdb_free(name);
+	duckdb_destroy_logical_type(&res);
+
+	duckdb_destroy_logical_type(&integer_type);
+	duckdb_destroy_logical_type(&varchar_type);
+}
+
 TEST_CASE("Logical types with aliases", "[capi]") {
 	CAPITester tester;
 
