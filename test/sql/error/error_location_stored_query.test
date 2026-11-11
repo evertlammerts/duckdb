@@ -173,6 +173,92 @@ SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
                                                              ^^^^^^^^^^
 
+# a default value of a macro parameter points at the call, an argument given for it keeps its place
+statement ok
+CREATE MACRO tm_limit(n := -1) AS TABLE SELECT 42 LIMIT n;
+
+statement ok
+CREATE MACRO sm_limit(n := -1) AS (SELECT 42 LIMIT n);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+                                                             ^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_limit(n := CAST(-1 AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_limit(n := CAST(-1 AS INTEGER))
+                                                       ^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_limit()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sm_limit()
+                                                      ^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, sm_limit(n := CAST(-1 AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, sm_limit(n := CAST(-1 AS INTEGER))
+                                                ^^^^^^^^^^^^^^^^^^^
+
+# a body parsed by query_table or query points at the call that parsed it
+statement ok
+CREATE TABLE query_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_query AS SELECT a FROM query_src;
+
+statement ok
+CREATE MACRO tm_query_table(t) AS TABLE SELECT * FROM query_table(t);
+
+statement ok
+CREATE MACRO tm_query_table_view() AS TABLE SELECT * FROM query_table('v_query');
+
+statement ok
+CREATE MACRO tm_query(q) AS TABLE FROM query(q);
+
+statement ok
+DROP TABLE query_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table_view()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table_view()
+                                                             ^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, no_such_column')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, no_such_column')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('missing_tbl')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('missing_tbl')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('v_query')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query_table('v_query')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, no_such_column')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, no_such_column')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 # a view bound for its columns alone has no reference to point at
 statement error
 SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
@@ -354,6 +440,16 @@ statement error
 SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
 ----
 <REGEX>:.*"location":"\[46,18\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_limit()
+----
+<REGEX>:.*"location":"\[53,10\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
+----
+<REGEX>:.*"location":"\[53,29\]".*
 
 statement error
 EXECUTE p

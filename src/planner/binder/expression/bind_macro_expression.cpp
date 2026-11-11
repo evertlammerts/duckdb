@@ -176,8 +176,9 @@ MacroFunction &ExpressionBinder::UnfoldMacroExpression(FunctionExpression &funct
 	vector<unique_ptr<ParsedExpression>> positional_arguments;
 	InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> named_arguments;
 	binder.lambda_bindings = lambda_bindings;
-	auto bind_result = MacroFunction::BindMacroFunction(binder, macro_func.macros, macro_func.name, function,
-	                                                    positional_arguments, named_arguments, depth);
+	auto bind_result =
+	    MacroFunction::BindMacroFunction(binder, macro_func.macros, macro_func.name, function, positional_arguments,
+	                                     named_arguments, depth, expr->GetQueryLocation());
 	if (!bind_result.error.empty()) {
 		throw BinderException(*expr, bind_result.error);
 	}

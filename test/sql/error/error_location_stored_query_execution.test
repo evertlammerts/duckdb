@@ -177,6 +177,59 @@ SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
 LINE 1: SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
                                                 ^^^^^^^^^^^^^^^^^^^^
 
+# a default value of a macro parameter points at the call, an argument given for it keeps its place
+statement ok
+CREATE TABLE default_src (a INTEGER);
+
+statement ok
+INSERT INTO default_src VALUES (1);
+
+statement ok
+CREATE MACRO sm_eq(x, lim := 'all') AS x = lim;
+
+statement ok
+CREATE MACRO tm_filter(lim := 'all') AS TABLE SELECT a FROM default_src WHERE a = lim;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+                                                      ^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, sm_eq(a, lim := CAST('all' AS VARCHAR)) FROM default_src
+----
+LINE 1: SELECT 1 AS first_column, sm_eq(a, lim := CAST('all' AS VARCHAR)) FROM default_src
+                                                  ^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_filter()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_filter()
+                                                             ^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_filter(lim := CAST('all' AS VARCHAR))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_filter(lim := CAST('all' AS VARCHAR))
+                                                          ^^^^^^^^^^^^^^^^^^^^^^
+
+# a body parsed by query points at the call that parsed it
+statement ok
+CREATE MACRO tm_query(q) AS TABLE FROM query(q);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT CAST(s AS INTEGER) AS i FROM cast_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 statement ok
 SET errors_as_json = true;
 
@@ -189,3 +242,8 @@ statement error
 SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
 ----
 <REGEX>:.*"location":"\[46,15\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sm_eq(a) FROM default_src
+----
+<REGEX>:.*"location":"\[46,8\]".*
