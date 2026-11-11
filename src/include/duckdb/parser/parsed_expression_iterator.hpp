@@ -35,8 +35,10 @@ public:
 	EnumerateQueryNodeModifiers(QueryNode &node,
 	                            const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback);
 
-	//! Replaces each valid location of an expression or table reference under the node; an invalid location clears them
+	//! Replaces each valid location of an expression or table reference under the node or expression with the given
+	//! location, which clears them when it is invalid
 	static void ReplaceQueryLocations(QueryNode &node, QueryLocation location);
+	static void ReplaceQueryLocations(ParsedExpression &expr, QueryLocation location);
 
 	static void VisitExpressionClass(const ParsedExpression &expr, ExpressionClass expr_class,
 	                                 const std::function<void(const ParsedExpression &child)> &callback);

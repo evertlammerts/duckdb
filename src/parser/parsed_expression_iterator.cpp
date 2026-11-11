@@ -358,7 +358,6 @@ public:
 		    [&](TableRef &ref) { ReplaceInTableRef(ref); });
 	}
 
-private:
 	void ReplaceInExpression(ParsedExpression &expr) {
 		if (expr.HasQueryLocation()) {
 			expr.SetQueryLocation(location);
@@ -376,6 +375,7 @@ private:
 		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { ReplaceInExpression(child); });
 	}
 
+private:
 	//! Visits the parts under the reference that the iterator does not enumerate
 	void ReplaceInTableRef(TableRef &ref) {
 		if (ref.query_location.IsValid()) {
@@ -481,6 +481,11 @@ private:
 void ParsedExpressionIterator::ReplaceQueryLocations(QueryNode &node, QueryLocation location) {
 	QueryLocationReplacer replacer(location);
 	replacer.ReplaceInNode(node);
+}
+
+void ParsedExpressionIterator::ReplaceQueryLocations(ParsedExpression &expr, QueryLocation location) {
+	QueryLocationReplacer replacer(location);
+	replacer.ReplaceInExpression(expr);
 }
 
 } // namespace duckdb

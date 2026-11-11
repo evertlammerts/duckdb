@@ -1,5 +1,5 @@
 # name: test/sql/error/error_location_stored_query.test
-# description: An error raised while a stored view or prepared body is bound points at the reference that pulled it in
+# description: An error raised while a stored view, macro or prepared body is bound points at the reference that pulled it in
 # group: [error]
 
 statement ok
@@ -77,7 +77,7 @@ SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_over_tm
                                                              ^^^^^^^^^
 
-# the body of a scalar macro that a view calls is expanded while the view is bound, after its copy was rewritten
+# a macro body points at its call, and a call inside a view body points at the view reference
 statement ok
 CREATE TABLE macro_src (a INTEGER);
 
@@ -95,6 +95,83 @@ SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
 ----
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, x FROM v_over_macro
                                                              ^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_src() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, scalar_over_src() AS x
+                                                      ^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE TABLE view_in_macro_src (a INTEGER);
+
+statement ok
+CREATE VIEW v_in_macro AS SELECT a FROM view_in_macro_src;
+
+statement ok
+CREATE MACRO scalar_over_view() AS (SELECT max(a) FROM v_in_macro);
+
+statement ok
+DROP TABLE view_in_macro_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+                                                      ^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO inner_add(x) AS x + 1;
+
+statement ok
+CREATE MACRO window_sum(x) AS sum(inner_add(x));
+
+statement ok
+DROP MACRO inner_add;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, window_sum(a) OVER () FROM range(1) t(a)
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, window_sum(a) OVER () FROM range(1) t(a)
+                                                      ^^^^^^^^^^^^^^^^^^^^^
+
+# the arguments of a macro come from the calling query and keep their locations in it
+statement ok
+CREATE MACRO add_one(x) AS x + 1;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, add_one(missing_column)
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, add_one(missing_column)
+                                                              ^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO tm_arg(x) AS TABLE SELECT x AS i FROM range(1);
+
+statement error
+SELECT 1 AS first_column, * FROM tm_arg(no_such_function(1))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_arg(no_such_function(1))
+                                                ^^^^^^^^^^^^^^^^
+
+# an error without a location from a table macro body gets the call's
+statement ok
+CREATE TABLE alias_src (a INTEGER, b INTEGER);
+
+statement ok
+CREATE MACRO tm_alias() AS TABLE SELECT * FROM alias_src AS x(a, b);
+
+statement ok
+DROP TABLE alias_src;
+
+statement ok
+CREATE TABLE alias_src (a INTEGER);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_alias()
+                                                             ^^^^^^^^^^
 
 # a view bound for its columns alone has no reference to point at
 statement error
@@ -219,7 +296,7 @@ PREPARE p AS SELECT 1 AS first_column, 2 AS second_column, a FROM prepared_src;
 statement ok
 DROP TABLE prepared_src;
 
-# the EXECUTE statement carries no location of its own, so an error from the prepared body has none
+# the EXECUTE statement carries no location of its own, so an error from binding the prepared body has none
 statement error
 EXECUTE p /* a comment that makes this statement longer than the prepared text */
 ----
@@ -272,6 +349,11 @@ statement error
 SELECT 1 AS first_column, 2 AS second_column, * FROM vv
 ----
 <REGEX>:.*"location":"\[53,2\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, scalar_over_view() AS x
+----
+<REGEX>:.*"location":"\[46,18\]".*
 
 statement error
 EXECUTE p

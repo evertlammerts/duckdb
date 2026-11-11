@@ -18,7 +18,7 @@
 namespace duckdb {
 
 unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry &macro_func,
-                                             idx_t depth) {
+                                             idx_t depth, QueryLocation call_location) {
 	// expanding nested macros can take a long time, allow the query to be interrupted
 	context.InterruptCheck();
 	// validate the arguments and separate positional and default arguments
@@ -42,7 +42,9 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 	eb.macro_binding = new_macro_binding.get();
 	vector<identifier_set_t> lambda_params;
 
+	// relocated before the parameters are replaced, so the arguments keep their locations in the calling query
 	auto node = macro_def.Cast<TableMacroFunction>().query_node->Copy();
+	ParsedExpressionIterator::ReplaceQueryLocations(*node, call_location);
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    *node, [&](unique_ptr<ParsedExpression> &child) { eb.ReplaceMacroParameters(child, lambda_params); });
 

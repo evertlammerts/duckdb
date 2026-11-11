@@ -1,6 +1,5 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
-#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -349,17 +348,7 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 
 		// bind the child subquery
 		view_binder->AddBoundView(view_catalog_entry);
-		BoundStatement bound_child;
-		try {
-			bound_child = view_binder->Bind(subquery);
-		} catch (std::exception &ex) {
-			// a scalar macro body expanded while the view is bound keeps the offsets of its CREATE MACRO text
-			ErrorData error(ex);
-			if (!error.ReplaceQueryLocation(ref.query_location)) {
-				throw;
-			}
-			error.Throw();
-		}
+		auto bound_child = view_binder->Bind(subquery);
 		if (!view_binder->correlated_columns.empty()) {
 			throw BinderException("Contents of view were altered - view bound correlated columns");
 		}

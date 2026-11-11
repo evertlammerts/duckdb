@@ -1169,7 +1169,7 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
 }
 
-TEST_CASE("An error inside a view body bound through a relation reports no location", "[relation_api]") {
+TEST_CASE("An error inside a view or table macro body bound through a relation reports no location", "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -1202,6 +1202,23 @@ TEST_CASE("An error inside a view body bound through a relation reports no locat
 	result = over_macro->Execute();
 	REQUIRE(result->HasError());
 	REQUIRE(StringUtil::Contains(result->GetError(), "macro_src does not exist"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE table_macro_src(a INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO tm_src() AS TABLE SELECT a FROM table_macro_src"));
+	auto table_macro = con.TableFunction("tm_src");
+	REQUIRE_NO_FAIL(con.Query("DROP TABLE table_macro_src"));
+	result = table_macro->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "table_macro_src does not exist"));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
+	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO tm_cast() AS TABLE SELECT s::INTEGER AS i FROM cast_src"));
+	result = con.TableFunction("tm_cast")->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "Could not convert string"));
 	REQUIRE(!StringUtil::Contains(result->GetError(), "\"position\""));
 	REQUIRE(!StringUtil::Contains(result->GetError(), "\"location\""));
 }

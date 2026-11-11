@@ -1,5 +1,5 @@
 # name: test/sql/error/error_location_stored_query_execution.test
-# description: An error raised at execution from a part of a stored view body points at the view reference
+# description: An error raised at execution from a part of a stored view or macro body points at the reference that pulled it in
 # group: [error]
 
 statement ok
@@ -103,6 +103,80 @@ SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM v_match
                                                              ^^^^^^^
 
+# a macro body points at its call, and a call inside a view body points at the view reference
+statement ok
+CREATE MACRO plus_int(x) AS 1 + ('0' || x)::INTEGER;
+
+statement ok
+CREATE VIEW v_over_scalar_macro AS SELECT plus_int(s) AS i FROM cast_src;
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, plus_int(s) FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, plus_int(s) FROM cast_src
+                                                      ^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_scalar_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_scalar_macro
+                                                             ^^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO tm_cast() AS TABLE SELECT s::INTEGER AS i FROM cast_src;
+
+statement ok
+CREATE VIEW v_over_table_macro AS SELECT * FROM tm_cast();
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM tm_cast()
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM tm_cast()
+                                                             ^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_table_macro
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, i FROM v_over_table_macro
+                                                             ^^^^^^^^^^^^^^^^^^
+
+statement ok
+CREATE MACRO sum_int(x) AS sum(x::INTEGER);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, sum_int(s) OVER () FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, sum_int(s) OVER () FROM cast_src
+                                                      ^
+
+statement ok
+CREATE MACRO max_over_view() AS (SELECT max(i) FROM v_cast);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+                                                      ^^^^^^^^^^^^^^^
+
+# the arguments of a macro come from the calling query and keep their locations in it
+statement ok
+CREATE MACRO add_one(x) AS x + 1;
+
+statement ok
+CREATE MACRO tm_arg(x) AS TABLE SELECT x AS i FROM range(1);
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, add_one(CAST(s AS INTEGER)) FROM cast_src
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, add_one(CAST(s AS INTEGER)) FROM cast_src
+                                                              ^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
+----
+LINE 1: SELECT 1 AS first_column, * FROM tm_arg(CAST('x' AS INTEGER))
+                                                ^^^^^^^^^^^^^^^^^^^^
+
 statement ok
 SET errors_as_json = true;
 
@@ -110,3 +184,8 @@ statement error
 SELECT 1 AS first_column, 2 AS second_column, i FROM v_cast
 ----
 <REGEX>:.*"location":"\[53,6\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, max_over_view() AS x
+----
+<REGEX>:.*"location":"\[46,15\]".*

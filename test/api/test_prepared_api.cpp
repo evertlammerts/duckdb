@@ -629,7 +629,7 @@ TEST_CASE("Test prepared statements with extension that can request a rebind", "
 	REQUIRE_NO_FAIL(con.Prepare("SET VARIABLE test_var = ?")->Execute(42));
 }
 
-TEST_CASE("A rebind error of a directly executed prepared statement keeps its place in the prepared text", "[api]") {
+TEST_CASE("An error of a directly executed prepared statement keeps its place in the prepared text", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -653,4 +653,13 @@ TEST_CASE("A rebind error of a directly executed prepared statement keeps its pl
 	REQUIRE(result->HasError());
 	REQUIRE(StringUtil::Contains(result->GetError(), "LINE 1: SELECT 1 AS first_column, a FROM v\n"
 	                                                 "                                         ^"));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_src(s VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_src VALUES ('x')"));
+	auto failing_cast = con.Prepare("SELECT 1 AS first_column, s::INTEGER FROM cast_src");
+	REQUIRE(!failing_cast->HasError());
+	result = failing_cast->Execute();
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "LINE 1: SELECT 1 AS first_column, s::INTEGER FROM cast_src\n"
+	                                                 "                                   ^^^^^^^^^"));
 }

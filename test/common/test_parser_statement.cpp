@@ -1,14 +1,17 @@
 #include "catch.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 
 using namespace duckdb;
 
@@ -149,4 +152,18 @@ TEST_CASE("Parser tokenizes errors for shell highlighting", "[parser]") {
 
 	auto multiline_quote = Parser::TokenizeError("Error: bad 'quote\nstill bad");
 	REQUIRE(multiline_quote.size() == 2);
+}
+
+TEST_CASE("Replacing the query locations of a query node reaches the AT clause of a table reference", "[parser]") {
+	auto statement = ParseSingleStatement("SELECT * FROM tbl AT (VERSION => 42)");
+	auto &node = GetQueryNode(*statement);
+	auto &at_expression = *node.Cast<SelectNode>().from_table->Cast<BaseTableRef>().at_clause->ExpressionMutable();
+	REQUIRE(at_expression.HasQueryLocation());
+
+	ParsedExpressionIterator::ReplaceQueryLocations(node, QueryLocation(7, 1));
+	REQUIRE(at_expression.GetQueryLocation().offset == 7);
+	REQUIRE(at_expression.GetQueryLocation().length == 1);
+
+	ParsedExpressionIterator::ReplaceQueryLocations(node, QueryLocation());
+	REQUIRE(!at_expression.HasQueryLocation());
 }
