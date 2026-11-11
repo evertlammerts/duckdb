@@ -219,8 +219,7 @@ bool ExtensionHelper::TryAutoLoadExtension(ClientContext &context, const string 
 }
 
 void ExtensionHelper::AutoInstallExtension(ClientContext &context, const string &extension_name) {
-	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(context) ||
-	    FindLinkedExtensionToLoad(*context.db, AutoLoadOptions(extension_name))) {
+	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(context) || IsLinkedExtension(*context.db, extension_name)) {
 		return;
 	}
 	auto autoinstall_repo = GetAutoinstallRepository(*context.db);
@@ -230,8 +229,7 @@ void ExtensionHelper::AutoInstallExtension(ClientContext &context, const string 
 }
 
 void ExtensionHelper::AutoInstallExtension(DatabaseInstance &db, FileSystem &fs, const string &extension_name) {
-	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(db) ||
-	    FindLinkedExtensionToLoad(db, AutoLoadOptions(extension_name))) {
+	if (!Settings::Get<AutoinstallKnownExtensionsSetting>(db) || IsLinkedExtension(db, extension_name)) {
 		return;
 	}
 	auto autoinstall_repo = GetAutoinstallRepository(db);

@@ -260,8 +260,7 @@ static void ThrowExtensionSetUnrecognizedOptions(const identifier_map_t<Value> &
 	throw InvalidInputException("The following options were not recognized: " + concatenated);
 }
 
-identifier_map_t<Value> DatabaseInstance::LoadExtensionSettings(const identifier_map_t<Value> &startup_options,
-                                                                bool linked_extensions_load_later) {
+identifier_map_t<Value> DatabaseInstance::LoadExtensionSettings(const identifier_map_t<Value> &startup_options) {
 	identifier_map_t<Value> waiting;
 	if (!startup_options.empty()) {
 		const bool autoload = Settings::Get<AutoloadKnownExtensionsSetting>(*this);
@@ -279,9 +278,7 @@ identifier_map_t<Value> DatabaseInstance::LoadExtensionSettings(const identifier
 					continue;
 				}
 				if (config.options.load_extensions && ExtensionHelper::IsLinkedExtension(*this, extension_name)) {
-					if (linked_extensions_load_later) {
-						waiting.insert(option);
-					}
+					waiting.insert(option);
 					continue;
 				}
 				if (!autoload) {
@@ -356,11 +353,13 @@ void DatabaseInstance::LoadLinkedExtensions(identifier_map_t<Value> waiting_opti
 		// applied as soon as the owner has loaded, so the extensions that load after it see the validated value
 		ExtensionHelper::LoadAllExtensions(db_wrapper, [&]() {
 			if (!waiting_options.empty()) {
-				waiting_options = LoadExtensionSettings(waiting_options, true);
+				waiting_options = LoadExtensionSettings(waiting_options);
 			}
 		});
 	}
-	LoadExtensionSettings(waiting_options, false);
+	if (!waiting_options.empty()) {
+		ThrowExtensionSetUnrecognizedOptions(waiting_options);
+	}
 }
 
 void DatabaseInstance::StartScheduler() {
@@ -436,7 +435,7 @@ identifier_map_t<Value> DatabaseInstance::InitializeInstance(const char *databas
 		}
 	}
 
-	return LoadExtensionSettings(startup_options, config.options.load_extensions);
+	return LoadExtensionSettings(startup_options);
 }
 
 DuckDB::DuckDB(const char *path, DBConfig *new_config) : instance(make_shared_ptr<DatabaseInstance>()) {

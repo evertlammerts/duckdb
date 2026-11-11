@@ -397,6 +397,26 @@ TEST_CASE("Startup settings that no linked extension provides fail the open as b
 	REQUIRE(OpenError(nullptr, config) == "The following options were not recognized: s3_region");
 }
 
+TEST_CASE("A startup value of a linked extension setting that fails its SET leaves the new database file", "[api]") {
+	if (!IsLinked("icu")) {
+		return;
+	}
+	auto path = TestCreatePath("startup_setting_failed_set.db");
+	for (auto autoload : {false, true}) {
+		CAPTURE(autoload);
+		TestDeleteFile(path);
+		DBConfig config;
+		IsolateWithoutAutoload(config);
+		config.SetOptionByName("autoload_known_extensions", autoload);
+		config.SetOptionByName("TimeZone", "Not/AZone");
+		auto error = OpenError(path.c_str(), config);
+		REQUIRE(
+		    StringUtil::Contains(error, "Could not set option \"TimeZone\" at startup: Unknown TimeZone 'Not/AZone'"));
+		// the main database is attached before a linked extension's startup SET runs, so the new file stays
+		REQUIRE(FileSystem::CreateLocal()->FileExists(path));
+	}
+}
+
 TEST_CASE("A startup setting of a linked extension with load_extensions off", "[api]") {
 	if (!IsLinked("icu")) {
 		return;
@@ -416,7 +436,7 @@ TEST_CASE("A startup setting of a linked extension with load_extensions off", "[
 	config.SetOptionByName("TimeZone", "america/los_angeles");
 	DuckDB db(nullptr, &config);
 	Connection con(db);
-	auto res = con.Query("SELECT current_setting('TimeZone')");
+	auto res = con.Query("SELECT value FROM duckdb_settings() WHERE name = 'TimeZone'");
 	REQUIRE(CHECK_COLUMN(res, 0, {"America/Los_Angeles"}));
 	RequireLoaded(con, "icu");
 	RequireNothingInstalled(extension_directory);

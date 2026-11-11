@@ -114,9 +114,8 @@ private:
 	void StartScheduler();
 	//! Applies startup settings through the SET path, autoloading their owner where allowed, and throws for the ones
 	//! nothing provides. A setting owned by a linked extension that is not loaded yet is never autoloaded while
-	//! load_extensions is on; when linked_extensions_load_later it is returned, to be applied once its owner loads.
-	identifier_map_t<Value> LoadExtensionSettings(const identifier_map_t<Value> &startup_options,
-	                                              bool linked_extensions_load_later);
+	//! load_extensions is on; it is returned, to be applied once its owner loads.
+	identifier_map_t<Value> LoadExtensionSettings(const identifier_map_t<Value> &startup_options);
 	//! Loads the linked extensions after the main database, if any, is attached, so their load can run SQL against it,
 	//! and applies each startup setting they own once its owner has loaded.
 	void LoadLinkedExtensions(identifier_map_t<Value> waiting_options);
