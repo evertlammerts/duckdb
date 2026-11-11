@@ -156,3 +156,29 @@ query I
 SELECT column_name FROM (DESCRIBE SELECT * FROM arrow_table_macro(list_sum(list_transform([1], x -> x))));
 ----
 list_transform(list_value(1), (lambda x: (x + list_sum(list_transform(list_value(1), (x -> x))))))
+
+query III
+SELECT * FROM docs AS b, outer_table(b.p);
+----
+{"k":5}	$.k	5
+
+# an arrow passed to a macro that places it at a lambda position declares its own parameter
+
+statement ok
+CREATE MACRO apply_arrow(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO forwarded_arrow(a) AS TABLE SELECT list_transform([1], lambda x: list_concat(apply_arrow([2], x -> x), [a])) AS r FROM (VALUES (100)) AS x(z);
+
+query I
+SELECT r FROM (VALUES (100)) AS x(z), forwarded_arrow(x.z);
+----
+[[2, 100]]
+
+statement ok
+CREATE MACRO forwarded_arrow_scalar(a) AS list_transform([1], lambda x: list_concat(apply_arrow([2], x -> x), [a]));
+
+query II
+SELECT 100 AS x, forwarded_arrow_scalar(x);
+----
+100	[[2, 100]]

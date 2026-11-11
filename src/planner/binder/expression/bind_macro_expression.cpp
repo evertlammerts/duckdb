@@ -17,11 +17,8 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/joinref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/planner/column_qualifier.hpp"
@@ -160,16 +157,28 @@ static void CollectWrittenNames(ParsedExpression &expr, identifier_set_t &names)
 	                                            [&](ParsedExpression &child) { CollectWrittenNames(child, names); });
 }
 
-static void CollectTableNames(TableRef &ref, identifier_set_t &names) {
-	if (ref.type == TableReferenceType::JOIN) {
-		auto &join = ref.Cast<JoinRef>();
-		CollectTableNames(*join.left, names);
-		CollectTableNames(*join.right, names);
-	} else if (!ref.alias.empty()) {
+static void CollectTableName(TableRef &ref, identifier_set_t &names) {
+	if (!ref.alias.empty()) {
 		names.insert(ref.alias);
 	} else if (ref.type == TableReferenceType::BASE_TABLE) {
 		names.insert(ref.Cast<BaseTableRef>().Table());
+	} else if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+		auto &function = *ref.Cast<TableFunctionRef>().function;
+		if (function.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			names.insert(function.Cast<FunctionExpression>().FunctionName());
+		}
 	}
+}
+
+static void CollectTableNames(ParsedExpression &expr, identifier_set_t &names) {
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    *expr.Cast<SubqueryExpression>().Subquery()->node,
+		    [&](unique_ptr<ParsedExpression> &child) { CollectTableNames(*child, names); },
+		    [&](TableRef &ref) { CollectTableName(ref, names); });
+	}
+	ParsedExpressionIterator::EnumerateChildren(expr,
+	                                            [&](ParsedExpression &child) { CollectTableNames(child, names); });
 }
 
 namespace {
@@ -188,13 +197,11 @@ class MacroLambdaRenamer {
 public:
 	MacroLambdaRenamer(const vector<reference<unique_ptr<ParsedExpression>>> &body, Binder &binder,
 	                   DummyBinding &macro_binding, optional_ptr<Binder> dummy_binder,
-	                   optional_ptr<ParsedExpression> window_aggregate, optional_ptr<ParsedExpression> caller_window)
+	                   optional_ptr<ParsedExpression> window_aggregate, optional_ptr<ParsedExpression> caller_window,
+	                   optional_ptr<QueryNode> body_node)
 	    : body(body), binder(binder), macro_binding(macro_binding), dummy_binder(dummy_binder),
-	      body_is_qualified(dummy_binder), window_aggregate(window_aggregate), caller_window(caller_window) {
-	}
-
-	void RenameNode(QueryNode &node) {
-		EnumerateNodeExpressions(node, [&](unique_ptr<ParsedExpression> &child) { Rename(child); });
+	      body_is_qualified(dummy_binder), window_aggregate(window_aggregate), caller_window(caller_window),
+	      body_node(body_node) {
 	}
 
 	void Rename(unique_ptr<ParsedExpression> &expr) {
@@ -232,7 +239,8 @@ public:
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
-			RenameNode(*sq->node);
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { Rename(child); });
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}
@@ -243,72 +251,21 @@ public:
 	}
 
 private:
-	// The tables of each FROM clause are in scope for the expressions of its query node and of the nodes below it.
-	void EnumerateNodeExpressions(QueryNode &node,
-	                              const std::function<void(unique_ptr<ParsedExpression> &)> &callback) {
-		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
-			for (auto &child : node.Cast<SetOperationNode>().children) {
-				EnumerateNodeExpressions(*child, callback);
-			}
-		} else if (node.type == QueryNodeType::SELECT_NODE) {
-			auto &select = node.Cast<SelectNode>();
-			body_tables.emplace_back();
-			if (select.from_table) {
-				CollectTableNames(*select.from_table, body_tables.back());
-			}
-			for (auto &expr : select.select_list) {
-				callback(expr);
-			}
-			for (auto &expr : select.groups.group_expressions) {
-				callback(expr);
-			}
-			for (auto clause : {&select.where_clause, &select.having, &select.qualify}) {
-				if (*clause) {
-					callback(*clause);
+	const identifier_set_t &BodyTableNames() {
+		if (!body_table_names) {
+			body_table_names = make_uniq<identifier_set_t>();
+			if (body_node) {
+				ParsedExpressionIterator::EnumerateQueryNodeChildren(
+				    *body_node,
+				    [&](unique_ptr<ParsedExpression> &child) { CollectTableNames(*child, *body_table_names); },
+				    [&](TableRef &ref) { CollectTableName(ref, *body_table_names); });
+			} else {
+				for (auto &expr : body) {
+					CollectTableNames(*expr.get(), *body_table_names);
 				}
 			}
-			if (select.from_table) {
-				EnumerateTableRefExpressions(*select.from_table, callback);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, callback);
-			body_tables.pop_back();
-		} else {
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(node, callback);
-			return;
 		}
-		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, callback);
-		}
-		for (auto &entry : node.cte_map.map) {
-			if (entry.second->query_node) {
-				EnumerateNodeExpressions(*entry.second->query_node, callback);
-			}
-		}
-	}
-
-	void EnumerateTableRefExpressions(TableRef &ref,
-	                                  const std::function<void(unique_ptr<ParsedExpression> &)> &callback) {
-		if (ref.type == TableReferenceType::JOIN) {
-			auto &join = ref.Cast<JoinRef>();
-			EnumerateTableRefExpressions(*join.left, callback);
-			EnumerateTableRefExpressions(*join.right, callback);
-			if (join.condition) {
-				callback(join.condition);
-			}
-		} else if (ref.type == TableReferenceType::SUBQUERY) {
-			EnumerateNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, callback);
-		} else {
-			ParsedExpressionIterator::EnumerateTableRefChildren(ref, callback);
-		}
-	}
-
-	bool IsBodyTable(const Identifier &name) const {
-		for (auto &tables : body_tables) {
-			if (tables.find(name) != tables.end()) {
-				return true;
-			}
-		}
-		return false;
+		return *body_table_names;
 	}
 
 	bool IsLambdaParameter(const Identifier &name) const {
@@ -495,9 +452,6 @@ private:
 		    Settings::Get<LambdaSyntaxSetting>(binder.context) != LambdaSyntax::ENABLE_SINGLE_ARROW) {
 			return false;
 		}
-		if (ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
-			return false;
-		}
 		bool dot_call;
 		auto entry = FindFunction(function, qualifying_binder, dot_call);
 		if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
@@ -568,8 +522,7 @@ private:
 			auto &column_ref = expr->Cast<ColumnRefExpression>();
 			auto &leading_name = column_ref.ColumnNamesMutable()[0];
 			auto entry = renames.find(leading_name);
-			// the binder reads x.v as the column v of a table x in scope before the field v of a parameter x
-			if (entry == renames.end() || (column_ref.IsQualified() && IsBodyTable(leading_name))) {
+			if (entry == renames.end()) {
 				return;
 			}
 			// struct_pack(x) names its field after the reference
@@ -580,10 +533,10 @@ private:
 			return;
 		}
 		case ExpressionClass::LAMBDA: {
+			// without an alias the left side names the new name whether the binder reads a column or a declaration
 			auto &lambda_expr = expr->Cast<LambdaExpression>();
 			vector<reference<ColumnRefExpression>> parameters;
-			if (lambda_expr.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD ||
-			    !GetLambdaParameters(lambda_expr, parameters)) {
+			if (!GetLambdaParameters(lambda_expr, parameters)) {
 				break;
 			}
 			RenameDeclaration(lambda_expr, parameters, renames);
@@ -617,8 +570,8 @@ private:
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
-			EnumerateNodeExpressions(*sq->node,
-			                         [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}
@@ -636,7 +589,8 @@ private:
 		identifier_map_t<Identifier> renames;
 		for (auto &parameter : scope.parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
-			if (scope.captured.find(name) == scope.captured.end()) {
+			// x.v binds by scopes and columns unseen here, so a parameter named like a body table keeps main's reading
+			if (scope.captured.find(name) == scope.captured.end() || BodyTableNames().count(name)) {
 				continue;
 			}
 			// a repeated parameter keeps one name, so the binder still rejects it as a duplicate
@@ -656,11 +610,12 @@ private:
 	bool body_is_qualified;
 	optional_ptr<ParsedExpression> window_aggregate;
 	optional_ptr<ParsedExpression> caller_window;
+	optional_ptr<QueryNode> body_node;
 	vector<LambdaScope> scopes;
-	vector<identifier_set_t> body_tables;
 	unordered_map<column_t, identifier_set_t> argument_names;
 	unique_ptr<identifier_set_t> caller_window_names;
 	unique_ptr<identifier_set_t> used_names;
+	unique_ptr<identifier_set_t> body_table_names;
 	identifier_map_t<Identifier> new_names;
 	shared_ptr<Binder> probe_binder;
 };
@@ -671,11 +626,7 @@ void ExpressionBinder::RenameLambdaParametersCapturingArguments(
     const vector<reference<unique_ptr<ParsedExpression>>> &body, Binder &binder, DummyBinding &macro_binding,
     optional_ptr<Binder> dummy_binder, optional_ptr<ParsedExpression> window_aggregate,
     optional_ptr<ParsedExpression> caller_window, optional_ptr<QueryNode> body_node) {
-	MacroLambdaRenamer renamer(body, binder, macro_binding, dummy_binder, window_aggregate, caller_window);
-	if (body_node) {
-		renamer.RenameNode(*body_node);
-		return;
-	}
+	MacroLambdaRenamer renamer(body, binder, macro_binding, dummy_binder, window_aggregate, caller_window, body_node);
 	for (auto &expr : body) {
 		renamer.Rename(expr.get());
 	}

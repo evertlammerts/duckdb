@@ -622,23 +622,33 @@ SELECT column_name FROM (DESCRIBE SELECT * FROM (SELECT 5 AS x) t9, qualified_in
 ----
 list_transform(list_value(1), (lambda x: (x + t2.s)))
 
-# a dotted reference that a table of the body provides is that table's column, not a field of the renamed parameter
+# a dotted reference that a table of the body provides is that table's column
 
 statement ok
 CREATE MACRO body_table_lambda(a) AS TABLE SELECT list_transform([1], lambda x: x.v + a) AS r FROM (VALUES (50, 7)) AS x(v, z);
 
 query I
-SELECT r FROM (VALUES (7)) AS x(z), body_table_lambda(x.z);
+SELECT r FROM (VALUES (3)) AS y(z), body_table_lambda(y.z);
 ----
-[57]
+[53]
 
 statement ok
 CREATE MACRO body_subquery_lambda(a) AS (SELECT list_transform([1], lambda x: x.v + a) FROM (VALUES (50, 7)) AS x(v, z));
 
 query I
-SELECT body_subquery_lambda(x.z) FROM (VALUES (7)) AS x(z);
+SELECT body_subquery_lambda(y.z) FROM (VALUES (3)) AS y(z);
 ----
-[57]
+[53]
+
+# a captured parameter named like a table of the body keeps its name, so the expansion reads as on main
+
+statement ok
+CREATE MACRO body_table_column(a) AS TABLE SELECT list_transform([{'v': 1, 'z': 9}], lambda x: x.v + a) FROM (VALUES (50, 9)) AS x(v, q);
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM (VALUES (3)) AS x(z), body_table_column(x.z)) WHERE column_name LIKE 'list%';
+----
+list_transform(list_value(struct_pack(v := 1, z := 9)), (lambda x: (x.v + x.z)))
 
 # the window form, whose OVER clause the caller writes
 
@@ -702,6 +712,28 @@ CREATE MACRO arrow_macro(a) AS list_transform([1], x -> a);
 
 query II
 SELECT s AS x, arrow_macro(x) FROM t;
+----
+99	[99]
+
+# an arrow read back from a file written before 2.0 is a lambda under the default setting too
+
+statement ok
+ATTACH '{TEST_DIR}/stored_arrow.db' AS stored_arrow (STORAGE_VERSION 'v1.4.0');
+
+statement ok
+CREATE MACRO stored_arrow.arrow_stored(a) AS list_transform([1], x -> a);
+
+statement ok
+DETACH stored_arrow;
+
+statement ok
+RESET lambda_syntax;
+
+statement ok
+ATTACH '{TEST_DIR}/stored_arrow.db' AS stored_arrow;
+
+query II
+SELECT s AS x, stored_arrow.arrow_stored(x) FROM t;
 ----
 99	[99]
 
