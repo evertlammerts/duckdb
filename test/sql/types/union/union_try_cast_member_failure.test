@@ -114,7 +114,7 @@ SELECT try_cast(x AS UNION(s VARCHAR, a DECIMAL(3,1))) r, union_tag(r) FROM (VAL
 NULL	NULL
 1.5	a
 
-# a NULL source row keeps the selected tag with a NULL member, unlike a row that fails
+# a NULL source row gives a valid union with the selected tag and a NULL member
 query IIII
 SELECT x, r IS NULL, union_tag(r), union_extract(r, 'a')
 FROM (SELECT x, try_cast(x AS UNION(a DECIMAL(3,1), b VARCHAR)) r
@@ -196,6 +196,15 @@ FROM (SELECT try_cast(x AS UNION(x UNION(a DECIMAL(3,1), b VARCHAR), y DATE)) r
 ----
 NULL	NULL	true
 1.5	x	false
+
+# a STRUCT member whose field fails stays valid, so the row keeps its tag; no other row here may make the tag vector flat
+query III
+SELECT r IS NULL, union_tag(r), (union_extract(r, 's')).f
+FROM (SELECT try_cast({'f': x} AS UNION(s STRUCT(f DECIMAL(3,1)), b DATE)) r
+      FROM (VALUES (1000::DECIMAL(9,1)), (2.5::DECIMAL(9,1))) v(x))
+----
+false	s	NULL
+false	s	2.5
 
 # a stored result keeps the NULL rows
 statement ok
