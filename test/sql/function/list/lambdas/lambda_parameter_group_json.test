@@ -42,3 +42,49 @@ query I
 SELECT (SELECT sum(CAST(json_extract(k, '$.f') AS INTEGER)) FROM range(1)) FROM (VALUES ('{"f":99}'::JSON), ('{"f":1}'::JSON)) o(k);
 ----
 100
+
+# an arrow argument of a function that takes no lambda there is the JSON operator, so a parameter on its left keeps
+# the expression out of a group of the same text over an outer column
+
+query I
+SELECT (SELECT list_transform(['{"f":"a"}'::JSON], lambda k: concat(k -> 'f', '')) FROM range(1) GROUP BY concat(k -> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+['"a"']
+
+query I
+SELECT (SELECT list_transform(['{"f":"a"}'::JSON], lambda k: concat(k ->> 'f', '')) FROM range(1) GROUP BY concat(k ->> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+[a]
+
+query I
+SELECT (SELECT list_transform(['{"f":"a"}'::JSON], lambda k: lower(k -> 'f')) FROM range(1) GROUP BY lower(k -> 'f')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+['"a"']
+
+query I
+SELECT (SELECT list_transform(['{"f":"a"}'::JSON], lambda k: concat(k -> 'f', '')) FROM range(1) GROUP BY concat(k -> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k UNION ALL SELECT NULL::JSON) o;
+----
+['"a"']
+['"a"']
+
+query I
+SELECT (SELECT 1 FROM range(1) GROUP BY concat(k -> 'f', '') HAVING list_transform(['{"f":"a"}'::JSON], lambda k: concat(k -> 'f', '')) = ['"a"']) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+1
+
+query I
+SELECT (SELECT list_transform(['{"f":"a"}'::JSON], lambda k: list_transform([1], lambda x: concat(k -> 'f', ''))) FROM range(1) GROUP BY concat(k -> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+[['"a"']]
+
+statement error
+SELECT list_transform(['{"f":"a"}'::JSON], lambda k: grouping(lower(k -> 'f'))) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) t GROUP BY lower(k -> 'f');
+----
+must be a grouping column
+
+# the same arrow over the outer column outside the lambda's parameters is still the group
+
+query I
+SELECT (SELECT list_transform([1], lambda x: concat(k -> 'f', '')) FROM range(1) GROUP BY concat(k -> 'f', '')) FROM (SELECT '{"f":"bbbb"}'::JSON AS k) o;
+----
+['"bbbb"']
