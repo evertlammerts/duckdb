@@ -26,6 +26,12 @@ struct DateTimestampSniffing {
 	vector<StrpTimeFormat> format;
 };
 
+//! Every format template for one separator
+struct FormatTemplates {
+	string separator;
+	vector<StrpTimeFormat> formats;
+};
+
 struct QuoteEscapeCombination {
 	QuoteEscapeCombination(char quote, char escape) : quote(quote), escape(escape) {
 	}
@@ -168,12 +174,15 @@ private:
 	static void SetDateFormat(CSVStateMachine &candidate, const string &format_specifier,
 	                          const LogicalTypeId &sql_type);
 
-	//! Function that initialized the necessary variables used for date and timestamp detection
-	void InitializeDateAndTimeStampDetection(const string &separator, const LogicalType &sql_type);
+	//! Every format template of the type for the separator, in ascending order of preference
+	const vector<StrpTimeFormat> &GetFormatTemplates(const string &separator, const LogicalTypeId sql_type);
+	//! Whether a template for the value's own separator reads it
+	bool TemplateReadsValue(const string_t &value, const LogicalTypeId sql_type);
 	//! Sets user defined date and time formats (if any)
 	void SetUserDefinedDateTimeFormat(CSVStateMachine &candidate) const;
-	//! Detects the date or timestamp format from the value at row_idx and the column's earlier values
-	void DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
+	//! Detects the date or timestamp format from the value at row_idx and the column's earlier values, and returns
+	//! false when no reader of the type can read every sampled value of the column
+	bool DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
 	                                   const VectorIterator<string_t> &values, idx_t first_row, idx_t row_idx);
 	//! Sniffs the types from a data chunk
 	void SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machine,
@@ -192,6 +201,8 @@ private:
 	vector<HeaderValue> best_header_row;
 	//! Variable used for sniffing date and timestamp
 	map<LogicalTypeId, DateTimestampSniffing> format_candidates;
+	//! The templates of the separator last asked for, per type
+	map<LogicalTypeId, FormatTemplates> format_templates;
 
 	//! ------------------------------------------------------//
 	//! ------------------ Type Refinement ------------------ //

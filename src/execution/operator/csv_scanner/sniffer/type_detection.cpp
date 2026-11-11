@@ -318,12 +318,16 @@ bool CSVSniffer::CanYouCastIt(ClientContext &context, const string_t value, cons
 	}
 }
 
-void CSVSniffer::InitializeDateAndTimeStampDetection(const string &separator, const LogicalType &sql_type) {
-	auto &format_candidate = format_candidates[sql_type.id()];
-	format_candidate.initialized = true;
-	auto entry = format_template_candidates.find(sql_type.id());
+const vector<StrpTimeFormat> &CSVSniffer::GetFormatTemplates(const string &separator, const LogicalTypeId sql_type) {
+	auto &templates = format_templates[sql_type];
+	if (templates.separator == separator) {
+		return templates.formats;
+	}
+	templates.separator = separator;
+	templates.formats.clear();
+	auto entry = format_template_candidates.find(sql_type);
 	if (entry == format_template_candidates.end()) {
-		return;
+		return templates.formats;
 	}
 	for (const auto &t : entry->second) {
 		const auto format_string = GenerateDateFormat(separator, t);
@@ -331,9 +335,10 @@ void CSVSniffer::InitializeDateAndTimeStampDetection(const string &separator, co
 		if (format_string.find("%Y-%m-%d") == string::npos) {
 			StrpTimeFormat format;
 			StrTimeFormat::ParseFormatSpecifier(format_string, format);
-			format_candidate.format.push_back(std::move(format));
+			templates.formats.push_back(std::move(format));
 		}
 	}
+	return templates.formats;
 }
 
 static bool FormatReadsValue(const StrpTimeFormat &format, const string_t &value, const LogicalTypeId sql_type) {
@@ -355,30 +360,37 @@ static bool IsSpecialValue(const StrpTimeFormat &format, const string_t &value) 
 	return format.Parse(value, result, true) && result.is_special;
 }
 
-//! Returns whether the list changed
-static bool NarrowFormatCandidates(DateTimestampSniffing &format_candidate, const string_t &value,
-                                   const LogicalTypeId sql_type) {
+enum class FormatNarrowing : uint8_t { UNCHANGED, CHANGED, REJECTED };
+
+static FormatNarrowing NarrowFormatCandidates(DateTimestampSniffing &format_candidate, const string_t &value,
+                                              const LogicalTypeId sql_type) {
 	auto &formats = format_candidate.format;
 	if (formats.empty() || IsSpecialValue(formats.back(), value)) {
-		return false;
+		return FormatNarrowing::UNCHANGED;
 	}
 	const auto reads_value = [&](const StrpTimeFormat &format) {
 		return FormatReadsValue(format, value, sql_type);
 	};
 	if (std::none_of(formats.begin(), formats.end(), reads_value)) {
 		if (format_candidate.had_match) {
-			return false;
+			return FormatNarrowing::REJECTED;
 		}
 		// No candidate read the values of the column so far, so only the plain cast can read the column
 		formats.clear();
-		return true;
+		return FormatNarrowing::CHANGED;
 	}
 	format_candidate.had_match = true;
 	const auto old_size = formats.size();
 	formats.erase(std::remove_if(formats.begin(), formats.end(),
 	                             [&](const StrpTimeFormat &format) { return !reads_value(format); }),
 	              formats.end());
-	return formats.size() != old_size;
+	return formats.size() != old_size ? FormatNarrowing::CHANGED : FormatNarrowing::UNCHANGED;
+}
+
+static bool AnyFormatReadsValue(const vector<StrpTimeFormat> &formats, const string_t &value,
+                                const LogicalTypeId sql_type) {
+	return std::any_of(formats.begin(), formats.end(),
+	                   [&](const StrpTimeFormat &format) { return FormatReadsValue(format, value, sql_type); });
 }
 
 static bool NoFormatReadsValue(const vector<StrpTimeFormat> &formats, const string_t &value,
@@ -386,49 +398,85 @@ static bool NoFormatReadsValue(const vector<StrpTimeFormat> &formats, const stri
 	if (formats.empty() || IsSpecialValue(formats.back(), value)) {
 		return false;
 	}
-	return std::none_of(formats.begin(), formats.end(),
-	                    [&](const StrpTimeFormat &format) { return FormatReadsValue(format, value, sql_type); });
+	return !AnyFormatReadsValue(formats, value, sql_type);
 }
 
 bool ValidSeparator(const string &separator) {
 	// We use https://en.wikipedia.org/wiki/List_of_date_formats_by_country as reference
 	return separator == "-" || separator == "." || separator == "/" || separator == " ";
 }
-void CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
+
+static bool StartsLikeTemplateValue(string &separator, const string_t &value) {
+	return StartsWithNumericDate(separator, value) && ValidSeparator(separator);
+}
+
+bool CSVSniffer::TemplateReadsValue(const string_t &value, const LogicalTypeId sql_type) {
+	string separator;
+	if (!StartsLikeTemplateValue(separator, value)) {
+		return false;
+	}
+	return AnyFormatReadsValue(GetFormatTemplates(separator, sql_type), value, sql_type);
+}
+
+bool CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
                                                const VectorIterator<string_t> &values, idx_t first_row, idx_t row_idx) {
-	if (options.dialect_options.date_format.find(sql_type.id())->second.IsSetByUser()) {
-		return;
+	const auto type = sql_type.id();
+	if (options.dialect_options.date_format.find(type)->second.IsSetByUser()) {
+		return true;
 	}
 	const auto &value = values[row_idx].GetValue();
-	auto &format_candidate = format_candidates[sql_type.id()];
+	auto &format_candidate = format_candidates[type];
+	const bool plain_cast_before = format_candidate.initialized && format_candidate.format.empty();
+	string separator;
 	bool changed = false;
-	if (format_candidate.inherited && NoFormatReadsValue(format_candidate.format, value, sql_type.id())) {
+	if (format_candidate.inherited && NoFormatReadsValue(format_candidate.format, value, type) &&
+	    StartsLikeTemplateValue(separator, value)) {
 		// Columns that did not end as the type rank the formats for this column but cannot rule out its values
 		format_candidate = DateTimestampSniffing();
 		changed = true;
 	}
-	string separator;
-	// The templates take their separator from the first value that starts like a numeric date
-	if (!format_candidate.initialized && StartsWithNumericDate(separator, value) && ValidSeparator(separator)) {
-		InitializeDateAndTimeStampDetection(separator, sql_type);
+	if (!format_candidate.initialized && StartsLikeTemplateValue(separator, value)) {
+		format_candidate.initialized = true;
+		format_candidate.format = GetFormatTemplates(separator, type);
 		changed = true;
 		// The earlier values of the column were read without these templates, and a format must read them too
 		for (idx_t earlier_row = first_row; earlier_row < row_idx; earlier_row++) {
 			const auto earlier_value = values[earlier_row];
 			if (earlier_value.IsValid()) {
-				NarrowFormatCandidates(format_candidate, earlier_value.GetValue(), sql_type.id());
+				NarrowFormatCandidates(format_candidate, earlier_value.GetValue(), type);
 			}
 		}
 	}
-	changed = NarrowFormatCandidates(format_candidate, value, sql_type.id()) || changed;
-	if (!changed) {
-		return;
+	const auto narrowing = NarrowFormatCandidates(format_candidate, value, type);
+	changed = narrowing == FormatNarrowing::CHANGED || changed;
+	if (changed) {
+		if (format_candidate.format.empty()) {
+			SetDateFormat(candidate, "", type);
+		} else {
+			candidate.dialect_options.date_format[type].Set(format_candidate.format.back(), false);
+		}
 	}
-	if (format_candidate.format.empty()) {
-		SetDateFormat(candidate, "", sql_type.id());
-	} else {
-		candidate.dialect_options.date_format[sql_type.id()].Set(format_candidate.format.back(), false);
+	if (narrowing == FormatNarrowing::REJECTED) {
+		return false;
 	}
+	if (!format_candidate.initialized || !format_candidate.format.empty()) {
+		return true;
+	}
+	// The plain cast reads the column only if it reads every sampled value and no template reads any of them
+	if (!plain_cast_before) {
+		for (idx_t earlier_row = first_row; earlier_row < row_idx; earlier_row++) {
+			const auto earlier_value = values[earlier_row];
+			if (!earlier_value.IsValid()) {
+				continue;
+			}
+			if (TemplateReadsValue(earlier_value.GetValue(), type) ||
+			    !CanYouCastIt(buffer_manager->context, earlier_value.GetValue(), sql_type, candidate.dialect_options,
+			                  false, candidate.options.decimal_separator[0], candidate.options.thousands_separator)) {
+				return false;
+			}
+		}
+	}
+	return !TemplateReadsValue(value, type);
 }
 
 void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machine,
@@ -457,17 +505,24 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 			// try cast from string to sql_type
 			while (col_type_candidates.size() > 1) {
 				const auto &sql_type = col_type_candidates.back();
+				bool format_reads = true;
 				// If Value is not Null and the current investigated candidate is either a timestamp or a date
 				if (!is_null && ((col_type_candidates.back().id() == LogicalTypeId::TIMESTAMP && !has_type.timestamp) ||
 				                 (col_type_candidates.back().id() == LogicalTypeId::DATE && !has_type.date))) {
-					DetectDateAndTimeStampFormats(state_machine, sql_type, column_values, start_idx_detection, row_idx);
+					format_reads = DetectDateAndTimeStampFormats(state_machine, sql_type, column_values,
+					                                             start_idx_detection, row_idx);
+				} else if (!is_null && sql_type.id() == LogicalTypeId::TIMESTAMP_TZ &&
+				           !options.dialect_options.date_format.at(LogicalTypeId::TIMESTAMP).IsSetByUser()) {
+					// The plain cast reads a timestamp in a template layout with a year of one or two digits
+					format_reads = !TemplateReadsValue(column_values.GetValueUnsafe(row_idx), LogicalTypeId::TIMESTAMP);
 				}
 				// try cast from string to sql_type
 				if (sql_type == LogicalType::VARCHAR) {
 					// Nothing to convert it to
 					continue;
 				}
-				if (CanYouCastIt(buffer_manager->context, column_values.GetValueUnsafe(row_idx), sql_type,
+				if (format_reads &&
+				    CanYouCastIt(buffer_manager->context, column_values.GetValueUnsafe(row_idx), sql_type,
 				                 state_machine.dialect_options, is_null, state_machine.options.decimal_separator[0],
 				                 state_machine.options.thousands_separator)) {
 					break;

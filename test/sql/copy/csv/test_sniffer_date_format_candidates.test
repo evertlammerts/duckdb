@@ -193,6 +193,83 @@ SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_dash_ts.csv');
 VARCHAR	2024-02-13 10:00:00
 VARCHAR	13-02-2024 10:00:00
 
+# the plain cast does not read a value in a template layout that a template reads, which it would read with a year of
+# one or two digits, so the order of such a value and ISO 8601 text does not matter
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13'), ('01-02-24'), ('2024-02-14')) t(d)) TO '{TEST_DIR}/iso_then_template.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_template.csv');
+----
+VARCHAR	2024-02-13
+VARCHAR	01-02-24
+VARCHAR	2024-02-14
+
+statement ok
+COPY (SELECT * FROM (VALUES ('01-02-24'), ('2024-02-13')) t(d)) TO '{TEST_DIR}/template_then_iso.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/template_then_iso.csv');
+----
+VARCHAR	01-02-24
+VARCHAR	2024-02-13
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13'), ('24-01-02')) t(d)) TO '{TEST_DIR}/iso_then_year_first.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_year_first.csv');
+----
+VARCHAR	2024-02-13
+VARCHAR	24-01-02
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13'), ('01/02/24')) t(d)) TO '{TEST_DIR}/iso_then_short_slash.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_short_slash.csv');
+----
+VARCHAR	2024-02-13
+VARCHAR	01/02/24
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13'), ('2024/02/14')) t(d)) TO '{TEST_DIR}/iso_then_year_slash.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_year_slash.csv');
+----
+VARCHAR	2024-02-13
+VARCHAR	2024/02/14
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024/02/14'), ('2024-02-13')) t(d)) TO '{TEST_DIR}/year_slash_then_iso.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/year_slash_then_iso.csv');
+----
+VARCHAR	2024/02/14
+VARCHAR	2024-02-13
+
+statement ok
+COPY (SELECT CASE WHEN i = 999 THEN '01-02-24' ELSE '2024-02-13' END AS d FROM range(3000) t(i)) TO '{TEST_DIR}/iso_then_template_late.csv' (HEADER);
+
+query II
+SELECT typeof(d), count(d) FROM read_csv('{TEST_DIR}/iso_then_template_late.csv') GROUP BY ALL;
+----
+VARCHAR	3000
+
+# the time zone cast after the timestamp is dropped follows the same rule
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13 10:00:00'), ('01-02-24 10:00:00')) t(d)) TO '{TEST_DIR}/iso_then_template_ts.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_template_ts.csv');
+----
+VARCHAR	2024-02-13 10:00:00
+VARCHAR	01-02-24 10:00:00
+
 # a value the plain cast reads before any value looks like a date with separators counts too
 
 statement ok
@@ -405,6 +482,51 @@ SELECT b FROM read_csv('{TEST_DIR}/two_columns_ts.csv', types = {'b': 'TIMESTAMP
 ----
 2024-02-01 10:00:00
 2024-02-13 11:00:00
+
+# a later column that starts afresh and whose earlier values no fresh template reads goes to the plain cast only if the
+# plain cast reads those values too: b's '13/02/2024' was read by the inherited %d/%m/%Y
+
+statement ok
+COPY (SELECT * FROM (VALUES ('13/02/2024', '13/02/2024'), ('N/A', '2024-02-14')) t(a, b)) TO '{TEST_DIR}/two_columns_restart_iso.csv' (HEADER);
+
+query IIII
+SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/two_columns_restart_iso.csv');
+----
+VARCHAR	13/02/2024	VARCHAR	13/02/2024
+VARCHAR	N/A	VARCHAR	2024-02-14
+
+# only a value in a template layout starts a later column afresh; 'N/A' drops the type and b keeps the narrowing its
+# '01-13-24' made, which c and a declared type on b read with
+
+statement ok
+COPY (SELECT * FROM (VALUES ('01-02-24', '01-13-24', '01-02-24'), ('abc', 'N/A', '03-04-24')) t(a, b, c)) TO '{TEST_DIR}/three_columns_stray.csv' (HEADER);
+
+query IIIIII
+SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM read_csv('{TEST_DIR}/three_columns_stray.csv');
+----
+VARCHAR	01-02-24	VARCHAR	01-13-24	DATE	2024-01-02
+VARCHAR	abc	VARCHAR	N/A	DATE	2024-03-04
+
+query I
+SELECT b FROM read_csv('{TEST_DIR}/three_columns_stray.csv', types = {'b': 'DATE'}, ignore_errors = true);
+----
+2024-01-13
+
+# two columns with stray values in conflicting layouts: b starts afresh at '13-01-24' and keeps its own narrowing, so a
+# declared type reads b and not a; one format per file cannot read both
+
+statement ok
+COPY (SELECT * FROM (VALUES ('01-13-24', '13-01-24'), ('N/A', 'N/A')) t(a, b)) TO '{TEST_DIR}/two_stray_columns.csv' (HEADER);
+
+query I
+SELECT b FROM read_csv('{TEST_DIR}/two_stray_columns.csv', types = {'b': 'DATE'}, ignore_errors = true);
+----
+2013-01-24
+
+query I
+SELECT count(a) FROM read_csv('{TEST_DIR}/two_stray_columns.csv', types = {'a': 'DATE'}, ignore_errors = true);
+----
+0
 
 # the file has one date format, chosen by the first date column; a later column the chosen format does not read is
 # VARCHAR
