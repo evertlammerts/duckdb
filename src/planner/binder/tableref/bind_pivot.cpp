@@ -64,13 +64,17 @@ static void ConstructPivots(PivotRef &ref, vector<PivotValueElement> &pivot_valu
 	}
 }
 
+static bool IsMacroParameter(const ColumnRefExpression &colref, optional_ptr<DummyBinding> macro_binding) {
+	return colref.IsQualified() && colref.ColumnNames()[0].StartsWith(DummyBinding::DUMMY_NAME) && macro_binding &&
+	       macro_binding->HasMatchingBinding(Identifier(colref.GetColumnName()));
+}
+
 static void ExtractPivotExpressions(ParsedExpression &root_expr, identifier_set_t &handled_columns,
                                     optional_ptr<DummyBinding> macro_binding) {
 	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
 	    root_expr, [&](const ColumnRefExpression &child_colref) {
 		    if (child_colref.IsQualified()) {
-			    if (child_colref.ColumnNames()[0].StartsWith(DummyBinding::DUMMY_NAME) && macro_binding &&
-			        macro_binding->HasMatchingBinding(Identifier(child_colref.GetColumnName()))) {
+			    if (IsMacroParameter(child_colref, macro_binding)) {
 				    throw ParameterNotResolvedException();
 			    }
 			    throw BinderException(child_colref, "PIVOT expression cannot contain qualified columns");
@@ -799,6 +803,23 @@ void Binder::ExtractUnpivotEntries(Binder &child_binder, PivotColumnEntry &entry
 	}
 }
 
+// A parameter is not the source column it is named like: the argument decides which source column the entry reads.
+static void RefuseMacroParameterNamedLikeSourceColumn(ParsedExpression &expr, optional_ptr<DummyBinding> macro_binding,
+                                                      const vector<unique_ptr<ParsedExpression>> &source_columns) {
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expr, [&](const ColumnRefExpression &colref) {
+		if (!IsMacroParameter(colref, macro_binding)) {
+			return;
+		}
+		for (auto &source_column : source_columns) {
+			if (source_column->GetExpressionType() == ExpressionType::COLUMN_REF &&
+			    source_column->Cast<ColumnRefExpression>().GetColumnName() == colref.GetColumnName()) {
+				throw BinderException(colref, "Conflicting column names for column %s!",
+				                      colref.GetColumnName().GetIdentifierName());
+			}
+		}
+	});
+}
+
 void Binder::ExtractUnpivotColumnName(ParsedExpression &expr, vector<Identifier> &result) {
 	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr.Cast<ColumnRefExpression>();
@@ -851,6 +872,7 @@ unique_ptr<SelectNode> Binder::BindUnpivot(Binder &child_binder, PivotRef &ref,
 				    "UNPIVOT clause must contain exactly one column - expression \"%s\" contains multiple (%s)",
 				    unpivot_expr->ToString(), StringUtil::Join(result, ", "));
 			}
+			RefuseMacroParameterNamedLikeSourceColumn(*unpivot_expr, macro_binding, all_columns);
 			handled_columns.insert(result[0]);
 			entry.column_names.push_back(std::move(result[0]));
 		}

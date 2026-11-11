@@ -151,6 +151,32 @@ FROM shadow_match_table(9);
 ----
 9
 
+# a parameter named like a column of the body's outer query takes precedence over it in a LATERAL PIVOT ON expression
+# and MATCH_RECOGNIZE input, as in a LATERAL select list
+statement ok
+CREATE MACRO lps(x) AS (SELECT max("6") FROM (SELECT 5 AS x) o, LATERAL (PIVOT (SELECT 1 AS k, 7 AS v) ON (k + x) IN (6) USING max(v)));
+
+query II
+SELECT lps(100), lps(5);
+----
+NULL	7
+
+statement ok
+CREATE MACRO lm(x) AS (SELECT max(m) FROM (SELECT 5 AS x) o, LATERAL (SELECT m FROM (SELECT x AS y) t MATCH_RECOGNIZE (MEASURES FIRST(y) AS m ONE ROW PER MATCH PATTERN (A) DEFINE A AS true)));
+
+query I
+SELECT lm(100);
+----
+100
+
+statement ok
+CREATE MACRO lateral_select(x) AS (SELECT max(y) FROM (SELECT 5 AS x) o, LATERAL (SELECT x AS y));
+
+query I
+SELECT lateral_select(100);
+----
+100
+
 # a name in a PIVOT IN entry, alone or in a tuple at any depth, is a value spelled like it, so a parameter of the
 # same name does not replace it; the other elements of the entry are constant expressions
 statement ok
@@ -298,6 +324,13 @@ Conflicting column names for column a!
 
 statement error
 CREATE MACRO unpivot_name_pick(a) AS (SELECT sum(val) FROM (UNPIVOT wide ON a, b INTO NAME n VALUE val));
+----
+Conflicting column names for column a!
+
+# a table macro parameter named like a source column conflicts with it in an UNPIVOT expression entry too, since the
+# argument decides which source column the entry reads
+statement error
+CREATE MACRO unpivot_expression_shadow_table(a) AS TABLE (UNPIVOT wide ON (a + 0) AS x, b INTO NAME n VALUE val);
 ----
 Conflicting column names for column a!
 

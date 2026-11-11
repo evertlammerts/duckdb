@@ -101,3 +101,21 @@ query I
 FROM shadow_nearest_table(0);
 ----
 4
+
+# a parameter named like a column of the NEAREST join's left side takes precedence over it, as in the LATERAL join that
+# NEAREST is bound as
+statement ok
+CREATE MACRO nz_scalar(z) AS (SELECT max(t.v) FROM (VALUES (0), (100)) u(z) JOIN (VALUES (4), (10), (90)) t(v) NEAREST 1 BY DISTANCE abs(t.v - z));
+
+query II
+SELECT nz_scalar(5), nz_scalar(95);
+----
+4	90
+
+statement ok
+CREATE MACRO lateral_scalar(z) AS (SELECT max(t.v) FROM (VALUES (0), (100)) u(z), LATERAL (SELECT t.v FROM (VALUES (4), (10), (90)) t(v) ORDER BY abs(t.v - z) LIMIT 1) t);
+
+query II
+SELECT lateral_scalar(5), lateral_scalar(95);
+----
+4	90
