@@ -904,3 +904,49 @@ query II
 SELECT 7 AS x, quoted_table_body(x);
 ----
 7	[8]
+
+# a dot call on the parameter and a dotted name in a subquery under an aggregate read a body table too
+
+statement ok
+CREATE MACRO dot_call_body(a) AS TABLE SELECT list_transform([1], lambda x: x.typeof() || ':' || a::VARCHAR) AS r FROM (VALUES (50, 9)) AS x(v, q);
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), dot_call_body(x.z);
+----
+['STRUCT(v INTEGER, q INTEGER):3']
+
+statement ok
+CREATE MACRO field_dot_call_body(a) AS TABLE SELECT list_transform([1], lambda x: x.v.upper() || a) AS r FROM (VALUES ('cd', 'q')) AS x(v, q);
+
+query I
+SELECT r FROM (VALUES ('p')) AS x(z), field_dot_call_body(x.z);
+----
+[CDp]
+
+statement ok
+CREATE MACRO aggregate_subquery_body(a) AS TABLE SELECT list_transform([1], lambda x: sum((SELECT x.v FROM (VALUES (50)) AS x(v))) + a) AS r FROM (VALUES (7)) AS y(z) GROUP BY y.z;
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), aggregate_subquery_body(x.z);
+----
+[53]
+
+# an aliased base table is known by its alias only
+
+statement ok
+CREATE MACRO aliased_base_table(a) AS TABLE SELECT list_transform([{'v': 1}], lambda x: x.v + a) AS r FROM x AS t;
+
+query I
+SELECT r FROM x, aliased_base_table(x.z);
+----
+[8]
+
+# a lambda at the top of a scalar body sees no table of the body, so a body subquery's table does not keep its name
+
+statement ok
+CREATE MACRO top_lambda_beside_subquery(a) AS list_transform([{'d': 1}], lambda x: x.d + a) || (SELECT [2] FROM (SELECT 0 AS k) x);
+
+query II
+SELECT 5 AS x, top_lambda_beside_subquery(x);
+----
+5	[6, 2]
