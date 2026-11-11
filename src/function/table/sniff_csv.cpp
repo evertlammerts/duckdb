@@ -213,15 +213,7 @@ static void CSVSniffFunction(ClientContext &context, TableFunctionInput &data_p,
 	if (!date_format.Empty()) {
 		output.data[8].Append(Value(date_format.format_specifier));
 	} else {
-		bool has_date = false;
-		for (auto &c_type : sniffer_result.return_types) {
-			if (c_type.id() == LogicalTypeId::DATE) {
-				has_date = true;
-				break;
-			}
-		}
-		// Must be ISO 8601
-		output.data[8].Append(has_date ? Value("%Y-%m-%d") : Value(nullptr));
+		output.data[8].Append(Value(nullptr));
 	}
 
 	// 10. Timestamp Format
@@ -294,15 +286,6 @@ static void CSVSniffFunction(ClientContext &context, TableFunctionInput &data_p,
 			         << "'"
 			         << sniffer_options.dialect_options.date_format[LogicalType::DATE].GetValue().format_specifier
 			         << "'";
-		} else {
-			for (auto &c_type : sniffer_result.return_types) {
-				// Must be ISO 8601
-				if (c_type.id() == LogicalTypeId::DATE) {
-					csv_read << separator << "dateformat="
-					         << "'%Y-%m-%d'";
-					break;
-				}
-			}
 		}
 	}
 	// 11.10. Timestamp Format
