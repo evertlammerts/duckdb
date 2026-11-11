@@ -31,6 +31,11 @@ SELECT fd() FROM (SELECT 1 AS e) q, x;
 ----
 [1]
 
+query I
+SELECT fd() FROM range(1) x(d);
+----
+[1]
+
 # written next to the table, the table wins over the parameter: the query's own tables come first
 
 query I
@@ -229,6 +234,7 @@ SELECT list_transform([1], lambda q: fp(q)) FROM x;
 ----
 [[2]]
 
+# a guard: a subquery's own scope has no table x
 query I
 SELECT (SELECT fd()) FROM x;
 ----
@@ -284,3 +290,31 @@ query III
 SELECT * FROM x, tm();
 ----
 50	7	[1]
+
+# UPDATE, MERGE and DELETE on a table named like the parameter
+
+statement ok
+UPDATE x SET d = fd()[1] + 100;
+
+query II
+SELECT d, z FROM x;
+----
+101	7
+
+statement ok
+MERGE INTO x USING (SELECT 7 AS z) src ON x.z = src.z WHEN MATCHED THEN UPDATE SET d = fd()[1] + 200;
+
+query II
+SELECT d, z FROM x;
+----
+201	7
+
+query I
+DELETE FROM x WHERE fd()[1] = 1;
+----
+1
+
+query I
+SELECT count(*) FROM x;
+----
+0

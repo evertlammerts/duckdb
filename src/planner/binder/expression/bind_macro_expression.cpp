@@ -290,9 +290,7 @@ private:
 		return nullptr;
 	}
 
-	// The top level of a scalar macro body binds in the caller's scope, which resolves a dotted name against its
-	// own tables before the lambda parameters, as it must for a lambda written there, so a caller table named like
-	// a body parameter would read the parameter's fields.
+	// The caller's scope, where a scalar macro body binds, tries its own tables before lambda parameters.
 	void CaptureByCallerScope(const ColumnRefExpression &column_ref) {
 		if (!column_ref.IsQualified()) {
 			return;
