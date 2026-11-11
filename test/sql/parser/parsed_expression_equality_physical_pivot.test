@@ -1,0 +1,16 @@
+# name: test/sql/parser/parsed_expression_equality_physical_pivot.test
+# description: GROUP BY matches a select entry only to a physical PIVOT whose GROUP BY names its columns alike
+# group: [parser]
+
+# the physical PIVOT names its group columns as written
+statement ok
+SET pivot_filter_threshold = 0
+
+query I
+SELECT (SELECT COLUMNS('^[a-z]$') FROM (PIVOT (SELECT 1 AS g, 2 AS h, 3 AS k) ON k IN (3) USING count(*) GROUP BY g, H)) AS c
+GROUP BY (SELECT COLUMNS('^[a-z]$') FROM (PIVOT (SELECT 1 AS g, 2 AS h, 3 AS k) ON k IN (3) USING count(*) GROUP BY G, h)), c
+----
+1
+
+statement ok
+RESET pivot_filter_threshold

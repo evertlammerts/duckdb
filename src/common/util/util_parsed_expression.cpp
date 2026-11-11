@@ -645,6 +645,9 @@ bool FunctionExpression::Equals(const ParsedExpression &other) const {
 	if (distinct != other_p.distinct) {
 		return false;
 	}
+	if (is_operator != other_p.is_operator) {
+		return false;
+	}
 	if (export_state != other_p.export_state) {
 		return false;
 	}
@@ -656,6 +659,13 @@ bool FunctionExpression::Equals(const ParsedExpression &other) const {
 			return false;
 		}
 	}
+	if (is_legacy_function_call != other_p.is_legacy_function_call) {
+		for (auto &argument : arguments) {
+			if (argument.HasName()) {
+				return false;
+			}
+		}
+	}
 	return true;
 }
 
@@ -663,6 +673,7 @@ hash_t FunctionExpression::Hash() const {
 	hash_t hash = ParsedExpression::Hash();
 	hash = CombineHash(hash, qualified_name.Hash());
 	hash = CombineHash(hash, duckdb::Hash<bool>(distinct));
+	hash = CombineHash(hash, duckdb::Hash<bool>(is_operator));
 	hash = CombineHash(hash, duckdb::Hash<bool>(export_state));
 	return hash;
 }
@@ -694,9 +705,17 @@ bool LambdaExpression::Equals(const ParsedExpression &other) const {
 	if (!ParsedExpression::Equals(expr, other_p.expr)) {
 		return false;
 	}
+	if (syntax_type != other_p.syntax_type) {
+		return false;
+	}
 	return true;
 }
 
+hash_t LambdaExpression::Hash() const {
+	hash_t hash = ParsedExpression::Hash();
+	hash = CombineHash(hash, duckdb::Hash<uint32_t>(static_cast<uint32_t>(syntax_type)));
+	return hash;
+}
 
 unique_ptr<ParsedExpression> LambdaExpression::Copy() const {
 	auto copy = duckdb::unique_ptr<LambdaExpression>(new LambdaExpression());
@@ -792,7 +811,7 @@ bool StarExpression::Equals(const ParsedExpression &other) const {
 	}
 	for (auto &entry : replace_list) {
 		auto other_entry = other_p.replace_list.find(entry.first);
-		if (other_entry == other_p.replace_list.end()) {
+		if (other_entry == other_p.replace_list.end() || !entry.first.SpellingEquals(other_entry->first)) {
 			return false;
 		}
 		if (!entry.second->Equals(*other_entry->second)) {
@@ -805,8 +824,15 @@ bool StarExpression::Equals(const ParsedExpression &other) const {
 	if (!ParsedExpression::Equals(expr, other_p.expr)) {
 		return false;
 	}
-	if (rename_list != other_p.rename_list) {
+	if (rename_list.size() != other_p.rename_list.size()) {
 		return false;
+	}
+	for (auto &entry : rename_list) {
+		auto other_entry = other_p.rename_list.find(entry.first);
+		if (other_entry == other_p.rename_list.end() || !(entry.first == other_entry->first) ||
+		    !entry.second.SpellingEquals(other_entry->second)) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -941,6 +967,13 @@ bool WindowExpression::Equals(const ParsedExpression &other) const {
 	for (idx_t i = 0; i < arguments.size(); i++) {
 		if (!arguments[i].Equals(other_p.arguments[i])) {
 			return false;
+		}
+	}
+	if (is_legacy_function_call != other_p.is_legacy_function_call) {
+		for (auto &argument : arguments) {
+			if (argument.HasName()) {
+				return false;
+			}
 		}
 	}
 	return true;

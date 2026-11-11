@@ -91,6 +91,7 @@ public:
 
 	//! Case-sensitive equality, for names whose spelling the result keeps (aliases, struct field names)
 	DUCKDB_API bool SpellingEquals(const Identifier &other) const;
+	DUCKDB_API static bool SpellingEquals(const vector<Identifier> &a, const vector<Identifier> &b);
 
 private:
 	string value;
