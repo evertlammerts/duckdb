@@ -41,6 +41,11 @@ FROM (SELECT x, try_cast(x AS UNION(d DECIMAL(2,0), s VARCHAR)) u FROM (VALUES (
 100	true	NULL	NULL
 NULL	true	NULL	NULL
 
+query III
+SELECT u, u IS NULL, union_tag(u) FROM (SELECT try_cast(100 AS UNION(d DECIMAL(2,0), s VARCHAR)) u)
+----
+NULL	true	NULL
+
 # a union that holds a NULL member stays as it is: union_value, and a UNION to UNION cast of such a union
 query III
 SELECT u IS NULL, union_tag(u), union_tag(u::UNION(i BIGINT, s VARCHAR)) FROM (SELECT union_value(i := NULL::INTEGER) u)
@@ -327,6 +332,11 @@ CHECKPOINT
 statement ok
 CREATE TABLE dst AS SELECT i, a::STRUCT(x UNION(i INTEGER, s VARCHAR), y UNION(i INTEGER, s VARCHAR)) c FROM src
 
+statement ok
+CHECKPOINT
+
+restart
+
 query IIIII
 SELECT count(*), count(c), count(c.x), count(c.y), count(*) FILTER (WHERE union_tag(c.x) = 'i' AND union_tag(c.y) = 's')
 FROM dst
@@ -352,6 +362,8 @@ INSERT INTO tops VALUES (1), (NULL), (NULL::VARCHAR), (NULL::INTEGER), ('q')
 
 statement ok
 CHECKPOINT
+
+restart
 
 query III
 SELECT count(*), count(u), count(union_tag(u)) FROM tops
