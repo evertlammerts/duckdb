@@ -166,6 +166,12 @@ FROM bad_utf8 WHERE id = 40;
 ----
 true	true	true
 
+# a valid run between two shortened subparts moves after the text has already shrunk
+query II
+SELECT decode(unhex('E2824142E28243'), 'replace'), decode(unhex('E2824142E28243'), 'ignore');
+----
+?AB?C	ABC
+
 # the strict mode still rejects a cut sequence
 statement error
 SELECT decode(b) FROM bad_utf8 WHERE id = 9;

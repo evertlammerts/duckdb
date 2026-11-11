@@ -303,7 +303,7 @@ is not valid UTF8
 
 endloop
 
-# replace marks a cut prefix with one '?' in every encoding; rows 6 and 7 shrink across the inline string limit
+# replace marks a cut prefix with one '?' in every encoding; rows 6 and 7 shrink across the inline limit, row 8 moves a run
 statement ok
 CREATE TABLE cut_sequences AS SELECT * FROM (VALUES
     (1, unhex('41C342')),
@@ -312,7 +312,8 @@ CREATE TABLE cut_sequences AS SELECT * FROM (VALUES
     (4, unhex('41E282')),
     (5, NULL::BLOB),
     (6, unhex(repeat('F09F98', 5))),
-    (7, unhex(repeat('41', 11) || 'E282'))
+    (7, unhex(repeat('41', 11) || 'E282')),
+    (8, unhex('E2824142E28243'))
 ) t(i, s);
 
 statement ok
@@ -344,6 +345,7 @@ SELECT DISTINCT i, s FROM read_parquet('{TEST_DIR}/cut_sequences_{encoding}.parq
 5	NULL
 6	?????
 7	AAAAAAAAAAA?
+8	?AB?C
 
 query II
 SELECT DISTINCT i, s FROM read_parquet('{TEST_DIR}/cut_sequences_{encoding}.parquet', binary_as_string=true, utf8_validation='ignore') ORDER BY i;
@@ -355,5 +357,6 @@ SELECT DISTINCT i, s FROM read_parquet('{TEST_DIR}/cut_sequences_{encoding}.parq
 5	NULL
 6	(empty)
 7	AAAAAAAAAAA
+8	ABC
 
 endloop

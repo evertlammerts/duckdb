@@ -218,14 +218,17 @@ bool Utf8Proc::IsValid(const char *s, size_t len) {
 std::string Utf8Proc::RemoveInvalid(const char *s, size_t len) {
 	std::string result;
 	result.reserve(len);
+	size_t run_start = 0;
 	for (size_t i = 0; i < len;) {
 		bool valid;
 		auto sequence_length = NextSequenceLength(s, len, i, valid);
-		if (valid) {
-			result.append(s + i, sequence_length);
+		if (!valid) {
+			result.append(s + run_start, i - run_start);
+			run_start = i + sequence_length;
 		}
 		i += sequence_length;
 	}
+	result.append(s + run_start, len - run_start);
 	D_ASSERT(Utf8Proc::IsValid(result.c_str(), result.size()));
 	return result;
 }
