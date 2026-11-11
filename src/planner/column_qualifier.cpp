@@ -8,6 +8,7 @@
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/positional_reference_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/expression_binder/having_binder.hpp"
 #include "duckdb/planner/planner_extension.hpp"
@@ -194,7 +195,8 @@ unique_ptr<ParsedExpression> ColumnQualifier::QualifyColumnName(const ParsedExpr
 	return nullptr;
 }
 
-void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, const bool within_function_expression) {
+void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, const bool within_function_expression,
+                                         const bool from_item) {
 	bool next_within_function_expression = false;
 	switch (expr->GetExpressionType()) {
 	case ExpressionType::COLUMN_REF: {
@@ -243,7 +245,7 @@ void ColumnQualifier::QualifyColumnNames(unique_ptr<ParsedExpression> &expr, con
 			entry = QualifyFunction(function, lambda_params);
 		}
 		if (function.IsLambdaFunction()) {
-			return QualifyColumnNamesInLambda(function, entry);
+			return QualifyColumnNamesInLambda(function, from_item ? nullptr : entry, from_item);
 		}
 
 		next_within_function_expression = true;
@@ -317,17 +319,19 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	return func;
 }
 
-bool ColumnQualifier::IsTableMacro(Binder &binder, const FunctionExpression &function, const QualifiedName &name) {
-	QueryErrorContext error_context(function.GetQueryLocation());
-	EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(name.Name()), error_context);
-	auto bound_name = Binder::BindTableName(binder.EntryRetriever(), name);
-	auto entry = binder.GetCatalogEntry(EntryLookupInfo(table_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
-	return entry && entry->type == CatalogType::TABLE_MACRO_ENTRY;
-}
-
 bool ColumnQualifier::IsLambdaArgument(Binder &binder, const FunctionExpression &function, idx_t index,
-                                       optional_ptr<CatalogEntry> entry) {
+                                       optional_ptr<CatalogEntry> entry, bool from_item) {
 	auto name = function.GetQualifiedName();
+	if (from_item) {
+		binder.BindSchemaOrCatalog(name);
+		QueryErrorContext error_context(function.GetQueryLocation());
+		EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(name.Name()), error_context);
+		auto bound_name = Binder::BindTableName(binder.EntryRetriever(), name);
+		auto table_function =
+		    binder.GetCatalogEntry(EntryLookupInfo(table_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
+		// a table macro places an argument only when it expands, so an arrow passed to one keeps the lambda reading
+		return !table_function || table_function->type == CatalogType::TABLE_MACRO_ENTRY;
+	}
 	bool dot_call = false;
 	auto func = entry;
 	if (!func) {
@@ -338,32 +342,30 @@ bool ColumnQualifier::IsLambdaArgument(Binder &binder, const FunctionExpression 
 		// a macro places an argument only when it expands, so an arrow passed to one keeps the lambda reading
 		return true;
 	}
-	if (func->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(func->Cast<ScalarFunctionCatalogEntry>());
-		// the receiver of a dot call is the function's first argument, so the written arguments start at the second
-		const idx_t receiver_count = dot_call ? 1 : 0;
-		if (lambda_index.IsValid() && lambda_index.GetIndex() == index + receiver_count) {
-			return true;
-		}
+	if (func->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+		return false;
 	}
-	// the walks also reach the call of a FROM clause item, which binds to a table function of the name
-	return !entry && IsTableMacro(binder, function, name);
+	auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(func->Cast<ScalarFunctionCatalogEntry>());
+	// the receiver of a dot call is the function's first argument, so the written arguments start at the second
+	const idx_t receiver_count = dot_call ? 1 : 0;
+	return lambda_index.IsValid() && lambda_index.GetIndex() == index + receiver_count;
 }
 
 bool ColumnQualifier::TryGetLambdaParameters(Binder &binder, const FunctionExpression &function, idx_t index,
-                                             identifier_set_t &parameters, optional_ptr<CatalogEntry> entry) {
+                                             identifier_set_t &parameters, optional_ptr<CatalogEntry> entry,
+                                             bool from_item) {
 	auto &argument = function.GetArguments()[index].GetExpression();
 	if (argument.GetExpressionClass() != ExpressionClass::LAMBDA) {
 		return false;
 	}
 	auto &lambda = argument.Cast<LambdaExpression>();
-	if (lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD &&
-	    !IsLambdaArgument(binder, function, index, entry)) {
-		return false;
-	}
 	string error_message;
 	auto column_refs = lambda.ExtractColumnRefExpressions(error_message);
 	if (!error_message.empty()) {
+		return false;
+	}
+	if (lambda.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD &&
+	    !IsLambdaArgument(binder, function, index, entry, from_item)) {
 		return false;
 	}
 	for (auto &column_ref : column_refs) {
@@ -376,12 +378,12 @@ void ColumnQualifier::EnumerateCallChildren(
     Binder &binder, FunctionExpression &function,
     const std::function<void(unique_ptr<ParsedExpression> &child)> &callback,
     const std::function<void(LambdaExpression &lambda, identifier_set_t &parameters)> &lambda_callback,
-    optional_ptr<CatalogEntry> entry) {
+    optional_ptr<CatalogEntry> entry, bool from_item) {
 	auto &arguments = function.GetArgumentsMutable();
 	for (idx_t i = 0; i < arguments.size(); i++) {
 		auto &child = arguments[i].GetExpressionMutable();
 		identifier_set_t parameters;
-		if (TryGetLambdaParameters(binder, function, i, parameters, entry)) {
+		if (TryGetLambdaParameters(binder, function, i, parameters, entry, from_item)) {
 			lambda_callback(child->Cast<LambdaExpression>(), parameters);
 		} else {
 			callback(child);
@@ -397,7 +399,8 @@ void ColumnQualifier::EnumerateCallChildren(
 	}
 }
 
-void ColumnQualifier::QualifyColumnNamesInLambda(FunctionExpression &function, optional_ptr<CatalogEntry> entry) {
+void ColumnQualifier::QualifyColumnNamesInLambda(FunctionExpression &function, optional_ptr<CatalogEntry> entry,
+                                                 bool from_item) {
 	EnumerateCallChildren(
 	    binder, function,
 	    [&](unique_ptr<ParsedExpression> &child) {
@@ -414,7 +417,21 @@ void ColumnQualifier::QualifyColumnNamesInLambda(FunctionExpression &function, o
 		    QualifyColumnNames(lambda.RightMutable(), true);
 		    lambda_params.pop_back();
 	    },
-	    entry);
+	    entry, from_item);
+}
+
+void ColumnQualifier::EnumerateQueryNodeExpressions(
+    QueryNode &node, const std::function<void(unique_ptr<ParsedExpression> &child, bool from_item)> &callback) {
+	unordered_set<const ParsedExpression *> from_items;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [](unique_ptr<ParsedExpression> &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+			    from_items.insert(ref.Cast<TableFunctionRef>().function.get());
+		    }
+	    });
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, from_items.count(child.get()) > 0); });
 }
 
 unique_ptr<ParsedExpression> ColumnQualifier::QualifyColumnNameWithManyDotsInternal(ColumnRefExpression &col_ref,

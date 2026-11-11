@@ -34,6 +34,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/column_qualifier.hpp"
 #include "duckdb/planner/bound_query_node.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -622,9 +623,9 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 
 			// create a copy of the query node because we do not want to alter the original
 			auto query_node = function->Cast<TableMacroFunction>().query_node->Copy();
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(
-			    *query_node, [&dummy_binder](unique_ptr<ParsedExpression> &child) {
-				    ExpressionBinder::QualifyColumnNames(*dummy_binder, child);
+			ColumnQualifier::EnumerateQueryNodeExpressions(
+			    *query_node, [&dummy_binder](unique_ptr<ParsedExpression> &child, bool from_item) {
+				    ExpressionBinder::QualifyColumnNames(*dummy_binder, child, nullptr, from_item);
 			    });
 			try {
 				dummy_binder->Bind(*query_node);

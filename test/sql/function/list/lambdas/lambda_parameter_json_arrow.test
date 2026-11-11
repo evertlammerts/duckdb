@@ -474,6 +474,22 @@ SELECT lower_from(100);
 [2, 3]
 
 statement ok
+CREATE MACRO lower_rows(x) AS TABLE SELECT r FROM lower([1, 2], x -> x + 1);
+
+query I
+SELECT * FROM lower_rows(100);
+----
+[2, 3]
+
+statement ok
+CREATE MACRO lower_rows_shifted(x) AS TABLE SELECT r FROM lower([1, 2], y -> y + x);
+
+query I
+SELECT * FROM lower_rows_shifted(100);
+----
+[101, 102]
+
+statement ok
 DROP MACRO TABLE lower;
 
 statement ok

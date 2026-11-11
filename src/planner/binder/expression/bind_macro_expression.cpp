@@ -22,7 +22,7 @@
 namespace duckdb {
 
 void ExpressionBinder::ReplaceMacroParametersInLambda(FunctionExpression &function,
-                                                      vector<identifier_set_t> &lambda_params) {
+                                                      vector<identifier_set_t> &lambda_params, bool from_item) {
 	ColumnQualifier::EnumerateCallChildren(
 	    binder, function, [&](unique_ptr<ParsedExpression> &child) { ReplaceMacroParameters(child, lambda_params); },
 	    [&](LambdaExpression &lambda, identifier_set_t &parameters) {
@@ -30,11 +30,12 @@ void ExpressionBinder::ReplaceMacroParametersInLambda(FunctionExpression &functi
 		    lambda_params.push_back(std::move(parameters));
 		    ReplaceMacroParameters(lambda.RightMutable(), lambda_params);
 		    lambda_params.pop_back();
-	    });
+	    },
+	    nullptr, from_item);
 }
 
 void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr,
-                                              vector<identifier_set_t> &lambda_params) {
+                                              vector<identifier_set_t> &lambda_params, bool from_item) {
 	switch (expr->GetExpressionClass()) {
 	case ExpressionClass::COLUMN_REF: {
 		// If the expression is a column reference, we replace it with its argument.
@@ -64,14 +65,16 @@ void ExpressionBinder::ReplaceMacroParameters(unique_ptr<ParsedExpression> &expr
 		// Special-handling for lambdas, which are inside function expressions.
 		auto &function = expr->Cast<FunctionExpression>();
 		if (function.IsLambdaFunction()) {
-			return ReplaceMacroParametersInLambda(function, lambda_params);
+			return ReplaceMacroParametersInLambda(function, lambda_params, from_item);
 		}
 		break;
 	}
 	case ExpressionClass::SUBQUERY: {
 		auto &sq = (expr->Cast<SubqueryExpression>()).Subquery();
-		ParsedExpressionIterator::EnumerateQueryNodeChildren(
-		    *sq->node, [&](unique_ptr<ParsedExpression> &child) { ReplaceMacroParameters(child, lambda_params); });
+		ColumnQualifier::EnumerateQueryNodeExpressions(
+		    *sq->node, [&](unique_ptr<ParsedExpression> &child, bool child_from_item) {
+			    ReplaceMacroParameters(child, lambda_params, child_from_item);
+		    });
 		break;
 	}
 	default:
