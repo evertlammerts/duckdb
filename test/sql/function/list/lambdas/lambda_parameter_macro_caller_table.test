@@ -291,6 +291,32 @@ SELECT * FROM x, tm();
 ----
 50	7	[1]
 
+# a table of a body subquery is not in scope for a lambda beside it, so the caller's table still does not capture
+
+statement ok
+CREATE MACRO mix(a) AS list_concat(list_transform([{'d': 1}], lambda x: x.d + a), (SELECT list_transform([{'d': 2}], lambda x: x.d + a) FROM (VALUES (60)) AS x(d)));
+
+query I
+SELECT mix(7) FROM x;
+----
+[8, 67]
+
+statement ok
+CREATE MACRO top2() AS list_transform([{'d': 1}], lambda x: x.d) || (SELECT [count(*)] FROM (SELECT 1) x);
+
+query I
+SELECT top2() FROM x;
+----
+[1, 1]
+
+statement ok
+CREATE MACRO beside() AS list_transform([{'d': 1}], lambda x: x.d) || (SELECT [2] FROM (SELECT 0 AS k) x);
+
+query I
+SELECT beside() FROM x;
+----
+[1, 2]
+
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
 statement ok

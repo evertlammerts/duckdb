@@ -210,6 +210,8 @@ struct LambdaScope {
 	reference<LambdaExpression> lambda_expr;
 	vector<reference<ColumnRefExpression>> parameters;
 	identifier_set_t captured;
+	// A lambda holds no subquery, so no body table is in scope where the caller's scope captures a parameter.
+	identifier_set_t captured_by_caller_scope;
 };
 
 using lambda_callback_t = std::function<void(LambdaExpression &, vector<reference<ColumnRefExpression>> &)>;
@@ -323,11 +325,17 @@ private:
 		}
 		auto &parameter = column_ref.ColumnNames()[0];
 		auto scope = DeclaringScope(parameter);
-		if (!scope || scope->captured.find(parameter) != scope->captured.end()) {
+		if (!scope || scope->captured_by_caller_scope.find(parameter) != scope->captured_by_caller_scope.end()) {
 			return;
 		}
-		if (CallerScopeBindsElsewhere(column_ref)) {
-			Capture(identifier_set_t {parameter});
+		if (!CallerScopeBindsElsewhere(column_ref)) {
+			return;
+		}
+		Capture(identifier_set_t {parameter});
+		for (auto &enclosing : scopes) {
+			if (enclosing.captured.find(parameter) != enclosing.captured.end()) {
+				enclosing.captured_by_caller_scope.insert(parameter);
+			}
 		}
 	}
 
@@ -675,7 +683,8 @@ private:
 		identifier_map_t<Identifier> renames;
 		for (auto &parameter : scope.parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
-			if (scope.captured.find(name) == scope.captured.end() || ReadsBodyTable(scope, name)) {
+			if (scope.captured.find(name) == scope.captured.end() ||
+			    (ReadsBodyTable(scope, name) && !scope.captured_by_caller_scope.count(name))) {
 				continue;
 			}
 			// a repeated parameter keeps one name, so the binder still rejects it as a duplicate
