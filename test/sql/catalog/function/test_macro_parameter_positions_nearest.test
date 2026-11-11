@@ -87,3 +87,17 @@ SELECT * FROM nearest_table(90) ORDER BY id;
 ----
 1	2
 2	2
+
+# a table macro parameter named like a source column takes precedence over the column, as in a select list
+statement ok
+CREATE MACRO shadow_nearest_table(v) AS TABLE SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4), (10)) t(v) NEAREST 1 BY DISTANCE abs(t.v - v);
+
+query I
+FROM shadow_nearest_table(100);
+----
+10
+
+query I
+FROM shadow_nearest_table(0);
+----
+4

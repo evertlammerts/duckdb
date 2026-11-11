@@ -221,7 +221,9 @@ TEST_CASE("Table references that differ only in an iterated expression are not e
 	CHECK(!join.Equals(*other));
 }
 
-TEST_CASE("A prepared CREATE MACRO refuses a parameter in every position of a table macro body", "[api][parser]") {
+TEST_CASE("A prepared CREATE MACRO refuses a parameter in a WHERE clause, an AT clause, a NEAREST ranking, a PIVOT ON "
+          "expression, an UNPIVOT expression entry and a MATCH_RECOGNIZE input of a table macro body",
+          "[api][parser]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -233,6 +235,8 @@ TEST_CASE("A prepared CREATE MACRO refuses a parameter in every position of a ta
 	             "NEAREST 1 BY DISTANCE abs(b.v - $1::INT)"),
 	      string("CREATE MACRO m() AS TABLE SELECT * FROM (PIVOT (SELECT 7 AS v, 1 AS a) ON (a + $1::INT) IN (2) "
 	             "USING max(v))"),
+	      string("CREATE MACRO m() AS TABLE SELECT * FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON (a + $1::INT) AS ap, b "
+	             "INTO NAME n VALUE val)"),
 	      string("CREATE MACRO m() AS TABLE SELECT m FROM (SELECT $1::INT AS x) t MATCH_RECOGNIZE (MEASURES "
 	             "FIRST(x) AS m ONE ROW PER MATCH PATTERN (A) DEFINE A AS true)")}) {
 		INFO(sql);

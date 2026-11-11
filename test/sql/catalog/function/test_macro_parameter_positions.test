@@ -127,6 +127,30 @@ SELECT * FROM pivot_on_table(0) ORDER BY k;
 1	20	NULL
 2	NULL	NULL
 
+# a table macro parameter named like a source column takes precedence over the column, as in a select list
+statement ok
+CREATE MACRO shadow_pivot_table(c) AS TABLE PIVOT pivot_source ON c IN (1, 2) USING sum(v) GROUP BY k;
+
+query III
+SELECT * FROM shadow_pivot_table(5) ORDER BY k;
+----
+1	NULL	NULL
+2	NULL	NULL
+
+query III
+SELECT * FROM shadow_pivot_table(1) ORDER BY k;
+----
+1	30	NULL
+2	30	NULL
+
+statement ok
+CREATE MACRO shadow_match_table(x) AS TABLE SELECT m FROM (SELECT x FROM (SELECT 1 AS x)) t MATCH_RECOGNIZE (MEASURES FIRST(x) AS m ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+query I
+FROM shadow_match_table(9);
+----
+9
+
 # a name in a PIVOT IN entry, alone or in a tuple at any depth, is a value spelled like it, so a parameter of the
 # same name does not replace it; the other elements of the entry are constant expressions
 statement ok
