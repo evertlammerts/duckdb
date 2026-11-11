@@ -1539,21 +1539,23 @@ void StringValueScanner::ProcessOverBufferValue() {
 				       (buffer_handle_ptr[pos] == '\r' || buffer_handle_ptr[pos] == '\n');
 			};
 			const bool split_line_end = result.last_position.buffer_pos > previous_buffer_handle->actual_size;
-			// past its boundary a scan reads only the rest of its line, and an empty line is a line of its own
-			if (!line_open && !split_line_end && line_end_at(iterator.pos.buffer_pos)) {
-				if (buffer_handle_ptr[iterator.pos.buffer_pos] == '\r') {
+			const bool split_newline = split_line_end && line_end_at(iterator.pos.buffer_pos) &&
+			                           buffer_handle_ptr[iterator.pos.buffer_pos] == '\n';
+			const idx_t empty_line_pos = iterator.pos.buffer_pos + (split_newline ? 1 : 0);
+			// past its boundary a scan reads only the rest of its line, and an empty line is a line of its own: the
+			// scan reads the one empty line the next scan skips as the end of the line before its start
+			if (!line_open && (split_newline || !split_line_end) && line_end_at(empty_line_pos)) {
+				if (split_newline) {
 					state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
 				}
-				if (iterator.pos.buffer_pos < cur_buffer_handle->actual_size &&
+				state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos]);
+				result.EmptyLine(result, iterator.pos.buffer_pos);
+				if (buffer_handle_ptr[iterator.pos.buffer_pos++] == '\r' &&
+				    iterator.pos.buffer_pos < cur_buffer_handle->actual_size &&
 				    buffer_handle_ptr[iterator.pos.buffer_pos] == '\n') {
 					state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
 				}
 				lines_read++;
-				return;
-			}
-			if (!line_open && split_line_end && line_end_at(iterator.pos.buffer_pos) &&
-			    buffer_handle_ptr[iterator.pos.buffer_pos] == '\n' && line_end_at(iterator.pos.buffer_pos + 1)) {
-				state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
 				return;
 			}
 			idx_t pre_carry_pos = iterator.pos.buffer_pos;
@@ -1596,6 +1598,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 	}
 	// second buffer
+	idx_t opening_quote_pos = 0;
 	for (; iterator.pos.buffer_pos < cur_buffer_handle->actual_size; iterator.pos.buffer_pos++) {
 		state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos]);
 		if (states.EmptyLine()) {
@@ -1617,6 +1620,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 			over_buffer_string += buffer_handle_ptr[iterator.pos.buffer_pos];
 		}
 		if (states.IsQuoted()) {
+			if (!result.quoted) {
+				opening_quote_pos = iterator.pos.buffer_pos - 1;
+			}
 			result.SetQuoted(result, j);
 		}
 		if (states.IsComment()) {
@@ -1642,6 +1648,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 		result.last_position = {iterator.pos.buffer_idx,
 		                        result.last_position.buffer_pos - previous_buffer_handle->actual_size,
 		                        cur_buffer_handle->actual_size};
+		// the end of the file, when the next read finds it, adds the value from this buffer as Process does, which
+		// takes the position of the opening quote
+		result.quoted_position = opening_quote_pos;
 		over_buffer_value_open = true;
 		return;
 	}
@@ -1649,10 +1658,11 @@ void StringValueScanner::ProcessOverBufferValue() {
 	// string or at the start of a line; after a delimiter the value before the comment is kept, even when empty.
 	const bool comment_only = result.comment && (comment_before || result.cur_col_id == 0) &&
 	                          over_buffer_string.find_first_not_of(' ') == string::npos;
+	const bool no_value = comment_only || states.EmptyLine();
 	bool skip_value = false;
 	if (result.projecting_columns) {
 		if (result.cur_col_id < result.number_of_columns && !result.projected_columns[result.cur_col_id]) {
-			if (!comment_only) {
+			if (!no_value) {
 				result.cur_col_id++;
 			}
 			skip_value = true;
@@ -1742,7 +1752,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		if (states.EmptyLine() && state_machine->dialect_options.num_cols == 1) {
 			result.EmptyLine(result, iterator.pos.buffer_pos);
-		} else if (!states.IsNotSet() && !states.EmptyLine() && !comment_only) {
+		} else if (!states.IsNotSet() && !no_value) {
 			idx_t value_size = value.GetSize();
 			if (!removed_extra_delimiter_bytes) {
 				if (extra_delimiter_bytes > value_size) {
@@ -1759,16 +1769,22 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 	}
 
-	if (states.NewRow() && !states.IsNotSet()) {
+	const bool file_ended =
+	    iterator.pos.buffer_pos >= cur_buffer_handle->actual_size && cur_buffer_handle->is_last_buffer;
+	if (states.NewRow() && !states.IsNotSet() && !states.EmptyLine()) {
 		if (result.IsCommentSet(result)) {
 			result.UnsetComment(result, iterator.pos.buffer_pos);
 		} else {
 			result.AddRowInternal();
 		}
 		lines_read++;
+	} else if (file_ended && result.IsCommentSet(result)) {
+		// the value before the comment is in the previous buffer, which result.buffer_ptr is only here
+		result.UnsetComment(result, iterator.pos.buffer_pos);
+		lines_read++;
 	}
 
-	if (iterator.pos.buffer_pos >= cur_buffer_handle->actual_size && cur_buffer_handle->is_last_buffer) {
+	if (file_ended) {
 		result.added_last_line = true;
 	}
 	if (states.IsCarriageReturn() &&
