@@ -1519,6 +1519,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 			result.escaped = true;
 		}
 		if (states.IsComment()) {
+			if (!result.comment) {
+				marker_position = {previous_buffer_handle->buffer_idx, i, previous_buffer_handle->actual_size};
+			}
 			result.SetComment(result, j);
 		}
 		if (states.IsInvalid()) {

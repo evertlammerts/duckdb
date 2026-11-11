@@ -236,6 +236,67 @@ endloop
 
 endloop
 
+# A row end two bytes after a comment line that ends in a bare newline under a carriage return and newline dialect puts
+# the next scan start inside a quoted value, which then shows its quoted comment character as a marker in the previous
+# buffer; a reject of that row still points inside its own line.
+
+foreach serial true false
+
+statement ok
+SELECT * FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/quoted_marker_after_bare_newline_comment.csv',
+	new_line = '\r\n', comment = '#', buffer_size = 16, max_line_size = 16, strict_mode = false, store_rejects = true,
+	parallel = (NOT {serial}), auto_detect = false, header = false, columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+
+query I
+SELECT count(*) FROM reject_errors WHERE byte_position < line_byte_position;
+----
+0
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+endloop
+
+# A line of exactly max_line_size bytes is read when skip has moved the sniffer's start past the first buffer, and
+# where the sniffer starts in the first buffer.
+
+foreach serial true false
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/line_at_limit_after_skip.csv', buffer_size = 200, skip = 50, parallel = (NOT {serial}),
+	max_line_size = 100);
+----
+29
+
+endloop
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/line_at_limit_after_skip.csv', skip = 50,
+	max_line_size = 100);
+----
+29
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/line_at_limit_after_skip.csv', buffer_size = 300, skip = 50,
+	max_line_size = 100);
+----
+29
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/line_at_limit_after_skip.csv', buffer_size = 200, skip = 10,
+	max_line_size = 100);
+----
+69
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/line_at_limit_after_skip.csv', buffer_size = 200, skip = 20,
+	max_line_size = 100);
+----
+59
+
 # The default buffer size keeps raising the error.
 
 statement error
