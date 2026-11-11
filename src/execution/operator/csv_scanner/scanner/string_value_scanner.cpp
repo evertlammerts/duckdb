@@ -1490,7 +1490,9 @@ void StringValueScanner::ProcessOverBufferValue() {
 	string over_buffer_string;
 	auto previous_buffer = previous_buffer_handle->Ptr();
 	idx_t j = 0;
-	result.quoted = false;
+	if (!comment_before) {
+		result.quoted = false;
+	}
 	for (idx_t i = result.last_position.buffer_pos; i < previous_buffer_handle->actual_size; i++) {
 		state_machine->Transition(states, previous_buffer[i]);
 		if (states.EmptyLine() || states.IsCurrentNewRow()) {
@@ -1498,7 +1500,12 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		if (states.NewRow() || states.NewValue()) {
 			break;
-		} else if (!result.comment) {
+		}
+		if (comment_before) {
+			// UnsetComment builds the value before the comment from the previous buffer, where Process set its quote
+			continue;
+		}
+		if (!result.comment) {
 			over_buffer_string += previous_buffer[i];
 		}
 		if (states.IsQuoted()) {
@@ -1525,6 +1532,30 @@ void StringValueScanner::ProcessOverBufferValue() {
 				iterator.pos.buffer_pos++;
 			}
 		} else {
+			const bool line_open = result.cur_col_id > 0 || result.IsCommentSet(result) ||
+			                       result.last_position.buffer_pos < previous_buffer_handle->actual_size;
+			const auto line_end_at = [&](idx_t pos) {
+				return pos < cur_buffer_handle->actual_size &&
+				       (buffer_handle_ptr[pos] == '\r' || buffer_handle_ptr[pos] == '\n');
+			};
+			const bool split_line_end = result.last_position.buffer_pos > previous_buffer_handle->actual_size;
+			// past its boundary a scan reads only the rest of its line, and an empty line is a line of its own
+			if (!line_open && !split_line_end && line_end_at(iterator.pos.buffer_pos)) {
+				if (buffer_handle_ptr[iterator.pos.buffer_pos] == '\r') {
+					state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
+				}
+				if (iterator.pos.buffer_pos < cur_buffer_handle->actual_size &&
+				    buffer_handle_ptr[iterator.pos.buffer_pos] == '\n') {
+					state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
+				}
+				lines_read++;
+				return;
+			}
+			if (!line_open && split_line_end && line_end_at(iterator.pos.buffer_pos) &&
+			    buffer_handle_ptr[iterator.pos.buffer_pos] == '\n' && line_end_at(iterator.pos.buffer_pos + 1)) {
+				state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
+				return;
+			}
 			idx_t pre_carry_pos = iterator.pos.buffer_pos;
 			while (iterator.pos.buffer_pos < cur_buffer_handle->actual_size &&
 			       (buffer_handle_ptr[iterator.pos.buffer_pos] == '\n' ||
@@ -1544,6 +1575,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 						        buffer_handle_ptr[iterator.pos.buffer_pos] == '\n')) {
 							state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos++]);
 						}
+						lines_read++;
 						return;
 					}
 				} else {
@@ -1567,14 +1599,21 @@ void StringValueScanner::ProcessOverBufferValue() {
 	for (; iterator.pos.buffer_pos < cur_buffer_handle->actual_size; iterator.pos.buffer_pos++) {
 		state_machine->Transition(states, buffer_handle_ptr[iterator.pos.buffer_pos]);
 		if (states.EmptyLine()) {
-			if (state_machine->dialect_options.num_cols == 1) {
+			// an empty line is a line of its own, and past its boundary a scan reads only the rest of its line
+			lines_read++;
+			if (state_machine->dialect_options.num_cols == 1 || iterator.IsBoundarySet()) {
 				break;
 			}
 			continue;
 		}
 		if (states.NewRow() || states.NewValue()) {
 			break;
-		} else if (!result.comment && !states.IsComment()) {
+		}
+		if (states.IsCurrentNewRow()) {
+			// the newline of an empty line's carriage return and newline
+			continue;
+		}
+		if (!result.comment && !states.IsComment()) {
 			over_buffer_string += buffer_handle_ptr[iterator.pos.buffer_pos];
 		}
 		if (states.IsQuoted()) {
@@ -1703,7 +1742,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		if (states.EmptyLine() && state_machine->dialect_options.num_cols == 1) {
 			result.EmptyLine(result, iterator.pos.buffer_pos);
-		} else if (!states.IsNotSet() && !comment_only) {
+		} else if (!states.IsNotSet() && !states.EmptyLine() && !comment_only) {
 			idx_t value_size = value.GetSize();
 			if (!removed_extra_delimiter_bytes) {
 				if (extra_delimiter_bytes > value_size) {
@@ -1776,12 +1815,13 @@ StringValueScanner::MoveBufferResult StringValueScanner::TryMoveToNextBuffer() {
 			LinePosition line_end = {iterator.pos.buffer_idx, previous_buffer_handle->actual_size, result.buffer_size};
 			result.current_line_position.begin = result.current_line_position.end;
 			result.current_line_position.end = line_end;
+			result.CheckLineSize(state_machine->options.maximum_line_size.GetValue());
 			// handle the errors recorded for the row before counting it, as AddRowInternal does
 			const auto chunk_col_id_before = result.chunk_col_id;
 			if (result.current_errors.HandleErrors(result)) {
 				result.InvalidateUnwrittenColumns(chunk_col_id_before);
 			}
-			result.line_positions_per_row[static_cast<idx_t>(result.number_of_rows)] = result.current_line_position;
+			result.StoreLinePosition();
 			result.number_of_rows++;
 		}
 		result.cur_col_id = 0;
@@ -1955,11 +1995,6 @@ bool StringValueScanner::IsRowValid(CSVIterator &current_iterator) const {
 	try {
 		auto &tuples = scan_finder->ParseChunk();
 		current_iterator.pos = scan_finder->GetIteratorPosition();
-		// a quote opened at a wrong start can run through the next buffer to the end of the file, which a read that is
-		// not strict accepts as one row
-		if (scan_finder->FinishedFile() && scan_finder->states.IsQuotedCurrent()) {
-			return false;
-		}
 		bool has_error = false;
 		if (tuples.current_errors.HasError()) {
 			if (tuples.current_errors.Size() != 1 || !tuples.current_errors.HasErrorType(MAXIMUM_LINE_SIZE)) {
@@ -2131,6 +2166,7 @@ void StringValueScanner::FinishBoundaryScan(const bool moved) {
 				const auto chunk_col_id_before = result.chunk_col_id;
 				if (result.current_errors.HandleErrors(result)) {
 					result.InvalidateUnwrittenColumns(chunk_col_id_before);
+					result.StoreLinePosition();
 					result.number_of_rows++;
 				}
 				lines_read++;
@@ -2138,8 +2174,8 @@ void StringValueScanner::FinishBoundaryScan(const bool moved) {
 				states.Initialize();
 				break;
 			}
-			// buffers before the last are full and at least max_line_size, so a line still open at the end of the
-			// second buffer after the boundary's is over the limit
+			// the open line starts in the boundary's buffer or the next, and buffers before the last are full and at
+			// least max_line_size, so it is over the limit by the end of the second buffer after the boundary's
 			D_ASSERT(iterator.pos.buffer_idx < iterator.GetBoundaryBufferIdx() + 2);
 			const auto move_result = TryMoveToNextBuffer();
 			if (move_result == MoveBufferResult::NOT_IN_MEMORY) {
@@ -2212,3 +2248,5 @@ ValidatorLine StringValueScanner::GetValidationLine() {
 }
 
 } // namespace duckdb
+
+#undef DUCKDB_CSV_NOINLINE

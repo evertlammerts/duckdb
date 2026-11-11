@@ -50,6 +50,45 @@ SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/third_line_long.cs
 ----
 <REGEX>:.*CSV Error on Line: 3.*Maximum line size of 100 bytes exceeded.*
 
+# The reported file without its final newline: the over long last line ends with the file, in the second buffer, and
+# is measured there too, as is a quoted last line in a file whose lines end in a carriage return and newline.
+
+statement error
+SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/third_line_long_no_final_newline.csv', 150);
+----
+<REGEX>:.*CSV Error on Line: 3.*Maximum line size of 100 bytes exceeded. Actual Size:132 bytes.*
+
+statement error
+SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/third_line_long_no_final_newline.csv', 150, serial := true);
+----
+<REGEX>:.*CSV Error on Line: 3.*Maximum line size of 100 bytes exceeded. Actual Size:132 bytes.*
+
+query II
+SELECT a, length(b) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/third_line_long_no_final_newline.csv', 150, rejects := true);
+----
+x	60
+
+query III
+SELECT line, error_type, length(csv_line) FROM reject_errors;
+----
+3	LINE SIZE OVER MAXIMUM	132
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+statement error
+SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_quoted_last_line_long_no_final_newline.csv', 150);
+----
+<REGEX>:.*CSV Error on Line: 12.*Maximum line size of 100 bytes exceeded. Actual Size:132 bytes.*
+
+statement error
+SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_quoted_last_line_long_no_final_newline.csv', 150, serial := true);
+----
+<REGEX>:.*CSV Error on Line: 12.*Maximum line size of 100 bytes exceeded. Actual Size:132 bytes.*
+
 # The default buffer size keeps raising the error.
 
 statement error
@@ -741,8 +780,159 @@ SELECT count(*), max(b) FILTER (a = 'r12') FROM read_csv('{DATA_DIR}/csv/long_li
 ----
 20	value
 
+# A quoted value before a comment whose carriage return, or newline, is the first byte of the next buffer is built from
+# its own bytes in the previous buffer, not from the row before it.
+
+query II
+SELECT a, b FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_quoted_value_before_comment_across_buffer.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'}) WHERE a = 'q';
+----
+q	value
+
+query II
+SELECT a, b FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_quoted_value_before_comment_across_buffer.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'}) WHERE a = 'q';
+----
+q	value
+
+query II
+SELECT a, b FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/quoted_value_before_comment_across_buffer.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'}) WHERE a = 'q';
+----
+q	value
+
+query II
+SELECT a, b FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/quoted_value_before_comment_across_buffer.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'}) WHERE a = 'q';
+----
+q	value
+
+# A line whose carriage return is the first byte of the next buffer counts as a line also when nothing of its last value
+# is in the next buffer (a comment after a value, a comment line, an empty last value), so the error two lines later is
+# on line 5.
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_comment_after_value_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+4
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_comment_after_value_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+4
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_comment_line_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+3
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_comment_line_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+3
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_last_value_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+4
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_last_value_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', store_rejects = true, parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+4
+
+query II
+SELECT line, error_type FROM reject_errors;
+----
+5	TOO MANY COLUMNS
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+statement error
+SELECT * FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_comment_after_value_then_error.csv', buffer_size = 150, max_line_size = 100,
+	comment = '#', auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+<REGEX>:.*CSV Error on Line: 5.*Expected Number of Columns: 2 Found: 3.*
+
 # Without strict mode, the scan of the boundary at byte 283 (the second buffer's start, inside record 17's quoted value
-# with escaped quotes) takes no start whose trial row carries a quote through the next buffer to the end of the file:
+# with escaped quotes) tries a start inside record 19 whose trial row carries a quote through the next buffer to the end
+# of the file. That row of 349 bytes is over max_line_size, so the start is refused as it is within one buffer, and
 # every record is read once.
 
 query II
@@ -772,6 +962,38 @@ SELECT count(*), string_agg(a, ' ' ORDER BY a::INTEGER) FROM read_csv('{DATA_DIR
 	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
 ----
 25	1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+
+# Without strict mode, a last row that ends the file inside an open quote is a row, also when a scan boundary starts in
+# the row before it: the row starts at byte 105, in the second buffer at buffer_size = 100 and in the boundary [100, 113)
+# of the only buffer at buffer_size = 120.
+
+query II
+SELECT count(*), max(a::INTEGER) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/not_strict_open_quote_last_row.csv',
+	buffer_size = 100, max_line_size = 100, strict_mode = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+18	18
+
+query II
+SELECT count(*), max(a::INTEGER) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/not_strict_open_quote_last_row.csv',
+	buffer_size = 100, max_line_size = 100, strict_mode = false, parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+18	18
+
+query II
+SELECT count(*), max(a::INTEGER) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/not_strict_open_quote_last_row.csv',
+	buffer_size = 120, max_line_size = 100, strict_mode = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+18	18
+
+query II
+SELECT count(*), max(a::INTEGER) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/not_strict_open_quote_last_row.csv',
+	buffer_size = 120, max_line_size = 100, strict_mode = false, parallel = false, auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+18	18
 
 # A single value of exactly max_line_size bytes that starts at the second buffer and fills it (after a 99 byte header,
 # with buffer_size equal to max_line_size) is joined from its start with the third buffer, so it is read whole.
@@ -1038,3 +1260,148 @@ SELECT a, length(b) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/valid_l
 x	88
 x	63
 x	1
+
+# Past its boundary a scan reads only the rest of its line, and an empty line is a line of its own. Rows up to the end of
+# the first 100 byte buffer, a buffer of nothing but newlines, then a newline and a last line of 100 bytes: the scan of
+# the first buffer stops at the first empty line, so the last line is read once, by the scan it starts in.
+
+query III
+SELECT count(*), count(DISTINCT a), max(length(b)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_fill_buffer.csv', buffer_size = 100,
+	auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+22	22	98
+
+query III
+SELECT count(*), count(DISTINCT a), max(length(b)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_fill_buffer.csv', buffer_size = 100, parallel = false,
+	auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+22	22	98
+
+query III
+SELECT count(*), count(DISTINCT a), max(length(b)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_fill_buffer.csv', buffer_size = 100, max_line_size = 100,
+	auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+22	22	98
+
+query III
+SELECT count(*), count(DISTINCT a), max(length(b)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_fill_buffer.csv', buffer_size = 100, max_line_size = 100, parallel = false,
+	auto_detect = false, header = true,
+	columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+22	22	98
+
+# Lines ending in a carriage return and newline, rows up to the end of the first 150 byte buffer, then three empty lines
+# at the start of the next: the scan of the first buffer reads the first of them and stops, and the newline of an empty
+# line is no part of the next value.
+
+query III
+SELECT count(*), count(DISTINCT a), string_agg(a, ' ' ORDER BY a) FILTER (a NOT SIMILAR TO '[0-9]+')
+FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_lines_at_buffer_start.csv', 150);
+----
+27	27	q r
+
+query III
+SELECT count(*), count(DISTINCT a), string_agg(a, ' ' ORDER BY a) FILTER (a NOT SIMILAR TO '[0-9]+')
+FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_lines_at_buffer_start.csv', 150, serial := true);
+----
+27	27	q r
+
+# 99 bytes of rows, then 120 empty lines of a carriage return and newline, so each 150 byte buffer ends between the
+# carriage return and the newline of one of them: the scan whose empty line ends at a buffer end reads only its newline,
+# and the next scan reads the rest of the run and the row after it.
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_lines_after_split_line_end.csv', 150);
+----
+20	20
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_lines_after_split_line_end.csv', 150, skip := true);
+----
+20	20
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/crlf_empty_lines_after_split_line_end.csv', 150, serial := true);
+----
+20	20
+
+# 98 bytes of rows, 120 empty lines from byte 98, then 17,zz and five rows: the scan whose boundary starts inside the
+# run does not read the row after the run, which starts in the next boundary.
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_across_boundary.csv', 150);
+----
+22	22
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_across_boundary.csv', 150, skip := true);
+----
+22	22
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_across_boundary.csv', 150, serial := true);
+----
+22	22
+
+# The same with 250 empty lines and a 203 byte line 268 after them: one reject, on that line, in both modes.
+
+statement error
+SELECT * FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_before_long_line.csv', 150);
+----
+<REGEX>:.*CSV Error on Line: 268.*Maximum line size of 100 bytes exceeded.*
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_before_long_line.csv', 150, rejects := true);
+----
+21	21
+
+query III
+SELECT line, error_type, length(csv_line) FROM reject_errors;
+----
+268	LINE SIZE OVER MAXIMUM	203
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query II
+SELECT count(*), count(DISTINCT a) FROM lines('{DATA_DIR}/csv/long_line_buffer_boundary/empty_lines_before_long_line.csv', 150, rejects := true, serial := true);
+----
+21	21
+
+query III
+SELECT line, error_type, length(csv_line) FROM reject_errors;
+----
+268	LINE SIZE OVER MAXIMUM	203
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+# A cast error on a line the scan stops at for its size (line 14, abc and 400 bytes, cut after the part read) is rejected
+# with that line's position and text, as its line size error is.
+
+query II
+SELECT count(a), count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/cast_error_on_long_line.csv', buffer_size = 150, max_line_size = 100,
+	store_rejects = true, auto_detect = false, header = true, columns = {'a': 'UUID', 'b': 'VARCHAR'});
+----
+0	17
+
+query IIII
+SELECT line, line_byte_position, error_type, left(csv_line, 4) FROM reject_errors ORDER BY error_type;
+----
+14	53	CAST	abc,
+14	53	LINE SIZE OVER MAXIMUM	abc,
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
