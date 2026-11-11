@@ -334,6 +334,22 @@ CREATE MACRO unpivot_expression_shadow_table(a) AS TABLE (UNPIVOT wide ON (a + 0
 ----
 Conflicting column names for column a!
 
+# a source column qualified with its table is not the parameter, so the macro runs
+statement ok
+CREATE MACRO unpivot_qualified_source_table(a) AS TABLE (UNPIVOT wide ON (wide.a + 0) AS x, b INTO NAME n VALUE val);
+
+query IR
+SELECT n, val FROM unpivot_qualified_source_table(100) ORDER BY n;
+----
+b	20
+x	10
+
+# a parameter named like no source column keeps the table's own message
+statement error
+CREATE MACRO unpivot_unknown_parameter_table(p) AS TABLE (UNPIVOT wide ON (p + 0) AS x, b INTO NAME n VALUE val);
+----
+Column "p" referenced in UNPIVOT but no matching entry was found in the table
+
 # the column count check of an UNPIVOT still reads a parameter in an expression entry as a second source column at
 # CREATE, where a prepared parameter passes
 statement error
