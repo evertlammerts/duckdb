@@ -253,7 +253,7 @@ q	a	q	a
 2	b	2	b
 NULL	NULL	NULL	NULL
 
-# a STRUCT to UNION cast whose selected member is a UNION and whose other member is NULL
+# a STRUCT to UNION cast whose selected member is an INTEGER and whose other member, a UNION, is NULL
 query II
 SELECT CAST({'tag': 1::UTINYINT, 'a': NULL::VARCHAR, 'b': 5} AS UNION(a UNION(i INTEGER, s VARCHAR), b INTEGER)) u,
        union_tag(u)
@@ -459,3 +459,67 @@ NULL
 
 statement ok
 RESET debug_verification_mode
+
+# every cast into a UNION gives a NULL union for a NULL input, which the function verifier checks
+statement ok
+SET debug_verification_mode = 'verify_functions'
+
+query II
+SELECT x::UNION(i INTEGER, s VARCHAR) u, union_tag(u) FROM (VALUES (1), (NULL)) t(x)
+----
+1	i
+NULL	NULL
+
+query II
+SELECT try_cast(x AS UNION(d DECIMAL(2,0), s VARCHAR)) u, union_tag(u) FROM (VALUES (100), (NULL)) t(x)
+----
+NULL	NULL
+NULL	NULL
+
+query II
+SELECT x::UNION(a BIGINT, b VARCHAR) u, union_tag(u)
+FROM (VALUES (union_value(a := 1)::UNION(a INTEGER, b VARCHAR)), (NULL)) t(x)
+----
+1	a
+NULL	NULL
+
+query II
+SELECT x::UNION(i INTEGER, s VARCHAR) u, union_tag(u)
+FROM (VALUES ({'tag': 0::UTINYINT, 'i': 1, 's': NULL::VARCHAR}), (NULL)) t(x)
+----
+1	i
+NULL	NULL
+
+query I
+SELECT try_cast(x AS UNION(d DATE)) FROM (VALUES ([1]), (NULL)) t(x)
+----
+NULL
+NULL
+
+statement ok
+RESET debug_verification_mode
+
+# a cast into a UNION propagates NULLs, so the statistics of an all NULL row group prune it
+statement ok
+ATTACH '{TEST_DIR}/union_cast_null_pruning.db' AS rg (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE rg
+
+statement ok
+CREATE TABLE pruned AS
+SELECT CASE WHEN i < 2048 OR (i < 4096 AND i % 2 = 0) THEN NULL ELSE i::INTEGER END x FROM range(6144) t(i)
+
+foreach cast CAST TRY_CAST
+
+query I
+SELECT count(*) FROM pruned WHERE {cast}(x AS UNION(i INTEGER, s VARCHAR)) IS NOT NULL
+----
+3072
+
+query II
+EXPLAIN ANALYZE SELECT x FROM pruned WHERE {cast}(x AS UNION(i INTEGER, s VARCHAR)) IS NOT NULL
+----
+analyzed_plan	<REGEX>:.*Row Groups Scanned: 2 / 3.*
+
+endloop
