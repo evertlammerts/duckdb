@@ -440,8 +440,7 @@ static bool GroupByAliasNamesEntry(Binder &binder, const SelectBindState &bind_s
 	if (alias.empty()) {
 		return false;
 	}
-	// GROUP BY <alias> qualifies the name first, so a column, table or macro parameter of that name wins; checked
-	// directly because qualifying an ambiguous name throws, and GROUP BY ALL never qualified it
+	// Looked up directly, not qualified as GROUP BY <alias> does, because qualifying an ambiguous name throws.
 	auto &bind_context = binder.bind_context;
 	ErrorData unused_error;
 	if (!bind_context.GetMatchingBindings(alias).empty() ||

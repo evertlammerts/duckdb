@@ -457,6 +457,12 @@ def generate_member_hash(member, indent='\t'):
 
     if type_str == 'TypeExpression*':
         return [f'{indent}hash = CombineHash(hash, {field_name} ? {field_name}->Hash() : 0);']
+    if member.get('equals_by_spelling', False) and is_parsed_expression_list(type_str):
+        return [
+            f'{indent}for (auto &child : {field_name}) {{',
+            f'{indent}\thash = CombineHash(hash, child->GetAlias().Hash());',
+            f'{indent}}}',
+        ]
     # Covered by EnumerateChildren in ParsedExpression::Hash
     if is_parsed_expression_ptr(type_str):
         return []

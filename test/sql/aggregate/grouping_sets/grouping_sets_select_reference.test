@@ -610,3 +610,35 @@ statement error
 SELECT ({'a': s}).a AS v FROM t GROUP BY {'A': s};
 ----
 must appear in the GROUP BY clause
+
+# an UNPIVOT of another column is a different subquery, so a reference does not join its group
+statement ok
+CREATE TABLE w AS SELECT range AS id, range * 10 AS a, range * 100 AS b FROM range(1, 4);
+
+query II
+SELECT (SELECT sum(value) FROM (UNPIVOT (SELECT a, b FROM w) ON a)) AS c, count(*) FROM t GROUP BY (SELECT sum(value) FROM (UNPIVOT (SELECT a, b FROM w) ON b)), c;
+----
+60	3
+
+query I
+SELECT (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON a)) AS c GROUP BY (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON b)), c;
+----
+1
+
+query II
+SELECT (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON a)) AS c, GROUPING(c) AS g GROUP BY GROUPING SETS (((SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON b))), (c)) ORDER BY ALL;
+----
+1	0
+NULL	1
+
+query I
+SELECT (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON a)) AS c GROUP BY (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON b));
+----
+1
+
+# an equal UNPIVOT is still the entry's group
+query II
+SELECT (SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON a)) AS c, GROUPING(c) AS g GROUP BY GROUPING SETS (((SELECT value FROM (UNPIVOT (SELECT 1 AS a, 2 AS b) ON a))), (c)) ORDER BY ALL;
+----
+1	0
+1	0
