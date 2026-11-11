@@ -40,15 +40,23 @@ public:
 		return cast_candidates.find(type) != cast_candidates.end();
 	}
 
-	//! Whether the candidate, the format at format_index or the plain cast when it is invalid, reads input
-	bool CandidateReads(optional_idx format_index, const string_t &input, date_t &result,
+	//! The format at format_index, or nullptr for the plain cast when format_index is invalid
+	optional_ptr<const StrpTimeFormat> GetCandidate(LogicalTypeId type, optional_idx format_index) const {
+		if (!format_index.IsValid()) {
+			return nullptr;
+		}
+		return &GetFormats(type)[format_index.GetIndex()];
+	}
+
+	//! Whether the candidate of type, a format or the plain cast when format is nullptr, reads input
+	bool CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, date_t &result,
 	                    optional_ptr<string> error_message) const;
-	bool CandidateReads(optional_idx format_index, const string_t &input, timestamp_t &result,
+	bool CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, timestamp_t &result,
 	                    optional_ptr<string> error_message) const;
 
 private:
 	bool HasTwoDigitYear(LogicalTypeId type, const string_t &input) const;
-	bool FourDigitYearReads(LogicalTypeId type, optional_idx format_index, const string_t &input, int32_t year,
+	bool FourDigitYearReads(LogicalTypeId type, optional_ptr<const StrpTimeFormat> format, const string_t &input,
 	                        optional_ptr<string> error_message) const;
 
 public:

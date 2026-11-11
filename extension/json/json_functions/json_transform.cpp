@@ -412,7 +412,7 @@ static bool TransformGeometry(yyjson_val *vals[], Vector &result, const idx_t co
 
 template <class T>
 static bool TransformStringWithCandidate(const Vector &string_vector, const DateFormatMap &date_format_map,
-                                         const optional_idx format_index, const idx_t count, Vector &result,
+                                         optional_ptr<const StrpTimeFormat> format, const idx_t count, Vector &result,
                                          JSONTransformOptions &options, bool success) {
 	const auto source_strings = FlatVector::GetData<string_t>(string_vector);
 	const auto &source_validity = FlatVector::Validity(string_vector);
@@ -426,7 +426,7 @@ static bool TransformStringWithCandidate(const Vector &string_vector, const Date
 			continue;
 		}
 		const bool report = success && options.strict_cast;
-		if (!date_format_map.CandidateReads(format_index, source_strings[i], target_vals[i],
+		if (!date_format_map.CandidateReads(format, source_strings[i], target_vals[i],
 		                                    report ? &options.error_message : nullptr)) {
 			target_validity.SetInvalid(i);
 			if (report) {
@@ -453,17 +453,18 @@ static bool TransformFromStringWithFormat(yyjson_val *vals[], Vector &result, co
 	if (formats && (formats->cast || formats->format_index.IsValid())) {
 		format_index = formats->format_index;
 	} else {
-		// Without a detected candidate the type came from the user, whose format is the only one, or the column is a
-		// GeoJSON property under a Properties member in another case, which reads as NULL
+		// Without a detected candidate the type came from the user, whose format is the only one of its type
+		D_ASSERT(!date_format_map.CastIsCandidate(result_type_id));
 		format_index = date_format_map.GetFormats(result_type_id).size() - 1;
 	}
+	const auto format = date_format_map.GetCandidate(result_type_id, format_index);
 	switch (result_type_id) {
 	case LogicalTypeId::DATE:
-		success = TransformStringWithCandidate<date_t>(string_vector, date_format_map, format_index, count, result,
-		                                               options, success);
+		success = TransformStringWithCandidate<date_t>(string_vector, date_format_map, format, count, result, options,
+		                                               success);
 		break;
 	case LogicalTypeId::TIMESTAMP:
-		success = TransformStringWithCandidate<timestamp_t>(string_vector, date_format_map, format_index, count, result,
+		success = TransformStringWithCandidate<timestamp_t>(string_vector, date_format_map, format, count, result,
 		                                                    options, success);
 		break;
 	default:
@@ -673,6 +674,18 @@ static bool TransformObjectInternal(yyjson_val *objects[], yyjson_alc *alc, Vect
 	                                      error_unknown_key, formats);
 }
 
+//! A child transform reports the position of the failing element among all elements, the line needs its row
+static void SetErrorRowOfElement(JSONTransformOptions &options, const list_entry_t entries[],
+                                 const ValidityMask &validity, const idx_t count) {
+	for (idx_t i = 0; i < count; i++) {
+		if (validity.RowIsValid(i) && options.object_index >= entries[i].offset &&
+		    options.object_index < entries[i].offset + entries[i].length) {
+			options.object_index = i;
+			return;
+		}
+	}
+}
+
 static bool TransformArrayToList(yyjson_val *arrays[], yyjson_alc *alc, Vector &result, const idx_t count,
                                  JSONTransformOptions &options, optional_ptr<const JSONColumnFormats> formats) {
 	bool success = true;
@@ -726,22 +739,10 @@ static bool TransformArrayToList(yyjson_val *arrays[], yyjson_alc *alc, Vector &
 	}
 	D_ASSERT(list_i == offset);
 
-	if (!success) {
-		// Set object index in case of error in nested list so we can get accurate line number information
-		for (idx_t i = 0; i < count; i++) {
-			if (!list_validity.RowIsValid(i)) {
-				continue;
-			}
-			auto &entry = list_entries[i];
-			if (options.object_index >= entry.offset && options.object_index < entry.offset + entry.length) {
-				options.object_index = i;
-			}
-		}
-	}
-
 	// Transform array values
 	if (!JSONTransform::Transform(nested_vals, alc, ListVector::GetChildMutable(result), offset, options, nullptr,
 	                              JSONColumnFormats::GetChild(formats, 0))) {
+		SetErrorRowOfElement(options, list_entries, list_validity, count);
 		success = false;
 	}
 
@@ -872,22 +873,11 @@ static bool TransformArrayToArray(yyjson_val *arrays[], yyjson_alc *alc, Vector 
 		}
 	}
 
-	if (!success) {
-		// Set object index in case of error in nested array so we can get accurate line number information
-		for (idx_t i = 0; i < count; i++) {
-			if (!result_validity.RowIsValid(i)) {
-				continue;
-			}
-			auto offset = i * array_size;
-			if (options.object_index >= offset && options.object_index < offset + array_size) {
-				options.object_index = i;
-			}
-		}
-	}
-
 	// Transform array values
 	if (!JSONTransform::Transform(nested_vals, alc, ArrayVector::GetChildMutable(result), child_count, options, nullptr,
 	                              nullptr)) {
+		// Every row holds array_size elements, also a NULL row
+		options.object_index /= array_size;
 		success = false;
 	}
 
@@ -954,14 +944,13 @@ static bool TransformObjectToMap(yyjson_val *objects[], yyjson_alc *alc, Vector 
 	}
 	D_ASSERT(list_offset == list_size);
 
-	// Transform keys
-	if (!JSONTransform::Transform(keys, alc, MapVector::GetKeys(result), list_size, options, nullptr, nullptr)) {
-		success = false;
-	}
-
-	// Transform values
-	if (!JSONTransform::Transform(vals, alc, MapVector::GetValues(result), list_size, options, nullptr,
-	                              JSONColumnFormats::GetChild(formats, 0))) {
+	// Transform keys and values
+	const auto keys_read =
+	    JSONTransform::Transform(keys, alc, MapVector::GetKeys(result), list_size, options, nullptr, nullptr);
+	const auto values_read = JSONTransform::Transform(vals, alc, MapVector::GetValues(result), list_size, options,
+	                                                  nullptr, JSONColumnFormats::GetChild(formats, 0));
+	if (!keys_read || !values_read) {
+		SetErrorRowOfElement(options, list_entries, list_validity, count);
 		success = false;
 	}
 

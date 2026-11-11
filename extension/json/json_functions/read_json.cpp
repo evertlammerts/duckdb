@@ -308,12 +308,21 @@ void JSONScan::StructureToColumns(ClientContext &context, JSONReaderOptions &opt
 	if (options.record_type == JSONRecordType::FEATURES) {
 		if (names.empty()) {
 			UnnestGeoJSONFeature(type, options.ignore_errors, return_types, names, feature_columns);
-			const auto properties = node.GetField("properties");
+			// The Feature's members were matched in any case, so their nodes are found under the sample's spelling
+			const auto feature_member = [&](const string &member) -> optional_ptr<const JSONStructureNode> {
+				for (const auto &child : StructType::GetChildTypes(type)) {
+					if (child.first == member) {
+						return node.GetField(child.first.GetIdentifierName());
+					}
+				}
+				return nullptr;
+			};
+			const auto properties = feature_member("properties");
 			for (idx_t col_idx = 0; col_idx < feature_columns.size(); col_idx++) {
 				const auto &feature_column = feature_columns[col_idx];
 				optional_ptr<const JSONStructureNode> field;
 				if (!feature_column.from_properties) {
-					field = node.GetField(feature_column.key);
+					field = feature_member(feature_column.key);
 				} else if (properties) {
 					field = properties->GetField(feature_column.key);
 				}

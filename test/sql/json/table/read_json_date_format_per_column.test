@@ -154,6 +154,34 @@ select typeof(d), d from read_json(['{TEMP_DIR}/multi_1.json', '{TEMP_DIR}/multi
 DATE	2024-01-02
 DATE	2024-12-31
 
+# Two sampled files whose values share no candidate: the column stays text
+statement ok
+copy (select * from (values ('{"d":"13-02-2024"}'))) to '{TEMP_DIR}/no_common_1.json' (format csv, quote '', header 0)
+
+statement ok
+copy (select * from (values ('{"d":"12-31-2024"}'))) to '{TEMP_DIR}/no_common_2.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json(['{TEMP_DIR}/no_common_1.json', '{TEMP_DIR}/no_common_2.json']) order by d
+----
+VARCHAR	12-31-2024
+VARCHAR	13-02-2024
+
+query II
+select typeof(d), d from read_json(['{TEMP_DIR}/no_common_1.json', '{TEMP_DIR}/no_common_2.json'], union_by_name=true) order by d
+----
+VARCHAR	12-31-2024
+VARCHAR	13-02-2024
+
+# Map values under different keys that share no candidate: the values stay text
+statement ok
+copy (select * from (values ('{"id":1,"m":{"a":"13-02-2024","b":"12-31-2024"}}'))) to '{TEMP_DIR}/map_no_common.json' (format csv, quote '', header 0)
+
+query II
+select typeof(m), m from read_json('{TEMP_DIR}/map_no_common.json', map_inference_threshold=1)
+----
+MAP(VARCHAR, VARCHAR)	{a=13-02-2024, b=12-31-2024}
+
 # A value beyond the sample is read under the column's format too
 statement ok
 copy (select * from (values ('{"d":"12-31-2024"}'), ('{"d":"01-02-2024"}'), ('{"d":"03-04-2024"}'))) to '{TEMP_DIR}/beyond_sample_fits.json' (format csv, quote '', header 0)
@@ -236,14 +264,16 @@ select typeof(d), d from read_json('{TEMP_DIR}/features.geojsonl')
 DATE	2024-01-02
 DATE	2024-12-31
 
-# A GeoJSON Feature whose properties member is spelled in another case binds
+# A GeoJSON Feature whose properties member is spelled in another case binds, with the property detected
 statement ok
 copy (select * from (values
 	('{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"Properties":{"d":"01-02-2024"}}')
 )) to '{TEMP_DIR}/features_case.geojsonl' (format csv, quote '', header 0)
 
-statement ok
-select * from read_json('{TEMP_DIR}/features_case.geojsonl')
+query I
+select typeof(d) from read_json('{TEMP_DIR}/features_case.geojsonl')
+----
+DATE
 
 # Projections that skip columns and fields still find each column's format
 query I
@@ -319,6 +349,17 @@ query II
 select typeof(d), d from read_json('{TEMP_DIR}/two_digit_year.json')
 ----
 DATE	1996-03-27
+
+# The special values are read alike by the plain cast and by every format
+statement ok
+copy (select * from (values ('{"d":"infinity"}'), ('{"d":"epoch"}'), ('{"d":"-infinity"}'))) to '{TEMP_DIR}/special_values.json' (format csv, quote '', header 0)
+
+query II
+select typeof(d), d from read_json('{TEMP_DIR}/special_values.json')
+----
+DATE	infinity
+DATE	1970-01-01
+DATE	-infinity
 
 # ISO dates with and without a time of day are read by the plain timestamp cast
 statement ok
@@ -489,6 +530,40 @@ statement error
 select d from read_json('{TEMP_DIR}/two_misfits_after_sample.json', sample_size=2)
 ----
 <REGEX>:.*in line 3: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+# A misfit inside a list, a map or an array is reported at the line of the row that holds it
+statement ok
+copy (select * from (values ('{"d":["13-02-2024","14-02-2024"]}'), ('{"d":["01-03-2024","12-31-2024"]}'))) to '{TEMP_DIR}/list_misfit.json' (format csv, quote '', header 0)
+
+statement error
+select d from read_json('{TEMP_DIR}/list_misfit.json', sample_size=1)
+----
+<REGEX>:.*in line 2: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+statement ok
+copy (select * from (values ('{"id":1,"m":{"a":"13-02-2024","b":"14-02-2024"}}'), ('{"id":2,"m":{"a":"01-03-2024","b":"12-31-2024"}}'))) to '{TEMP_DIR}/map_misfit.json' (format csv, quote '', header 0)
+
+statement error
+select m from read_json('{TEMP_DIR}/map_misfit.json', sample_size=1, map_inference_threshold=1)
+----
+<REGEX>:.*in line 2: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+statement ok
+copy (select * from (values ('{"l":["13-02-2024","14-02-2024"]}'), ('{"l":["01-03-2024","12-31-2024"]}'))) to '{TEMP_DIR}/array_misfit.json' (format csv, quote '', header 0)
+
+statement error
+select l from read_json('{TEMP_DIR}/array_misfit.json', columns={l: 'DATE[2]'}, dateformat='%d-%m-%Y')
+----
+<REGEX>:.*in line 2: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+# A row that holds no list is reported at its own line
+statement ok
+copy (select * from (values ('{"l":[1,2,3]}'), ('{"l":5}'))) to '{TEMP_DIR}/list_not_array.json' (format csv, quote '', header 0)
+
+statement error
+select l from read_json('{TEMP_DIR}/list_not_array.json', columns={l: 'INTEGER[]'})
+----
+<REGEX>:.*in line 2: Expected ARRAY, but got UBIGINT: 5.*
 
 # A two digit year is not read by a four digit year format or the plain cast, so mixed widths are text
 statement ok

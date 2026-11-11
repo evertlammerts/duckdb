@@ -417,21 +417,17 @@ static idx_t CastYearDigits(const string_t &input) {
 	return digits;
 }
 
-bool DateFormatMap::FourDigitYearReads(const LogicalTypeId type, const optional_idx format_index, const string_t &input,
-                                       const int32_t year, optional_ptr<string> error_message) const {
-	// The cast and %Y read a two digit year as one of the first century
-	if (year >= 100) {
-		return true;
-	}
-	if (format_index.IsValid()) {
-		const auto &format = GetFormats(type)[format_index.GetIndex()];
-		if (!format.HasFormatSpecifier(StrTimeSpecifier::YEAR_DECIMAL) || !HasTwoDigitYear(type, input)) {
+//! Only for a value before the year 100, which is also what the cast and %Y read from a two digit year
+bool DateFormatMap::FourDigitYearReads(const LogicalTypeId type, optional_ptr<const StrpTimeFormat> format,
+                                       const string_t &input, optional_ptr<string> error_message) const {
+	if (format) {
+		if (!format->HasFormatSpecifier(StrTimeSpecifier::YEAR_DECIMAL) || !HasTwoDigitYear(type, input)) {
 			return true;
 		}
 		if (error_message) {
 			*error_message =
 			    StringUtil::Format("\"%s\" has a two digit year, which format specifier \"%s\" does not read",
-			                       input.GetString(), format.format_specifier);
+			                       input.GetString(), format->format_specifier);
 		}
 		return false;
 	}
@@ -445,12 +441,11 @@ bool DateFormatMap::FourDigitYearReads(const LogicalTypeId type, const optional_
 	return false;
 }
 
-bool DateFormatMap::CandidateReads(const optional_idx format_index, const string_t &input, date_t &result,
+bool DateFormatMap::CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input, date_t &result,
                                    optional_ptr<string> error_message) const {
-	if (format_index.IsValid()) {
-		const auto &format = GetFormats(LogicalTypeId::DATE)[format_index.GetIndex()];
-		if (error_message ? !format.TryParseDate(input, result, *error_message)
-		                  : !format.TryParseDate(input.GetData(), input.GetSize(), result)) {
+	if (format) {
+		if (error_message ? !format->TryParseDate(input, result, *error_message)
+		                  : !format->TryParseDate(input.GetData(), input.GetSize(), result)) {
 			return false;
 		}
 	} else if (!TryCast::Operation<string_t, date_t>(input, result, true)) {
@@ -459,16 +454,16 @@ bool DateFormatMap::CandidateReads(const optional_idx format_index, const string
 		}
 		return false;
 	}
-	return !result.IsFinite() ||
-	       FourDigitYearReads(LogicalTypeId::DATE, format_index, input, Date::ExtractYear(result), error_message);
+	static const auto first_day_of_year_100 = Date::FromDate(100, 1, 1);
+	return result >= first_day_of_year_100 || !result.IsFinite() ||
+	       FourDigitYearReads(LogicalTypeId::DATE, format, input, error_message);
 }
 
-bool DateFormatMap::CandidateReads(const optional_idx format_index, const string_t &input, timestamp_t &result,
-                                   optional_ptr<string> error_message) const {
-	if (format_index.IsValid()) {
-		const auto &format = GetFormats(LogicalTypeId::TIMESTAMP)[format_index.GetIndex()];
-		if (error_message ? !format.TryParseTimestamp(input, result, *error_message)
-		                  : !format.TryParseTimestamp(input.GetData(), input.GetSize(), result)) {
+bool DateFormatMap::CandidateReads(optional_ptr<const StrpTimeFormat> format, const string_t &input,
+                                   timestamp_t &result, optional_ptr<string> error_message) const {
+	if (format) {
+		if (error_message ? !format->TryParseTimestamp(input, result, *error_message)
+		                  : !format->TryParseTimestamp(input.GetData(), input.GetSize(), result)) {
 			return false;
 		}
 	} else {
@@ -490,8 +485,9 @@ bool DateFormatMap::CandidateReads(const optional_idx format_index, const string
 			return false;
 		}
 	}
-	return !result.IsFinite() || FourDigitYearReads(LogicalTypeId::TIMESTAMP, format_index, input,
-	                                                Date::ExtractYear(Timestamp::GetDate(result)), error_message);
+	static const auto first_instant_of_year_100 = Timestamp::FromDatetime(Date::FromDate(100, 1, 1), dtime_t(0));
+	return result >= first_instant_of_year_100 || !result.IsFinite() ||
+	       FourDigitYearReads(LogicalTypeId::TIMESTAMP, format, input, error_message);
 }
 
 void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &string_vector,
@@ -557,13 +553,13 @@ void JSONStructureNode::EliminateCandidateTypes(const idx_t vec_count, Vector &s
 }
 
 template <class T>
-static bool ReadsEveryValue(const DateFormatMap &formats, const optional_idx format_index, const Vector &string_vector,
-                            const idx_t count) {
+static bool ReadsEveryValue(const DateFormatMap &formats, optional_ptr<const StrpTimeFormat> format,
+                            const Vector &string_vector, const idx_t count) {
 	const auto strings = FlatVector::GetData<string_t>(string_vector);
 	const auto &validity = FlatVector::Validity(string_vector);
 	T result;
 	for (idx_t i = 0; i < count; i++) {
-		if (validity.RowIsValid(i) && !formats.CandidateReads(format_index, strings[i], result, nullptr)) {
+		if (validity.RowIsValid(i) && !formats.CandidateReads(format, strings[i], result, nullptr)) {
 			return false;
 		}
 	}
@@ -572,11 +568,12 @@ static bool ReadsEveryValue(const DateFormatMap &formats, const optional_idx for
 
 static bool ReadsEveryValue(const DateFormatMap &formats, const LogicalTypeId type, const optional_idx format_index,
                             const Vector &string_vector, const idx_t count) {
+	const auto format = formats.GetCandidate(type, format_index);
 	switch (type) {
 	case LogicalTypeId::DATE:
-		return ReadsEveryValue<date_t>(formats, format_index, string_vector, count);
+		return ReadsEveryValue<date_t>(formats, format, string_vector, count);
 	case LogicalTypeId::TIMESTAMP:
-		return ReadsEveryValue<timestamp_t>(formats, format_index, string_vector, count);
+		return ReadsEveryValue<timestamp_t>(formats, format, string_vector, count);
 	default:
 		throw InternalException("No date/timestamp formats for %s", EnumUtil::ToString(type));
 	}
@@ -1068,7 +1065,7 @@ JSONColumnFormats JSONStructure::StructureToFormats(const JSONStructureNode &nod
 		    desc.candidate_types.back() != type.id()) {
 			break;
 		}
-		// A format is chosen only where the plain cast failed on a sampled value, the last of them preferred
+		// The cast and a format both read only the special values, and alike, so their order changes no value
 		const auto entry = desc.format_candidates.find(type.id());
 		if (entry != desc.format_candidates.end()) {
 			if (entry->second.cast) {
