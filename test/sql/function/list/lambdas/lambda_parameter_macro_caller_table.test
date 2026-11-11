@@ -325,7 +325,7 @@ SELECT nested_beside() FROM x;
 ----
 [[2], [3]]
 
-# an argument that names the caller's table x is captured first; the caller scope still asks, so x.d reads the parameter
+# an argument that names the caller's table x is captured first; at the top of the body no body table is in scope, so x.d reads the parameter
 
 statement ok
 CREATE MACRO arg_first(a) AS list_transform([{'d': 1}], lambda x: a + x.d) || (SELECT [0] FROM (SELECT 1) x);
