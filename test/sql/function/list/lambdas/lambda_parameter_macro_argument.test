@@ -149,7 +149,7 @@ SELECT 100 AS x, unused_parameter(x, 1000);
 ----
 100	[101]
 
-# the new name cannot be the name of a table in scope
+# a table named like the parameter with a counter suffix does not capture the renamed reference
 
 statement ok
 CREATE TABLE x_1 AS SELECT 50 AS d;
@@ -621,6 +621,24 @@ query I
 SELECT column_name FROM (DESCRIBE SELECT * FROM (SELECT 5 AS x) t9, qualified_in_table_macro(x)) WHERE column_name LIKE 'list%';
 ----
 list_transform(list_value(1), (lambda x: (x + t2.s)))
+
+# a dotted reference that a table of the body provides is that table's column, not a field of the renamed parameter
+
+statement ok
+CREATE MACRO body_table_lambda(a) AS TABLE SELECT list_transform([1], lambda x: x.v + a) AS r FROM (VALUES (50, 7)) AS x(v, z);
+
+query I
+SELECT r FROM (VALUES (7)) AS x(z), body_table_lambda(x.z);
+----
+[57]
+
+statement ok
+CREATE MACRO body_subquery_lambda(a) AS (SELECT list_transform([1], lambda x: x.v + a) FROM (VALUES (50, 7)) AS x(v, z));
+
+query I
+SELECT body_subquery_lambda(x.z) FROM (VALUES (7)) AS x(z);
+----
+[57]
 
 # the window form, whose OVER clause the caller writes
 

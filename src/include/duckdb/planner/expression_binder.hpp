@@ -251,7 +251,8 @@ public:
 	                                                     Binder &binder, DummyBinding &macro_binding,
 	                                                     optional_ptr<Binder> dummy_binder,
 	                                                     optional_ptr<ParsedExpression> window_aggregate = nullptr,
-	                                                     optional_ptr<ParsedExpression> caller_window = nullptr);
+	                                                     optional_ptr<ParsedExpression> caller_window = nullptr,
+	                                                     optional_ptr<QueryNode> body_node = nullptr);
 
 	static LogicalType GetExpressionReturnType(const Expression &expr);
 

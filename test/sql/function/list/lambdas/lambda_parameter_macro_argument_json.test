@@ -74,8 +74,64 @@ SELECT '{"k":5}'::JSON AS x, json_in_call(x -> '$.k');
 ----
 {"k":5}	[5]
 
+# an arrow passed to a macro is the JSON operator, as the binder reads it
+
+statement ok
+CREATE MACRO txt(s) AS concat(s, '');
+
+statement ok
+CREATE MACRO json_at_macro(p_arg) AS TABLE SELECT txt(b -> p_arg) AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at_macro(b.p);
+----
+5
+
+statement ok
+CREATE MACRO keep_json(j) AS j;
+
+statement ok
+CREATE MACRO json_at_keep(p_arg) AS TABLE SELECT keep_json(b -> p_arg)::VARCHAR AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at_keep(b.p);
+----
+5
+
+statement ok
+CREATE MACRO inner_table(v) AS TABLE SELECT concat(v, '') AS r;
+
+statement ok
+CREATE MACRO outer_table(p_arg) AS TABLE SELECT r FROM docs AS b, inner_table(b -> p_arg);
+
+query III
+SELECT * FROM docs AS b, outer_table(b.p);
+----
+{"k":5}	$.k	5
+
+statement ok
+CREATE MACRO capture_b(a) AS list_transform([1], lambda b: a);
+
+query I
+SELECT capture_b(txt(b -> '$.k')) FROM docs;
+----
+[5]
+
 statement ok
 SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+query I
+SELECT r FROM docs AS b, json_at_macro(b.p);
+----
+5
+
+statement ok
+CREATE MACRO nested_arrow(a) AS list_transform([1], lambda x: list_concat(list_transform([2], x -> x), [a]));
+
+query II
+SELECT 100 AS x, nested_arrow(x);
+----
+100	[[2, 100]]
 
 statement ok
 CREATE MACRO dot_call_arrow(a, l) AS l.list_transform(x -> a);
