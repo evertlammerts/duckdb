@@ -270,10 +270,15 @@ copy (select * from (values
 	('{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"Properties":{"d":"01-02-2024"}}')
 )) to '{TEMP_DIR}/features_case.geojsonl' (format csv, quote '', header 0)
 
+# The detected type comes from the member spelled as the sample has it; the read finds no properties member spelled in
+# another case, as before this change, so its value is not pinned here
 query I
 select typeof(d) from read_json('{TEMP_DIR}/features_case.geojsonl')
 ----
 DATE
+
+statement ok
+select d from read_json('{TEMP_DIR}/features_case.geojsonl')
 
 # Projections that skip columns and fields still find each column's format
 query I
@@ -555,6 +560,23 @@ statement error
 select l from read_json('{TEMP_DIR}/array_misfit.json', columns={l: 'DATE[2]'}, dateformat='%d-%m-%Y')
 ----
 <REGEX>:.*in line 2: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+# Rows that hold empty lists or maps before the misfit keep the misfit at its own line
+statement ok
+copy (select * from (values ('{"l":[]}'), ('{"l":[]}'), ('{"l":["12-31-2024"]}'), ('{"l":["13-02-2024"]}'), ('{"l":["14-02-2024"]}'))) to '{TEMP_DIR}/empty_lists_misfit.json' (format csv, quote '', header 0)
+
+statement error
+select l from read_json('{TEMP_DIR}/empty_lists_misfit.json', columns={l: 'DATE[]'}, dateformat='%d-%m-%Y')
+----
+<REGEX>:.*in line 3: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
+
+statement ok
+copy (select * from (values ('{"m":{}}'), ('{"m":{}}'), ('{"m":{"a":"12-31-2024"}}'), ('{"m":{"a":"13-02-2024"}}'), ('{"m":{"a":"14-02-2024"}}'))) to '{TEMP_DIR}/empty_maps_misfit.json' (format csv, quote '', header 0)
+
+statement error
+select m from read_json('{TEMP_DIR}/empty_maps_misfit.json', columns={m: 'MAP(VARCHAR, DATE)'}, dateformat='%d-%m-%Y')
+----
+<REGEX>:.*in line 3: Could not parse string "12-31-2024" according to format specifier "%d-%m-%Y".*
 
 # A row that holds no list is reported at its own line
 statement ok
