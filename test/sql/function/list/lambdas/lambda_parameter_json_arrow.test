@@ -536,5 +536,36 @@ SELECT * FROM tms_concat_rows('a');
 ----
 ab
 
+# the creation check no longer looks a FROM clause call up among scalar functions, so a table macro records no
+# dependency on a scalar macro of the same name as the table macro it calls
+
+statement ok
+SET enable_macro_dependencies = true;
+
+statement ok
+CREATE MACRO dep_f(x) AS x;
+
+statement ok
+CREATE MACRO dep_f(x) AS TABLE SELECT x AS v;
+
+statement ok
+CREATE MACRO dep_g(x) AS TABLE SELECT * FROM dep_f(x);
+
+statement ok
+DROP MACRO dep_f;
+
+query I
+SELECT * FROM dep_g(7);
+----
+7
+
+statement error
+DROP MACRO TABLE dep_f;
+----
+depends on
+
+statement ok
+RESET enable_macro_dependencies;
+
 statement ok
 RESET lambda_syntax;
