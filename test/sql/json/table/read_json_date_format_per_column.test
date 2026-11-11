@@ -271,7 +271,7 @@ copy (select * from (values
 )) to '{TEMP_DIR}/features_case.geojsonl' (format csv, quote '', header 0)
 
 # The detected type comes from the member spelled as the sample has it; the read finds no properties member spelled in
-# another case, as before this change, so its value is not pinned here
+# another case, which main does not either, so its value is not pinned here
 query I
 select typeof(d) from read_json('{TEMP_DIR}/features_case.geojsonl')
 ----
