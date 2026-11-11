@@ -21,6 +21,8 @@ namespace duckdb {
 struct DateTimestampSniffing {
 	bool initialized = false;
 	bool had_match = false;
+	//! Whether the list comes from earlier columns, which did not end as the type
+	bool inherited = false;
 	vector<StrpTimeFormat> format;
 };
 
@@ -186,7 +188,6 @@ private:
 	      "%d-%m-%y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%y-%m-%d %H:%M:%S"}},
 	};
 	unordered_map<idx_t, vector<LogicalType>> best_sql_types_candidates_per_column_idx;
-	map<LogicalTypeId, vector<StrpTimeFormat>> best_format_candidates;
 	unique_ptr<StringValueScanner> best_candidate;
 	vector<HeaderValue> best_header_row;
 	//! Variable used for sniffing date and timestamp

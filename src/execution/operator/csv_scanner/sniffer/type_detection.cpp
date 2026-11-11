@@ -349,16 +349,17 @@ static bool FormatReadsValue(const StrpTimeFormat &format, const string_t &value
 	return result.TryToTimestamp(timestamp);
 }
 
+//! A special value such as 'infinity' parses under every format, so it tells no format apart
+static bool IsSpecialValue(const StrpTimeFormat &format, const string_t &value) {
+	StrpTimeFormat::ParseResult result;
+	return format.Parse(value, result, true) && result.is_special;
+}
+
 //! Returns whether the list changed
 static bool NarrowFormatCandidates(DateTimestampSniffing &format_candidate, const string_t &value,
                                    const LogicalTypeId sql_type) {
 	auto &formats = format_candidate.format;
-	if (formats.empty()) {
-		return false;
-	}
-	// A special value such as 'infinity' parses under every format, so it tells no format apart
-	StrpTimeFormat::ParseResult special_check;
-	if (formats.back().Parse(value, special_check, true) && special_check.is_special) {
+	if (formats.empty() || IsSpecialValue(formats.back(), value)) {
 		return false;
 	}
 	const auto reads_value = [&](const StrpTimeFormat &format) {
@@ -380,6 +381,15 @@ static bool NarrowFormatCandidates(DateTimestampSniffing &format_candidate, cons
 	return formats.size() != old_size;
 }
 
+static bool NoFormatReadsValue(const vector<StrpTimeFormat> &formats, const string_t &value,
+                               const LogicalTypeId sql_type) {
+	if (formats.empty() || IsSpecialValue(formats.back(), value)) {
+		return false;
+	}
+	return std::none_of(formats.begin(), formats.end(),
+	                    [&](const StrpTimeFormat &format) { return FormatReadsValue(format, value, sql_type); });
+}
+
 bool ValidSeparator(const string &separator) {
 	// We use https://en.wikipedia.org/wiki/List_of_date_formats_by_country as reference
 	return separator == "-" || separator == "." || separator == "/" || separator == " ";
@@ -392,15 +402,17 @@ void CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const
 	const auto &value = values[row_idx].GetValue();
 	auto &format_candidate = format_candidates[sql_type.id()];
 	bool changed = false;
-	if (!format_candidate.initialized) {
-		// The templates take their separator from the first value that starts like a numeric date
-		string separator;
-		if (!StartsWithNumericDate(separator, value) || !ValidSeparator(separator)) {
-			return;
-		}
+	if (format_candidate.inherited && NoFormatReadsValue(format_candidate.format, value, sql_type.id())) {
+		// Columns that did not end as the type rank the formats for this column but cannot rule out its values
+		format_candidate = DateTimestampSniffing();
+		changed = true;
+	}
+	string separator;
+	// The templates take their separator from the first value that starts like a numeric date
+	if (!format_candidate.initialized && StartsWithNumericDate(separator, value) && ValidSeparator(separator)) {
 		InitializeDateAndTimeStampDetection(separator, sql_type);
 		changed = true;
-		// The plain cast read the earlier values of the column, and a format must read them too
+		// The earlier values of the column were read without these templates, and a format must read them too
 		for (idx_t earlier_row = first_row; earlier_row < row_idx; earlier_row++) {
 			const auto earlier_value = values[earlier_row];
 			if (earlier_value.IsValid()) {
@@ -428,10 +440,12 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 		auto &cur_vector = data_chunk.data[col_idx];
 		D_ASSERT(cur_vector.GetVectorType() == VectorType::FLAT_VECTOR);
 		D_ASSERT(cur_vector.GetType() == LogicalType::VARCHAR);
-		auto vector_data = FlatVector::GetData<string_t>(cur_vector);
-		auto null_mask = FlatVector::ValidityMutable(cur_vector);
 		auto &col_type_candidates = info_sql_types_candidates[col_idx];
 		const auto column_values = cur_vector.Values<string_t>();
+		for (const auto type : {LogicalTypeId::DATE, LogicalTypeId::TIMESTAMP}) {
+			auto &format_candidate = format_candidates[type];
+			format_candidate.inherited = format_candidate.had_match;
+		}
 		auto column_start_format_candidates = format_candidates;
 		auto column_start_date_formats = state_machine.dialect_options.date_format;
 		for (idx_t row_idx = start_idx_detection; row_idx < chunk_size; row_idx++) {
@@ -439,13 +453,13 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 			// and we validate utf-8 compatibility when creating the type
 			D_ASSERT(!col_type_candidates.empty());
 			auto cur_top_candidate = col_type_candidates.back();
+			const bool is_null = !column_values[row_idx].IsValid();
 			// try cast from string to sql_type
 			while (col_type_candidates.size() > 1) {
 				const auto &sql_type = col_type_candidates.back();
 				// If Value is not Null and the current investigated candidate is either a timestamp or a date
-				if (null_mask.RowIsValid(row_idx) &&
-				    ((col_type_candidates.back().id() == LogicalTypeId::TIMESTAMP && !has_type.timestamp) ||
-				     (col_type_candidates.back().id() == LogicalTypeId::DATE && !has_type.date))) {
+				if (!is_null && ((col_type_candidates.back().id() == LogicalTypeId::TIMESTAMP && !has_type.timestamp) ||
+				                 (col_type_candidates.back().id() == LogicalTypeId::DATE && !has_type.date))) {
 					DetectDateAndTimeStampFormats(state_machine, sql_type, column_values, start_idx_detection, row_idx);
 				}
 				// try cast from string to sql_type
@@ -453,8 +467,8 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 					// Nothing to convert it to
 					continue;
 				}
-				if (CanYouCastIt(buffer_manager->context, vector_data[row_idx], sql_type, state_machine.dialect_options,
-				                 !null_mask.RowIsValid(row_idx), state_machine.options.decimal_separator[0],
+				if (CanYouCastIt(buffer_manager->context, column_values.GetValueUnsafe(row_idx), sql_type,
+				                 state_machine.dialect_options, is_null, state_machine.options.decimal_separator[0],
 				                 state_machine.options.thousands_separator)) {
 					break;
 				}
@@ -568,9 +582,6 @@ void CSVSniffer::DetectTypes() {
 			min_varchar_cols = varchar_cols;
 			best_candidate_is_strict = !best_candidate->used_unstrictness;
 			best_sql_types_candidates_per_column_idx = info_sql_types_candidates;
-			for (auto &format_candidate : format_candidates) {
-				best_format_candidates[format_candidate.first] = format_candidate.second.format;
-			}
 			if (chunk_size > 0) {
 				single_row_file = chunk_size == 1;
 				for (idx_t col_idx = 0; col_idx < data_chunk.ColumnCount(); col_idx++) {
@@ -593,7 +604,7 @@ void CSVSniffer::DetectTypes() {
 		error_handler->Error(error, true);
 	}
 	// Assert that it's all good at this point.
-	D_ASSERT(best_candidate && !best_format_candidates.empty());
+	D_ASSERT(best_candidate);
 }
 
 } // namespace duckdb
