@@ -22,6 +22,12 @@
       ]
     },
     {
+      "reason": "The verifier turns a navigation offset into a parameter, and a parameter in the MATCH_RECOGNIZE input defers binding to EXECUTE, where the offset is refused for not being a constant",
+      "paths": [
+        "test/sql/match_recognize/test_match_recognize_navigation_offsets.test"
+      ]
+    },
+    {
       "reason": "Different error message",
       "paths": [
         "test/sql/cast/cast_error_location.test",

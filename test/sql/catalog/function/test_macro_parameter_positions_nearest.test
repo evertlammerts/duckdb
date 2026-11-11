@@ -1,0 +1,121 @@
+# name: test/sql/catalog/function/test_macro_parameter_positions_nearest.test
+# description: A macro parameter is substituted in the ranking expression of a NEAREST join
+# group: [function]
+
+statement ok
+CREATE MACRO rank_pick(c) AS (SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - c));
+
+query II
+SELECT rank_pick(100), rank_pick(0);
+----
+10	4
+
+query I
+SELECT rank_pick(NULL);
+----
+NULL
+
+# a caller column of the parameter's name does not capture the parameter
+query I
+SELECT rank_pick(100) FROM (SELECT 4::BIGINT AS c) s;
+----
+10
+
+query II
+SELECT c, rank_pick(c) FROM (VALUES (0::BIGINT), (100::BIGINT)) s(c) ORDER BY c;
+----
+0	4
+100	10
+
+query II
+SELECT b, rank_pick(b + 1) FROM (VALUES (0::BIGINT), (100::BIGINT)) s(b) ORDER BY b;
+----
+0	4
+100	10
+
+# the same parameter in ORDER BY is the control
+statement ok
+CREATE MACRO order_pick(c) AS (SELECT t.v FROM (VALUES (4::BIGINT), (10::BIGINT)) t(v) ORDER BY abs(t.v - c) LIMIT 1);
+
+query I
+SELECT order_pick(100) FROM (SELECT 4::BIGINT AS c) s;
+----
+10
+
+# a table macro with the same body
+statement ok
+CREATE MACRO rank_table(c) AS TABLE SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - c);
+
+query I
+FROM rank_table(100);
+----
+10
+
+# a prepared statement parameter in the same position
+statement ok
+PREPARE rank_prepared AS SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4::BIGINT), (10::BIGINT)) t(v) NEAREST 1 BY DISTANCE abs(t.v - $1::BIGINT);
+
+query I
+EXECUTE rank_prepared(100);
+----
+10
+
+# a table macro over base tables
+statement ok
+CREATE TABLE near_left(id INT, v INT);
+
+statement ok
+INSERT INTO near_left VALUES (1, 5), (2, 9);
+
+statement ok
+CREATE TABLE near_right(id INT, v INT);
+
+statement ok
+INSERT INTO near_right VALUES (1, 6), (2, 100);
+
+statement ok
+CREATE MACRO nearest_table(x) AS TABLE (SELECT near_left.id, near_right.id AS bid FROM near_left JOIN near_right NEAREST 1 BY DISTANCE abs(near_right.v - x));
+
+query II
+SELECT * FROM nearest_table(7) ORDER BY id;
+----
+1	1
+2	1
+
+query II
+SELECT * FROM nearest_table(90) ORDER BY id;
+----
+1	2
+2	2
+
+# a table macro parameter named like a source column takes precedence over the column, as in a select list
+statement ok
+CREATE MACRO shadow_nearest_table(v) AS TABLE SELECT t.v FROM (VALUES (0)) u(z) JOIN (VALUES (4), (10)) t(v) NEAREST 1 BY DISTANCE abs(t.v - v);
+
+query I
+FROM shadow_nearest_table(100);
+----
+10
+
+query I
+FROM shadow_nearest_table(0);
+----
+4
+
+# a parameter named like a column of the NEAREST join's left side takes precedence over it, as in the LATERAL join that
+# NEAREST is bound as
+statement ok
+CREATE MACRO nz_scalar(z) AS (SELECT max(t.v) FROM (VALUES (0), (100)) u(z) JOIN (VALUES (4), (10), (90)) t(v) NEAREST 1 BY DISTANCE abs(t.v - z));
+
+query II
+SELECT nz_scalar(5), nz_scalar(95);
+----
+4	90
+
+statement ok
+CREATE MACRO lateral_scalar(z) AS (SELECT max(t.v) FROM (VALUES (0), (100)) u(z), LATERAL (SELECT t.v FROM (VALUES (4), (10), (90)) t(v) ORDER BY abs(t.v - z) LIMIT 1) t);
+
+query II
+SELECT lateral_scalar(5), lateral_scalar(95);
+----
+4	90

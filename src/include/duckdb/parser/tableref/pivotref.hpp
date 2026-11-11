@@ -12,18 +12,29 @@
 #include "duckdb/parser/tableref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 struct PivotColumnEntry {
-	//! The set of values to match on (PIVOT only)
+	//! The folded values of the entry
 	vector<Value> values;
-	//! The expression (UNPIVOT only)
+	//! The entry as written, while it is not folded into values
 	unique_ptr<ParsedExpression> expr;
 	//! The alias of the pivot column entry
 	Identifier alias;
 
 	bool Equals(const PivotColumnEntry &other) const;
 	PivotColumnEntry Copy() const;
+
+	//! Whether an UNPIVOT entry expression is a list of source column names (unqualified columns, constants, or a row
+	//! of them) rather than an expression to unpivot; appends the names when it is
+	static bool TryExtractUnpivotColumnList(const ParsedExpression &expr, vector<Identifier> &column_names);
+	//! Calls the callback on each element of a PIVOT IN entry: the arguments of a row() at any depth, or else the
+	//! entry itself; a column reference element is a name, the rest are constant expressions
+	static void
+	EnumeratePivotInListElements(unique_ptr<ParsedExpression> &expr,
+	                             const std::function<void(unique_ptr<ParsedExpression> &element)> &callback);
 
 	void Serialize(Serializer &serializer) const;
 	static PivotColumnEntry Deserialize(Deserializer &source);
