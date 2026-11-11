@@ -231,10 +231,7 @@ bool StringValueResult::UnsetComment(StringValueResult &result, idx_t buffer_pos
 }
 
 void FullLinePosition::SanitizeError(string &value) {
-	std::vector<char> char_array(value.begin(), value.end());
-	char_array.push_back('\0'); // Null-terminate the character array
-	Utf8Proc::MakeValid(&char_array[0], char_array.size());
-	value = {char_array.begin(), char_array.end() - 1};
+	value.resize(Utf8Proc::ReplaceInvalid(&value[0], value.size()));
 }
 
 void StringValueResult::AddValueToVector(const char *value_ptr, idx_t size, bool allocate) {
@@ -810,8 +807,9 @@ bool LineError::HandleErrors(StringValueResult &result) {
 			}
 		} break;
 		case MAXIMUM_LINE_SIZE:
+			// The borked line leaves out the newline byte that starts the measured span.
 			csv_error = CSVError::LineSizeError(
-			    result.state_machine.options, lines_per_batch, borked_line,
+			    result.state_machine.options, lines_per_batch, borked_line, cur_error.current_line_size - first_nl,
 			    result.current_line_position.begin.GetGlobalPosition(result.requested_size, first_nl), result.path);
 			break;
 		case INVALID_STATE:
