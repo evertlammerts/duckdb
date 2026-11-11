@@ -125,7 +125,8 @@ EXECUTE w(1)
 ----
 Catalog type does not support time travel
 
-# binding stops at the parameter, so an error that needs the catalog also moves from PREPARE to EXECUTE
+# binding stops at the parameter before the table lookup, so a missing table passes PREPARE; no built in catalog
+# supports time travel, so EXECUTE reaches the time travel error first (the C++ test shows a catalog error at EXECUTE)
 statement ok
 PREPARE m AS SELECT * FROM missing AT (VERSION => $1::BIGINT)
 

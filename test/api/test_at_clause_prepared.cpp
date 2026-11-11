@@ -1,4 +1,6 @@
 #include "catch.hpp"
+
+#include <algorithm>
 #include "test_helpers.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
