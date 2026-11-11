@@ -189,8 +189,8 @@ endloop
 
 endloop
 
-# A row that a comment marker in the next buffer ends with too few columns is rejected with the byte after the marker
-# as its position, as the default buffer gives.
+# A row that a comment marker in the next buffer ends with too few columns is rejected at the position a row end at
+# the marker gives, as the default buffer does, with either line end.
 
 foreach nl final_newline no_final_newline
 
@@ -207,6 +207,24 @@ query IIIII
 SELECT line, line_byte_position, byte_position, error_type, csv_line FROM reject_errors;
 ----
 3	13	18	MISSING COLUMNS	x,123#c
+
+statement ok
+DROP TABLE reject_errors;
+
+statement ok
+DROP TABLE reject_scans;
+
+query I
+SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/missing_columns_comment_in_next_buffer_crlf_{nl}.csv',
+	comment = '#', buffer_size = 16, max_line_size = 16, store_rejects = true, parallel = (NOT {serial}),
+	auto_detect = false, header = false, columns = {'a': 'VARCHAR', 'b': 'VARCHAR', 'c': 'VARCHAR'});
+----
+2
+
+query IIIII
+SELECT line, line_byte_position, byte_position, error_type, csv_line FROM reject_errors;
+----
+3	14	21	MISSING COLUMNS	x,123#c
 
 statement ok
 DROP TABLE reject_errors;
