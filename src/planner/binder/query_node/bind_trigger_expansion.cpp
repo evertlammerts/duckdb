@@ -622,7 +622,17 @@ string Binder::RowScopeName(TriggerEventType event_type) {
 }
 
 void Binder::SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema) {
-	entry_retriever.SetSearchPath(GetSearchPath(trigger_schema.ParentCatalog(), trigger_schema.GetSchemaPath(), true));
+	auto &catalog = trigger_schema.ParentCatalog();
+	auto &catalog_name = catalog.GetName();
+	auto schema_path = trigger_schema.GetSchemaPath();
+	vector<CatalogSearchEntry> search_path;
+	search_path.push_back(CatalogSearchEntry::FromSchemaPath(catalog_name, schema_path));
+	auto default_schema = catalog.GetDefaultSchema();
+	if (default_schema && !default_schema->empty() && (schema_path.size() != 1 || schema_path[0] != *default_schema)) {
+		search_path.emplace_back(catalog_name, *default_schema);
+	}
+	search_path.emplace_back(catalog_name, INVALID_SCHEMA);
+	entry_retriever.SetSearchPath(std::move(search_path));
 }
 
 void Binder::PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema) {
