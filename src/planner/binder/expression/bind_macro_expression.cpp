@@ -158,7 +158,7 @@ static void CollectWrittenNames(ParsedExpression &expr, identifier_set_t &names)
 }
 
 static void CollectTableName(TableRef &ref, identifier_set_t &names) {
-	if (ref.type == TableReferenceType::BASE_TABLE) {
+	if (ref.type == TableReferenceType::BASE_TABLE && ref.alias.empty()) {
 		auto &path = ref.Cast<BaseTableRef>().GetQualifiedName().Path();
 		names.insert(path.begin(), path.end());
 	}
@@ -183,21 +183,26 @@ static void CollectTableNames(ParsedExpression &expr, identifier_set_t &names) {
 	                                            [&](ParsedExpression &child) { CollectTableNames(child, names); });
 }
 
-// The qualifier reads the receiver of x.v.f() as the qualified reference x.v.
-static bool HasQualifiedReference(const ParsedExpression &expr, const Identifier &name) {
+// The qualifier resolves the receiver of a dot call x.f() or x.v.f() against the tables before lambda parameters.
+static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &column_ref = expr.Cast<ColumnRefExpression>();
 		return column_ref.IsQualified() && column_ref.ColumnNames()[0] == name;
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &path = expr.Cast<FunctionExpression>().GetQualifiedName().Path();
-		if (path.size() >= 3 && path[0] == name) {
+		if (path.size() >= 2 && path[0] == name) {
 			return true;
 		}
 	}
 	bool found = false;
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](const ParsedExpression &child) { found = found || HasQualifiedReference(child, name); });
+	auto visit = [&](unique_ptr<ParsedExpression> &child) {
+		found = found || HasQualifiedReference(*child, name);
+	};
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(*expr.Cast<SubqueryExpression>().Subquery()->node, visit);
+	}
+	ParsedExpressionIterator::EnumerateChildren(expr, visit);
 	return found;
 }
 
@@ -209,6 +214,8 @@ struct LambdaScope {
 	reference<LambdaExpression> lambda_expr;
 	vector<reference<ColumnRefExpression>> parameters;
 	identifier_set_t captured;
+	//! Whether the lambda lies in a query of the body, where a table of the body can be in scope
+	bool in_body_query = false;
 };
 
 using lambda_callback_t = std::function<void(LambdaExpression &, vector<reference<ColumnRefExpression>> &)>;
@@ -248,6 +255,7 @@ public:
 			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
 				    scopes.emplace_back(lambda_expr);
 				    scopes.back().parameters = std::move(parameters);
+				    scopes.back().in_body_query = !body_is_qualified;
 				    Rename(lambda_expr.RightMutable());
 				    RenameCaptured(scopes.back());
 				    scopes.pop_back();
@@ -604,7 +612,8 @@ private:
 
 	// x.v may name a body table x by scopes and columns unknown here, so such an x keeps its name.
 	bool ReadsBodyTable(LambdaScope &scope, const Identifier &name) {
-		return BodyTableNames().count(name) && HasQualifiedReference(*scope.lambda_expr.get().RightMutable(), name);
+		return scope.in_body_query && BodyTableNames().count(name) &&
+		       HasQualifiedReference(*scope.lambda_expr.get().RightMutable(), name);
 	}
 
 	void RenameCaptured(LambdaScope &scope) {
