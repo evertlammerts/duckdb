@@ -267,6 +267,12 @@
       ]
     },
     {
+      "reason": "Creates a nested schema and triggers, which require storage version v2.0.0.",
+      "paths": [
+        "test/sql/generated_columns/virtual/search_path.test"
+      ]
+    },
+    {
       "reason": "MATCH_RECOGNIZE is a new table reference type that older versions cannot deserialize.",
       "paths": [
         "test/sql/match_recognize/test_match_recognize_composition.test"
