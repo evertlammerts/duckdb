@@ -289,16 +289,18 @@ TEST_CASE("A stored union with duplicate member names keeps reading", "[arrow]")
 	        "1\tUNION(a INTEGER, a INTEGER)\tfalse\n2\tUNION(a INTEGER, a INTEGER)\tfalse\n"
 	        "3\tUNION(a INTEGER, a INTEGER)\ttrue\n4\tUNION(a INTEGER, a INTEGER)\ttrue\n"
 	        "5\tUNION(a INTEGER, a INTEGER)\tfalse\n");
-	// Row 1 is left out: the cast still maps both members to the first one named a (E173's cast defect is not fixed by
-	// the check), and a wrong rendering is not pinned.
-	REQUIRE_NO_FAIL(con.Query("SELECT u::VARCHAR FROM t"));
-	REQUIRE(Rows(con, "SELECT id, u::VARCHAR FROM t WHERE id > 1 ORDER BY id") == "2\t11\n3\tNULL\n4\tNULL\n5\t11\n");
+	REQUIRE(Rows(con, "SELECT id, u::VARCHAR FROM t ORDER BY id") == "1\t0\n2\t11\n3\tNULL\n4\tNULL\n5\t11\n");
 	REQUIRE(Rows(con, "SELECT l.id, r.id FROM t l JOIN t r ON l.u = r.u ORDER BY l.id, r.id") ==
 	        "1\t1\n2\t2\n2\t5\n5\t2\n5\t5\n");
 	REQUIRE(Rows(con, "SELECT id FROM t ORDER BY array_value(u) NULLS LAST, id") == "1\n2\n5\n3\n4\n");
 	REQUIRE(Rows(con, "SELECT count(DISTINCT array_value(u)) FROM t") == "3\n");
 	REQUIRE(Rows(con, "SELECT DISTINCT typeof(u) FROM (SELECT u FROM t UNION ALL SELECT union_value(b := NULL))") ==
 	        "UNION(a INTEGER, a INTEGER, b \"NULL\")\n");
+	REQUIRE_NO_FAIL(con.Query("SET legacy_disable_null_type = true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t3 AS SELECT u FROM t UNION ALL SELECT union_value(b := NULL)"));
+	REQUIRE(Rows(con, "SELECT typeof(u), count(*) FROM t3 GROUP BY ALL") ==
+	        "UNION(a INTEGER, a INTEGER, b INTEGER)\t6\n");
+	REQUIRE_NO_FAIL(con.Query("RESET legacy_disable_null_type"));
 	if (db.ExtensionIsLoaded("json")) {
 		REQUIRE(Rows(con, "SELECT to_json(u) FROM t ORDER BY id") == "{\"a\":0}\n{\"a\":11}\nNULL\nNULL\n{\"a\":11}\n");
 	}
