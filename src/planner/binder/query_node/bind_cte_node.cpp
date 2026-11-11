@@ -178,7 +178,7 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 	// instead of eagerly binding the CTE here we add the CTE bind state to the list of CTE bindings
 	// the CTE is bound lazily - when referenced for the first time we perform the binding
 	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases);
-	result.cte_bind_state->is_trigger_body = statement.is_trigger_body;
+	result.cte_bind_state->is_trigger_body = global_binder_state->trigger_body_ctes.count(*statement.query_node) > 0;
 
 	result.child_binder = Binder::CreateBinder(context, this);
 

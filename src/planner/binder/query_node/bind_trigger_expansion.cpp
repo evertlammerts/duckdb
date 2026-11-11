@@ -341,7 +341,6 @@ static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<
 		trig_cte->query_node = trigger.trigger_action->Copy();
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		trig_cte->is_trigger_body = true;
 
 		// Scoped to this body so sibling triggers can't see the alias.
 		auto &body_map = trig_cte->query_node->cte_map.map;
@@ -388,7 +387,6 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 		trig_cte->query_node = before_triggers[i].get().trigger_action->Copy();
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		trig_cte->is_trigger_body = true;
 		outer->cte_map.map[body_cte_name] = std::move(trig_cte);
 	}
 
@@ -454,10 +452,20 @@ BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
 		global_binder_state->trigger_old_capture.insert(*capture_base);
 		global_binder_state->trigger_old_capture_cte_names[*capture_base] = old_capture_names;
 	}
+	vector<reference<QueryNode>> trigger_bodies;
+	for (auto &cte : outer->cte_map.map) {
+		if (cte.first != base_cte_name) {
+			trigger_bodies.push_back(*cte.second->query_node);
+			global_binder_state->trigger_body_ctes.insert(*cte.second->query_node);
+		}
+	}
 	auto chain = Bind(*outer);
 	if (capture_base) {
 		global_binder_state->trigger_old_capture.erase(*capture_base);
 		global_binder_state->trigger_old_capture_cte_names.erase(*capture_base);
+	}
+	for (auto &body : trigger_bodies) {
+		global_binder_state->trigger_body_ctes.erase(body);
 	}
 
 	if (!has_returning) {
