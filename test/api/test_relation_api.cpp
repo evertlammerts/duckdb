@@ -1095,12 +1095,29 @@ TEST_CASE("Test CSV relation with declared columns", "[relation_api]") {
 	REQUIRE_THROWS_WITH(con.ReadCSV(ints_file, duckdb::vector<string> {"v INTEGER", "V VARCHAR"}),
 	                    Catch::Matchers::Contains("already exists"));
 	REQUIRE_FAIL(con.Query("SELECT * FROM read_csv('" + ints_file + "', columns = {'v': 'INTEGER', 'V': 'VARCHAR'})"));
+
+	// as in the SQL form, a column definition contributes only its name and type
+	rel = con.ReadCSV(ints_file, duckdb::vector<string> {"v VARCHAR", "n INTEGER DEFAULT 3"});
+	REQUIRE(CHECK_COLUMN(*rel->Execute(), 1, {1, 2}));
+	RequireSameAsSQL(
+	    con, rel, "SELECT * FROM read_csv('" + ints_file + "', columns = {'v': 'VARCHAR', 'n': 'INTEGER DEFAULT 3'})");
+	rel = con.ReadCSV(ints_file, duckdb::vector<string> {"v VARCHAR", "n INTEGER AS (v + 1)"});
+	REQUIRE(CHECK_COLUMN(*rel->Execute(), 1, {1, 2}));
+	RequireSameAsSQL(
+	    con, rel, "SELECT * FROM read_csv('" + ints_file + "', columns = {'v': 'VARCHAR', 'n': 'INTEGER AS (v + 1)'})");
+	rel = con.ReadCSV(ints_file, duckdb::vector<string> {"v VARCHAR PRIMARY KEY", "n INTEGER CHECK (n > 5)"});
+	REQUIRE(CHECK_COLUMN(*rel->Execute(), 1, {1, 2}));
+	RequireSameAsSQL(con, rel,
+	                 "SELECT * FROM read_csv('" + ints_file +
+	                     "', columns = {'v': 'VARCHAR PRIMARY KEY', 'n': 'INTEGER CHECK (n > 5)'})");
+	auto null_file = TestCreatePath("declared_null.csv");
+	WriteTestFile(null_file, "1,\n2,3\n");
+	rel = con.ReadCSV(null_file, duckdb::vector<string> {"v INTEGER", "n INTEGER NOT NULL"});
+	REQUIRE(CHECK_COLUMN(*rel->Execute(), 1, {Value(), 3}));
+	RequireSameAsSQL(
+	    con, rel, "SELECT * FROM read_csv('" + null_file + "', columns = {'v': 'INTEGER', 'n': 'INTEGER NOT NULL'})");
 	REQUIRE_THROWS_WITH(con.ReadCSV(ints_file, duckdb::vector<string> {"v INTEGER", "n AS (v + 1)"}),
-	                    Catch::Matchers::Contains("takes only a name and a type"));
-	REQUIRE_THROWS_WITH(con.ReadCSV(ints_file, duckdb::vector<string> {"v INTEGER", "n INTEGER AS (v + 1)"}),
-	                    Catch::Matchers::Contains("takes only a name and a type"));
-	REQUIRE_THROWS_WITH(con.ReadCSV(ints_file, duckdb::vector<string> {"v VARCHAR", "n INTEGER DEFAULT 3"}),
-	                    Catch::Matchers::Contains("takes only a name and a type"));
+	                    Catch::Matchers::Contains("can not be converted to a DuckDB Type"));
 }
 
 TEST_CASE("Test CSV reading from weather.csv", "[relation_api]") {

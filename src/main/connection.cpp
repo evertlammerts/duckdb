@@ -308,9 +308,6 @@ shared_ptr<Relation> Connection::ReadCSV(const string &csv_file, const vector<st
 			throw ParserException("Expected a single column definition");
 		}
 		auto &col_def = col_list.GetColumnMutable(LogicalIndex(0));
-		if (col_def.Generated() || col_def.HasDefaultValue()) {
-			throw ParserException("A CSV column definition takes only a name and a type, not \"%s\"", column);
-		}
 		declared_columns.AddColumn(std::move(col_def));
 	}
 	child_list_t<Value> column_list;
