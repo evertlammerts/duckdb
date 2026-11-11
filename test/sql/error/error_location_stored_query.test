@@ -259,6 +259,25 @@ SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, n
 LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, no_such_column')
                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+# a syntax error in the string given to query points at the call as well
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+CREATE VIEW v_query_syntax AS SELECT 1 AS a, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: CREATE VIEW v_query_syntax AS SELECT 1 AS a, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+LINE 1: SELECT 1 AS first_column, 2 AS second_column, * FROM query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 # a view bound for its columns alone has no reference to point at
 statement error
 SELECT 1 AS first_column, 2 AS second_column, * FROM pragma_table_info('v')
@@ -450,6 +469,11 @@ statement error
 SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query_table('missing_tbl')
 ----
 <REGEX>:.*"location":"\[53,29\]".*
+
+statement error
+SELECT 1 AS first_column, 2 AS second_column, * FROM tm_query('SELECT 1, 2, 3, 4, 5, 6 FROMM query_src')
+----
+<REGEX>:.*"location":"\[53,51\]".*
 
 statement error
 EXECUTE p
