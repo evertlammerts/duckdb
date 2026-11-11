@@ -1673,7 +1673,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		const auto &delimiter = result.state_machine.dialect_options.state_machine_options.delimiter.GetValue();
 		const idx_t extra_delimiter_bytes = states.IsDelimiter() && !delimiter.empty() ? delimiter.size() - 1 : 0;
 		bool removed_extra_delimiter_bytes = false;
-		if (result.quoted && !result.comment) {
+		if (result.quoted && !comment_before) {
 			idx_t length = over_buffer_string.size() - 1 - result.quoted_position;
 			while (length > 0 && result.ignore_empty_values &&
 			       over_buffer_string.c_str()[result.quoted_position + length] == ' ') {
@@ -1769,6 +1769,11 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 	}
 
+	if (result.IsCommentSet(result) && !comment_before) {
+		// a marker seen here is a position in over_buffer_string, which gave the value before it, so the value start
+		// UnsetComment compares it with is moved past it in that string
+		result.last_position.buffer_pos = result.position_before_comment + 1;
+	}
 	const bool file_ended =
 	    iterator.pos.buffer_pos >= cur_buffer_handle->actual_size && cur_buffer_handle->is_last_buffer;
 	if (states.NewRow() && !states.IsNotSet() && !states.EmptyLine()) {
@@ -1779,7 +1784,7 @@ void StringValueScanner::ProcessOverBufferValue() {
 		}
 		lines_read++;
 	} else if (file_ended && result.IsCommentSet(result)) {
-		// the value before the comment is in the previous buffer, which result.buffer_ptr is only here
+		// a comment from the previous buffer has its value there, which result.buffer_ptr is only here
 		result.UnsetComment(result, iterator.pos.buffer_pos);
 		lines_read++;
 	}

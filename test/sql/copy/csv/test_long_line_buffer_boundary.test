@@ -129,6 +129,51 @@ DROP TABLE reject_scans;
 
 endloop
 
+# A comment marker in the next buffer after a value that started in the buffer before ends the row with that value
+# once, with and without a final newline: a 80 byte value from byte 70 whose marker is the second 150 byte buffer's
+# first byte, a 13 byte value from byte 4 whose marker is byte 17 at buffer_size = 16, and a second value of 78 bytes
+# from byte 152 whose marker is byte 230 at buffer_size = 100, also quoted.
+
+foreach nl final_newline no_final_newline
+
+foreach serial true false
+
+foreach skip false true
+
+query II
+SELECT count(*), max(length(a)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/comment_in_next_buffer_after_long_value_{nl}.csv',
+	comment = '#', buffer_size = 150, max_line_size = 100, parallel = (NOT {serial}), ignore_errors = {skip},
+	auto_detect = false, header = true, columns = {'a': 'VARCHAR'});
+----
+20	80
+
+query II
+SELECT count(*), max(length(a)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/comment_in_next_buffer_small_buffer_{nl}.csv',
+	comment = '#', buffer_size = 16, max_line_size = 16, parallel = (NOT {serial}), ignore_errors = {skip},
+	auto_detect = false, header = false, columns = {'a': 'VARCHAR'});
+----
+2	13
+
+query III
+SELECT count(*), count(b), max(length(b)) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/comment_in_next_buffer_after_long_second_value_{nl}.csv',
+	comment = '#', buffer_size = 100, max_line_size = 100, parallel = (NOT {serial}), ignore_errors = {skip},
+	auto_detect = false, header = true, columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+32	32	78
+
+query III
+SELECT count(*), count(b), max(b) FILTER (a = 'x') FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/comment_in_next_buffer_after_quoted_second_value_{nl}.csv',
+	comment = '#', buffer_size = 100, max_line_size = 100, parallel = (NOT {serial}), ignore_errors = {skip},
+	auto_detect = false, header = true, columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
+----
+32	32	bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+endloop
+
+endloop
+
+endloop
+
 # The default buffer size keeps raising the error.
 
 statement error
@@ -766,6 +811,8 @@ SELECT count(*), count(a), count(b) FROM read_csv('{DATA_DIR}/csv/long_line_buff
 	comment = '#', auto_detect = false, header = true, parallel = false, columns = {'a': 'VARCHAR', 'b': 'VARCHAR'});
 ----
 9	9	8
+
+# The 9 rows at buffer_size = 150 are main's answer at that size, kept as it was, not a rule of this reader.
 
 query I
 SELECT count(*) FROM read_csv('{DATA_DIR}/csv/long_line_buffer_boundary/spaces_after_delimiter_comment_across_buffer.csv', buffer_size = 150,
