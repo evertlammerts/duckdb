@@ -45,3 +45,58 @@ query I
 SELECT r FROM json_path_argument((SELECT '$.k' FROM (SELECT 1 AS b) WHERE b = 1));
 ----
 5
+
+# a JSON arrow in a function that takes no lambda declares nothing, so an argument naming its column renames nothing
+
+statement ok
+CREATE TABLE docs AS SELECT '{"k":5}'::JSON AS b, '$.k' AS p;
+
+statement ok
+CREATE MACRO json_at(p_arg) AS TABLE SELECT concat(b -> p_arg, '') AS r FROM docs AS b;
+
+query I
+SELECT r FROM docs AS b, json_at(b.p);
+----
+5
+
+# an arrow argument of a call is read as a lambda only where the function takes one
+
+statement ok
+CREATE MACRO json_in_call(a) AS list_transform([1], lambda x: concat(a, ''));
+
+query II
+SELECT '{"k":5}'::JSON AS x, json_in_call(concat(x -> '$.k', ''));
+----
+{"k":5}	[5]
+
+query II
+SELECT '{"k":5}'::JSON AS x, json_in_call(x -> '$.k');
+----
+{"k":5}	[5]
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement ok
+CREATE MACRO dot_call_arrow(a, l) AS l.list_transform(x -> a);
+
+query II
+SELECT 99 AS x, dot_call_arrow(x, [1]);
+----
+99	[99]
+
+statement ok
+CREATE MACRO invoke_arrow(a) AS list_transform([1], lambda x: invoke(y -> a + y, 1));
+
+query II
+SELECT 10 AS y, invoke_arrow(y);
+----
+10	[11]
+
+statement ok
+CREATE MACRO arrow_table_macro(a) AS TABLE SELECT list_transform([1], lambda x: x + a);
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM arrow_table_macro(list_sum(list_transform([1], x -> x))));
+----
+list_transform(list_value(1), (lambda x: (x + list_sum(list_transform(list_value(1), (x -> x))))))

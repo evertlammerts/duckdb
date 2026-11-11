@@ -1,3 +1,4 @@
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -134,41 +135,6 @@ static bool GetLambdaParameters(LambdaExpression &lambda_expr, vector<reference<
 	return true;
 }
 
-static void CollectFreeNames(ParsedExpression &expr, vector<identifier_set_t> &bound, identifier_set_t &names) {
-	switch (expr.GetExpressionClass()) {
-	case ExpressionClass::COLUMN_REF: {
-		auto &leading_name = expr.Cast<ColumnRefExpression>().ColumnNames()[0];
-		if (!LambdaExpression::IsLambdaParameter(bound, leading_name)) {
-			names.insert(leading_name);
-		}
-		return;
-	}
-	case ExpressionClass::LAMBDA: {
-		// an arrow may be the JSON operator, whose left side names a column
-		auto &lambda_expr = expr.Cast<LambdaExpression>();
-		vector<reference<ColumnRefExpression>> parameters;
-		if (lambda_expr.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD ||
-		    !GetLambdaParameters(lambda_expr, parameters)) {
-			break;
-		}
-		bound.emplace_back();
-		for (auto &parameter : parameters) {
-			bound.back().insert(parameter.get().GetColumnName());
-		}
-		CollectFreeNames(*lambda_expr.RightMutable(), bound, names);
-		bound.pop_back();
-		return;
-	}
-	case ExpressionClass::SUBQUERY:
-		// the binder rejects a subquery inside a lambda, so no name of it can be captured by a lambda parameter
-		return;
-	default:
-		break;
-	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](ParsedExpression &child) { CollectFreeNames(child, bound, names); });
-}
-
 static void CollectWrittenNames(ParsedExpression &expr, identifier_set_t &names) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &column_names = expr.Cast<ColumnRefExpression>().ColumnNames();
@@ -198,6 +164,8 @@ struct LambdaScope {
 	identifier_set_t captured;
 };
 
+using lambda_callback_t = std::function<void(LambdaExpression &, vector<reference<ColumnRefExpression>> &)>;
+
 class MacroLambdaRenamer {
 public:
 	MacroLambdaRenamer(const vector<reference<unique_ptr<ParsedExpression>>> &body, Binder &binder,
@@ -220,30 +188,21 @@ public:
 			auto &path = function.GetQualifiedName().Path();
 			// the dummy qualification turns a dot call on a macro parameter, a.upper(), into a parameter reference
 			if (body_is_qualified && !scopes.empty() && path.size() >= 2 && !IsLambdaParameter(path[0]) &&
-			    macro_binding.HasMatchingBinding(path[0]) && IsDotCall(function)) {
+			    macro_binding.HasMatchingBinding(path[0]) && IsDotCall(function, QualifyingBinder())) {
 				CaptureMacroParameter(path[0]);
 			}
 			if (!function.IsLambdaFunction()) {
 				break;
 			}
-			for (auto &child : function.GetArgumentsMutable()) {
-				auto &child_expr = child.GetExpressionMutable();
-				if (child_expr->GetExpressionClass() != ExpressionClass::LAMBDA) {
-					Rename(child_expr);
-					continue;
-				}
-				auto &lambda_expr = child_expr->Cast<LambdaExpression>();
-				LambdaScope scope(lambda_expr);
-				if (!GetLambdaParameters(lambda_expr, scope.parameters)) {
-					Rename(lambda_expr.LeftMutable());
-					Rename(lambda_expr.RightMutable());
-					continue;
-				}
-				scopes.push_back(std::move(scope));
-				Rename(lambda_expr.RightMutable());
-				RenameCaptured(scopes.back());
-				scopes.pop_back();
-			}
+			EnumerateCallChildren(
+			    function, QualifyingBinder(), [&](unique_ptr<ParsedExpression> &child) { Rename(child); },
+			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+				    scopes.emplace_back(lambda_expr);
+				    scopes.back().parameters = std::move(parameters);
+				    Rename(lambda_expr.RightMutable());
+				    RenameCaptured(scopes.back());
+				    scopes.pop_back();
+			    });
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
@@ -312,6 +271,63 @@ private:
 		return *caller_window_names;
 	}
 
+	// The caller's expressions are qualified by the expanding binder, so ProbeBinder answers for them.
+	void CollectFreeNames(ParsedExpression &expr, vector<identifier_set_t> &bound, identifier_set_t &names) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::COLUMN_REF: {
+			auto &leading_name = expr.Cast<ColumnRefExpression>().ColumnNames()[0];
+			if (!LambdaExpression::IsLambdaParameter(bound, leading_name)) {
+				names.insert(leading_name);
+			}
+			return;
+		}
+		case ExpressionClass::FUNCTION: {
+			auto &function = expr.Cast<FunctionExpression>();
+			auto &path = function.GetQualifiedName().Path();
+			// the receiver of a dot call, x.upper(), is a reference to x
+			if (path.size() >= 2 && !LambdaExpression::IsLambdaParameter(bound, path[0]) &&
+			    IsDotCall(function, ProbeBinder())) {
+				names.insert(path[0]);
+			}
+			EnumerateCallChildren(
+			    function, ProbeBinder(),
+			    [&](unique_ptr<ParsedExpression> &child) { CollectFreeNames(*child, bound, names); },
+			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+				    bound.emplace_back();
+				    for (auto &parameter : parameters) {
+					    bound.back().insert(parameter.get().GetColumnName());
+				    }
+				    CollectFreeNames(*lambda_expr.RightMutable(), bound, names);
+				    bound.pop_back();
+			    });
+			return;
+		}
+		case ExpressionClass::LAMBDA: {
+			// an argument that is itself an arrow lands where the body puts it, and reading it as JSON only adds names
+			auto &lambda_expr = expr.Cast<LambdaExpression>();
+			vector<reference<ColumnRefExpression>> parameters;
+			if (lambda_expr.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD ||
+			    !GetLambdaParameters(lambda_expr, parameters)) {
+				break;
+			}
+			bound.emplace_back();
+			for (auto &parameter : parameters) {
+				bound.back().insert(parameter.get().GetColumnName());
+			}
+			CollectFreeNames(*lambda_expr.RightMutable(), bound, names);
+			bound.pop_back();
+			return;
+		}
+		case ExpressionClass::SUBQUERY:
+			// the binder rejects a subquery inside a lambda, so no name of it can be captured by a lambda parameter
+			return;
+		default:
+			break;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](ParsedExpression &child) { CollectFreeNames(child, bound, names); });
+	}
+
 	void Capture(const identifier_set_t &names) {
 		for (auto &scope : scopes) {
 			for (auto &parameter : scope.parameters) {
@@ -323,8 +339,9 @@ private:
 		}
 	}
 
-	// A leading digit needs quotes, so no table or column at the call site has the name; one name per original name
-	// keeps identical lambdas, such as a select list item and its GROUP BY, equal.
+	// Every other name inside a renamed lambda is in the body or an argument, so only the renamed references can
+	// name the new one; one name per original name keeps identical lambdas, such as a select list item and its
+	// GROUP BY, equal.
 	Identifier GetUnusedName(const Identifier &name) {
 		auto known = new_names.find(name);
 		if (known != new_names.end()) {
@@ -360,17 +377,105 @@ private:
 		return *probe_binder;
 	}
 
-	// Only the search path of the binder that will qualify the call decides whether it is a dot call.
-	bool IsDotCall(FunctionExpression &function) {
+	// The dummy binder qualifies the top of a scalar macro body; the expanding binder qualifies everything else.
+	Binder &QualifyingBinder() {
+		return body_is_qualified ? *dummy_binder : ProbeBinder();
+	}
+
+	// Asked of the binder that will qualify the call, which decides whether it is a dot call.
+	static optional_ptr<CatalogEntry> FindFunction(const FunctionExpression &function, Binder &qualifying_binder,
+	                                               bool &dot_call) {
+		dot_call = false;
+		if (ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
+			return nullptr;
+		}
+		FunctionExpression probe(function.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
+		auto entry = ColumnQualifier(qualifying_binder).QualifyFunction(probe);
+		dot_call = function.GetQualifiedName().Path().size() >= 2 && probe.GetQualifiedName().Path().size() == 1;
+		return entry;
+	}
+
+	static bool IsDotCall(const FunctionExpression &function, Binder &qualifying_binder) {
+		bool dot_call;
+		FindFunction(function, qualifying_binder, dot_call);
+		return dot_call;
+	}
+
+	// A macro places an argument only when it expands, so an arrow passed to one, or to an unknown function, stays
+	// a lambda.
+	static bool TakesArrowAsLambda(const FunctionExpression &function, idx_t index, Binder &qualifying_binder) {
 		if (ExpressionBinder::IsUnnestFunction(function.FunctionName())) {
 			return false;
 		}
-		FunctionExpression probe(function.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
-		ColumnQualifier(body_is_qualified ? *dummy_binder : ProbeBinder()).QualifyFunction(probe);
-		return probe.GetQualifiedName().Path().size() == 1;
+		bool dot_call;
+		auto entry = FindFunction(function, qualifying_binder, dot_call);
+		if (!entry || entry->type == CatalogType::MACRO_ENTRY) {
+			return true;
+		}
+		if (entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+			return false;
+		}
+		auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(entry->Cast<ScalarFunctionCatalogEntry>());
+		// the receiver of a dot call is the function's first argument
+		return lambda_index.IsValid() && lambda_index.GetIndex() == index + (dot_call ? 1 : 0);
 	}
 
-	// An inner lambda declaring the name is renamed with it, which also renames the column of a JSON arrow.
+	// A keyword lambda always declares its parameters, an arrow only where the call binds it as a lambda; otherwise
+	// the binder reads the arrow as the JSON operator, whose left side is a column.
+	static bool DeclaresParameters(FunctionExpression &function, idx_t index, Binder &qualifying_binder,
+	                               vector<reference<ColumnRefExpression>> &parameters) {
+		auto &argument = function.GetArgumentsMutable()[index].GetExpressionMutable();
+		if (argument->GetExpressionClass() != ExpressionClass::LAMBDA) {
+			return false;
+		}
+		auto &lambda_expr = argument->Cast<LambdaExpression>();
+		if (!GetLambdaParameters(lambda_expr, parameters)) {
+			return false;
+		}
+		if (lambda_expr.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD ||
+		    TakesArrowAsLambda(function, index, qualifying_binder)) {
+			return true;
+		}
+		parameters.clear();
+		return false;
+	}
+
+	static void EnumerateCallChildren(FunctionExpression &function, Binder &qualifying_binder,
+	                                  const std::function<void(unique_ptr<ParsedExpression> &)> &callback,
+	                                  const lambda_callback_t &lambda_callback) {
+		auto &arguments = function.GetArgumentsMutable();
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			vector<reference<ColumnRefExpression>> parameters;
+			if (DeclaresParameters(function, i, qualifying_binder, parameters)) {
+				lambda_callback(arguments[i].GetExpressionMutable()->Cast<LambdaExpression>(), parameters);
+			} else {
+				callback(arguments[i].GetExpressionMutable());
+			}
+		}
+		if (function.FilterMutable()) {
+			callback(function.FilterMutable());
+		}
+		if (function.OrderByMutable()) {
+			for (auto &order : function.OrderByMutable()->orders) {
+				callback(order.expression);
+			}
+		}
+	}
+
+	// A declaration is named by its alias when it has one, so it takes the new name without an alias; an inner
+	// lambda declaring the name is renamed with it, which keeps its shadowing.
+	void RenameDeclaration(LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters,
+	                       const identifier_map_t<Identifier> &renames) {
+		for (auto &parameter : parameters) {
+			auto &name = parameter.get().ColumnNamesMutable()[0];
+			auto entry = renames.find(name);
+			if (entry != renames.end()) {
+				name = entry->second;
+			}
+		}
+		RenameReferences(lambda_expr.RightMutable(), renames);
+	}
+
 	void RenameReferences(unique_ptr<ParsedExpression> &expr, const identifier_map_t<Identifier> &renames) {
 		switch (expr->GetExpressionClass()) {
 		case ExpressionClass::COLUMN_REF: {
@@ -388,26 +493,19 @@ private:
 			return;
 		}
 		case ExpressionClass::LAMBDA: {
-			// a declaration is named by its alias when it has one, so it takes the new name without an alias
 			auto &lambda_expr = expr->Cast<LambdaExpression>();
 			vector<reference<ColumnRefExpression>> parameters;
-			if (!GetLambdaParameters(lambda_expr, parameters)) {
+			if (lambda_expr.GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD ||
+			    !GetLambdaParameters(lambda_expr, parameters)) {
 				break;
 			}
-			for (auto &parameter : parameters) {
-				auto &name = parameter.get().ColumnNamesMutable()[0];
-				auto entry = renames.find(name);
-				if (entry != renames.end()) {
-					name = entry->second;
-				}
-			}
-			RenameReferences(lambda_expr.RightMutable(), renames);
+			RenameDeclaration(lambda_expr, parameters, renames);
 			return;
 		}
 		case ExpressionClass::FUNCTION: {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto &path = function.GetQualifiedName().Path();
-			if (path.size() >= 2 && renames.find(path[0]) != renames.end() && IsDotCall(function)) {
+			if (path.size() >= 2 && renames.find(path[0]) != renames.end() && IsDotCall(function, QualifyingBinder())) {
 				// rewritten as the qualifier would, so that the receiver is a reference renamed below with its alias
 				auto qualified_name = function.GetQualifiedName();
 				auto receiver = qualified_name.Catalog().empty()
@@ -417,7 +515,16 @@ private:
 				arguments.insert(arguments.begin(), FunctionArgument(std::move(receiver)));
 				function.SetQualifiedName(QualifiedName(qualified_name.Name()));
 			}
-			break;
+			if (!function.IsLambdaFunction()) {
+				break;
+			}
+			EnumerateCallChildren(
+			    function, QualifyingBinder(),
+			    [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); },
+			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+				    RenameDeclaration(lambda_expr, parameters, renames);
+			    });
+			return;
 		}
 		case ExpressionClass::SUBQUERY: {
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
