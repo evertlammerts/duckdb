@@ -25,6 +25,7 @@ class BoundQueryNode;
 class ColumnRefExpression;
 class SubqueryRef;
 class LogicalGet;
+class SchemaCatalogEntry;
 class TableCatalogEntry;
 class TableFunctionCatalogEntry;
 class StandardEntry;
@@ -185,9 +186,8 @@ struct CTEBindState {
 	QueryNode &cte_def;
 	const vector<Identifier> &aliases;
 	idx_t active_binder_count;
-	bool is_trigger_body = false;
-	Identifier trigger_catalog;
-	vector<Identifier> trigger_schema_path;
+	//! The schema of the fired trigger whose body this CTE holds, if it holds one
+	optional_ptr<const SchemaCatalogEntry> trigger_body_schema;
 	shared_ptr<Binder> query_binder;
 	BoundStatement query;
 	vector<Identifier> names;
