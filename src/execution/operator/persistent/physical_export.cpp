@@ -11,6 +11,8 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/dependency_manager.hpp"
+#include "duckdb/optimizer/remote_pushdown_optimizer.hpp"
+#include "duckdb/parser/parsed_data/create_trigger_info.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -28,21 +30,30 @@ PhysicalExport::PhysicalExport(PhysicalPlan &physical_plan, vector<LogicalType> 
       function(std::move(function)), info(std::move(info)), exported_tables(std::move(exported_tables)) {
 }
 
+static void WriteCatalogEntry(stringstream &ss, CatalogEntry &entry) {
+	if (entry.internal) {
+		return;
+	}
+	auto create_info = entry.GetInfo();
+	try {
+		if (create_info->type == CatalogType::TRIGGER_ENTRY) {
+			// CREATE VIEW drops its own catalog from its body, CREATE TRIGGER keeps the body as written
+			RemotePushdownOptimizer::StripCatalogName(*create_info->Cast<CreateTriggerInfo>().trigger_action,
+			                                          create_info->GetQualifiedName().Catalog());
+		}
+		// the catalog is implied by the database the export is imported into - keep only the schema path
+		create_info->StripCatalogQualification();
+		auto to_string = create_info->ToString();
+		ss << to_string;
+	} catch (const NotImplementedException &) {
+		ss << entry.ToSQL();
+	}
+	ss << '\n';
+}
+
 static void WriteCatalogEntries(stringstream &ss, catalog_entry_vector_t &entries) {
 	for (auto &entry : entries) {
-		if (entry.get().internal) {
-			continue;
-		}
-		auto create_info = entry.get().GetInfo();
-		try {
-			// the catalog is implied by the database the export is imported into - keep only the schema path
-			create_info->StripCatalogQualification();
-			auto to_string = create_info->ToString();
-			ss << to_string;
-		} catch (const NotImplementedException &) {
-			ss << entry.get().ToSQL();
-		}
-		ss << '\n';
+		WriteCatalogEntry(ss, entry.get());
 	}
 	ss << '\n';
 }
@@ -57,9 +68,7 @@ static void WriteTriggers(CatalogTransaction transaction, stringstream &ss, Boun
 		return lhs.get().oid < rhs.get().oid;
 	});
 	for (auto &trigger : triggers) {
-		auto create_info = trigger.get().GetInfo();
-		create_info->StripCatalogQualification();
-		ss << create_info->ToString() << '\n';
+		WriteCatalogEntry(ss, trigger.get());
 	}
 }
 
