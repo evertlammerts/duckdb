@@ -52,8 +52,8 @@ BindResult ExpressionBinder::BindExpression(ParameterExpression &expr, idx_t dep
 		}
 	}
 	if (fired_trigger_body) {
-		throw InvalidInputException("Values were not provided for the following parameters: %s",
-		                            parameter_id.GetIdentifierName());
+		throw InvalidInputException("Variable \"%s\" is not set: a trigger body reads $%s as a user variable",
+		                            parameter_id.GetIdentifierName(), parameter_id.GetIdentifierName());
 	}
 	if (!parameters) {
 		throw BinderException("Unexpected prepared parameter. This type of statement can't be prepared!");

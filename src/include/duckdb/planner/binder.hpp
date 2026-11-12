@@ -241,10 +241,29 @@ struct GlobalBinderState {
 	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the scope the body
 	//! binds in. A trigger being created does not depend on what those bodies resolve.
 	reference_map_t<QueryNode, TriggerBodyCTE> trigger_body_ctes;
+	//! Generated DML nodes whose RETURNING list the trigger expansion added to read back the changed rows, keyed by
+	//! node identity. That list is not the user's, so it records no catalog lookups.
+	reference_set_t<QueryNode> trigger_generated_returning;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
 	Identifier trigger_creation_name;
+};
+
+//! Registers a generated DML node in GlobalBinderState::trigger_generated_returning while it binds, and removes it
+//! however the bind ends, because the node is destroyed after
+class TriggerGeneratedReturningScope {
+public:
+	TriggerGeneratedReturningScope(GlobalBinderState &state, QueryNode &node) : state(state), node(node) {
+		state.trigger_generated_returning.insert(node);
+	}
+	~TriggerGeneratedReturningScope() {
+		state.trigger_generated_returning.erase(node);
+	}
+
+private:
+	GlobalBinderState &state;
+	QueryNode &node;
 };
 
 //! Bind the parsed query tree to the actual columns present in the catalog.
@@ -604,6 +623,7 @@ private:
 	                             virtual_column_map_t virtual_columns = virtual_column_map_t());
 	//! A child binder for a user's RETURNING list, a binder without parent for the list the trigger expansion adds
 	shared_ptr<Binder> CreateReturningBinder(bool trigger_generated);
+	bool IsTriggerGeneratedReturning(QueryNode &node) const;
 
 	unique_ptr<QueryNode> BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry &macro_func, idx_t depth);
 

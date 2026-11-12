@@ -678,7 +678,6 @@ unique_ptr<MergeIntoStatement> Binder::GenerateMergeInto(InsertQueryNode &node, 
 
 	// move over extra properties
 	merge_into->node->returning_list = std::move(node.returning_list);
-	merge_into->node->trigger_generated_returning = node.trigger_generated_returning;
 	return merge_into;
 }
 
@@ -721,6 +720,11 @@ BoundStatement Binder::BindNode(InsertQueryNode &node) {
 	if (node.on_conflict_info) {
 		// generate a MERGE INTO statement and bind it instead
 		auto merge_into = GenerateMergeInto(node, table);
+		if (IsTriggerGeneratedReturning(node)) {
+			// The trigger expansion's RETURNING list moved to the MERGE node, so its registration moves with it.
+			TriggerGeneratedReturningScope returning_scope(*global_binder_state, *merge_into->node);
+			return Bind(*merge_into);
+		}
 		return Bind(*merge_into);
 	}
 	GetStatementProperties().RegisterDBModify(table.catalog, context, DatabaseModificationType::INSERT_DATA);
@@ -796,7 +800,7 @@ BoundStatement Binder::BindNode(InsertQueryNode &node) {
 		insert->table_index = insert_table_index;
 		unique_ptr<LogicalOperator> index_as_logicaloperator = std::move(insert);
 
-		return BindReturning(std::move(node.returning_list), node.trigger_generated_returning, table,
+		return BindReturning(std::move(node.returning_list), IsTriggerGeneratedReturning(node), table,
 		                     node.table_ref ? node.table_ref->alias : Identifier(), insert_table_index,
 		                     std::move(index_as_logicaloperator));
 	}

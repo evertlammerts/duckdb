@@ -634,6 +634,10 @@ shared_ptr<Binder> Binder::CreateReturningBinder(bool trigger_generated) {
 	return binder;
 }
 
+bool Binder::IsTriggerGeneratedReturning(QueryNode &node) const {
+	return global_binder_state->trigger_generated_returning.count(node) > 0;
+}
+
 BoundStatement Binder::BindReturning(vector<unique_ptr<ParsedExpression>> returning_list, bool trigger_generated,
                                      TableCatalogEntry &table, const Identifier &alias, TableIndex update_table_index,
                                      unique_ptr<LogicalOperator> child_operator, virtual_column_map_t virtual_columns) {
