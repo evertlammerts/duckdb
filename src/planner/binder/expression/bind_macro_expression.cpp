@@ -318,6 +318,110 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 	return found;
 }
 
+static bool HasTable(TableRef &ref) {
+	if (ref.type == TableReferenceType::JOIN) {
+		auto &join = ref.Cast<JoinRef>();
+		return HasTable(*join.left) || HasTable(*join.right);
+	}
+	// a VALUES list binds its expressions in the scope around it
+	return ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::EXPRESSION_LIST;
+}
+
+using folded_expression_callback_t =
+    std::function<void(unique_ptr<ParsedExpression> &expr, const identifier_set_t &names, bool table_in_scope)>;
+
+static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, bool outer_in_scope, bool in_scope,
+                               const folded_expression_callback_t &callback);
+
+// Hands each expression of a folded subquery the names that may still read the lambda's parameter there.
+static void EnumerateFoldedNode(QueryNode &node, const identifier_set_t &names, bool table_in_scope,
+                                const folded_expression_callback_t &callback) {
+	static const identifier_set_t none;
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		auto in_scope = table_in_scope || (select.from_table && HasTable(*select.from_table));
+		identifier_set_t clause_names;
+		for (auto &name : names) {
+			bool aliased = false;
+			for (auto &item : select.select_list) {
+				aliased = aliased || item->GetAlias() == name;
+			}
+			if (!aliased) {
+				clause_names.insert(name);
+			}
+		}
+		auto &select_names = in_scope ? none : names;
+		auto &level_clause_names = in_scope ? none : clause_names;
+		for (auto &expr : select.select_list) {
+			callback(expr, select_names, in_scope);
+		}
+		for (auto &expr : select.groups.group_expressions) {
+			callback(expr, level_clause_names, in_scope);
+		}
+		for (auto clause : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*clause) {
+				callback(*clause, level_clause_names, in_scope);
+			}
+		}
+		if (select.from_table) {
+			EnumerateFoldedRef(*select.from_table, names, table_in_scope, in_scope, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, level_clause_names, in_scope); });
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE:
+		for (auto &child : node.Cast<SetOperationNode>().children) {
+			EnumerateFoldedNode(*child, names, table_in_scope, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
+			callback(child, table_in_scope ? none : names, table_in_scope);
+		});
+		break;
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &cte = node.Cast<RecursiveCTENode>();
+		EnumerateFoldedNode(*cte.left, names, table_in_scope, callback);
+		EnumerateFoldedNode(*cte.right, names, table_in_scope, callback);
+		break;
+	}
+	default:
+		return;
+	}
+	for (auto &entry : node.cte_map.map) {
+		if (entry.second->query_node) {
+			EnumerateFoldedNode(*entry.second->query_node, names, table_in_scope, callback);
+		}
+	}
+}
+
+static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, bool outer_in_scope, bool in_scope,
+                               const folded_expression_callback_t &callback) {
+	static const identifier_set_t none;
+	switch (ref.type) {
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		EnumerateFoldedRef(*join.left, names, outer_in_scope, in_scope, callback);
+		EnumerateFoldedRef(*join.right, names, outer_in_scope, in_scope, callback);
+		if (join.condition) {
+			callback(join.condition, in_scope ? none : names, in_scope);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY:
+		EnumerateFoldedNode(*ref.Cast<SubqueryRef>().subquery->node, names, outer_in_scope, callback);
+		break;
+	case TableReferenceType::EXPRESSION_LIST:
+	case TableReferenceType::TABLE_FUNCTION:
+		ParsedExpressionIterator::EnumerateTableRefChildren(ref, [&](unique_ptr<ParsedExpression> &child) {
+			callback(child, outer_in_scope ? none : names, outer_in_scope);
+		});
+		break;
+	default:
+		break;
+	}
+}
+
 namespace {
 
 struct LambdaScope {
@@ -857,108 +961,25 @@ private:
 		return false;
 	}
 
-	static bool HasTable(TableRef &ref) {
-		if (ref.type == TableReferenceType::JOIN) {
-			auto &join = ref.Cast<JoinRef>();
-			return HasTable(*join.left) || HasTable(*join.right);
-		}
-		// a VALUES list binds its expressions in the scope around it
-		return ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::EXPRESSION_LIST;
-	}
-
-	void RenameFoldedExpression(unique_ptr<ParsedExpression> &expr, const identifier_map_t<Identifier> &renames,
-	                            bool table_in_scope) {
-		static const identifier_map_t<Identifier> none;
-		auto outer = folded_table_in_scope;
-		folded_table_in_scope = table_in_scope;
-		RenameReferences(expr, table_in_scope ? none : renames);
-		folded_table_in_scope = outer;
-	}
-
-	// In a folded subquery a reference binds the lambda's parameter where no table of its level or a level around it,
-	// and no select list alias of its level, provides the name; a level with a table keeps its references.
+	// Renames the references of a folded subquery that may still read the lambda's parameter.
 	void RenameFoldedNode(QueryNode &node, const identifier_map_t<Identifier> &renames, bool table_in_scope) {
-		switch (node.type) {
-		case QueryNodeType::SELECT_NODE: {
-			auto &select = node.Cast<SelectNode>();
-			auto in_scope = table_in_scope || (select.from_table && HasTable(*select.from_table));
-			identifier_map_t<Identifier> clause_renames;
-			for (auto &entry : renames) {
-				bool aliased = false;
-				for (auto &item : select.select_list) {
-					aliased = aliased || item->GetAlias() == entry.first;
-				}
-				if (!aliased) {
-					clause_renames.emplace(entry.first, entry.second);
-				}
-			}
-			for (auto &expr : select.select_list) {
-				RenameFoldedExpression(expr, renames, in_scope);
-			}
-			for (auto &expr : select.groups.group_expressions) {
-				RenameFoldedExpression(expr, clause_renames, in_scope);
-			}
-			for (auto clause : {&select.where_clause, &select.having, &select.qualify}) {
-				if (*clause) {
-					RenameFoldedExpression(*clause, clause_renames, in_scope);
-				}
-			}
-			if (select.from_table) {
-				RenameFoldedRef(*select.from_table, renames, table_in_scope, in_scope);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
-				RenameFoldedExpression(child, clause_renames, in_scope);
-			});
-			break;
+		identifier_set_t names;
+		for (auto &entry : renames) {
+			names.insert(entry.first);
 		}
-		case QueryNodeType::SET_OPERATION_NODE:
-			for (auto &child : node.Cast<SetOperationNode>().children) {
-				RenameFoldedNode(*child, renames, table_in_scope);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
-				RenameFoldedExpression(child, renames, table_in_scope);
-			});
-			break;
-		case QueryNodeType::RECURSIVE_CTE_NODE: {
-			auto &cte = node.Cast<RecursiveCTENode>();
-			RenameFoldedNode(*cte.left, renames, table_in_scope);
-			RenameFoldedNode(*cte.right, renames, table_in_scope);
-			break;
-		}
-		default:
-			return;
-		}
-		for (auto &entry : node.cte_map.map) {
-			if (entry.second->query_node) {
-				RenameFoldedNode(*entry.second->query_node, renames, table_in_scope);
-			}
-		}
-	}
-
-	void RenameFoldedRef(TableRef &ref, const identifier_map_t<Identifier> &renames, bool outer_in_scope,
-	                     bool in_scope) {
-		switch (ref.type) {
-		case TableReferenceType::JOIN: {
-			auto &join = ref.Cast<JoinRef>();
-			RenameFoldedRef(*join.left, renames, outer_in_scope, in_scope);
-			RenameFoldedRef(*join.right, renames, outer_in_scope, in_scope);
-			if (join.condition) {
-				RenameFoldedExpression(join.condition, renames, in_scope);
-			}
-			break;
-		}
-		case TableReferenceType::SUBQUERY:
-			RenameFoldedNode(*ref.Cast<SubqueryRef>().subquery->node, renames, outer_in_scope);
-			break;
-		case TableReferenceType::EXPRESSION_LIST:
-		case TableReferenceType::TABLE_FUNCTION:
-			ParsedExpressionIterator::EnumerateTableRefChildren(ref, [&](unique_ptr<ParsedExpression> &child) {
-				RenameFoldedExpression(child, renames, outer_in_scope);
-			});
-			break;
-		default:
-			break;
-		}
+		EnumerateFoldedNode(node, names, table_in_scope,
+		                    [&](unique_ptr<ParsedExpression> &expr, const identifier_set_t &expr_names, bool in_scope) {
+			                    identifier_map_t<Identifier> expr_renames;
+			                    for (auto &entry : renames) {
+				                    if (expr_names.find(entry.first) != expr_names.end()) {
+					                    expr_renames.emplace(entry.first, entry.second);
+				                    }
+			                    }
+			                    auto outer = folded_table_in_scope;
+			                    folded_table_in_scope = in_scope;
+			                    RenameReferences(expr, expr_renames);
+			                    folded_table_in_scope = outer;
+		                    });
 	}
 
 	// A lambda beside a table of its name reads x.v as that table, as without the macro.
