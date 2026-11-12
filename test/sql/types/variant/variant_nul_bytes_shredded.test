@@ -20,9 +20,9 @@ CHECKPOINT;
 restart
 
 query I
-SELECT stats(v).shredding_state::VARCHAR FROM shredded LIMIT 1;
+SELECT DISTINCT vector_type(v) FROM shredded;
 ----
-SHREDDED
+SHREDDED_VECTOR
 
 query IIIII
 SELECT count(*), count(DISTINCT variant_typeof(v)), min(variant_typeof(v))::BLOB, sum(variant_extract(v, 'a' || chr(0) || 'b')::BIGINT), sum(strlen(variant_extract(v, chr(0) || 'c')::VARCHAR)) FROM shredded;
