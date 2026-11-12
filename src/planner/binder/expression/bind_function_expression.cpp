@@ -166,6 +166,12 @@ ListReduceRebindResult MaybeRebindListReduceLambda(ClientContext &context, idx_t
 	}
 
 	if (has_initial) {
+		// operator== ignores collations, but a collated accumulator changes how the body compares strings
+		if (accumulator_type.EqualsIncludingCollation(function_child_types[2])) {
+			// ListReduceBind casts after the capture, too late to type a bare parameter body
+			CastDecimalLambdaToAccumulatorType(context, bind_lambda_result, accumulator_type);
+			return result;
+		}
 		D_ASSERT(lambda_expr_copy);
 		auto rebind_child_types = function_child_types;
 		rebind_child_types[2] = accumulator_type;
@@ -552,9 +558,9 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	};
 
 	if (is_list_reduce) {
-		// list_reduce requires binding the lambda function a second time as there is a cyclical dependency between its
-		// acc parameter type and its return type. This is resolved by initially binding it with acc = initial, and then
-		// rebinding it with acc = return type
+		// there is a cyclical dependency between the acc parameter type and the return type of a list_reduce lambda:
+		// it is bound with acc = initial value (or element) type first, and bound again only when the accumulator type
+		// settled from that bind's return type differs
 		auto rebind_result =
 		    MaybeRebindListReduceLambda(context, depth, function_child_types, bind_lambda_function, bind_lambda_result,
 		                                bind_lambda_expression, nullptr, lambda_expr_copy);
