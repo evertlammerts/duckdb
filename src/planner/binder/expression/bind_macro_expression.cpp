@@ -13,6 +13,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -318,13 +320,59 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 	return found;
 }
 
-static bool HasTable(TableRef &ref) {
+// A VALUES list, also as the derived table without column aliases it prints as, binds its expressions in the scope
+// around it and gives its level only its alias and its column names.
+static bool IsValuesList(TableRef &ref, identifier_set_t &level_names) {
+	reference<TableRef> inner = ref;
+	while (inner.get().type == TableReferenceType::SUBQUERY && inner.get().column_name_alias.empty()) {
+		auto &node = *inner.get().Cast<SubqueryRef>().subquery->node;
+		if (node.type != QueryNodeType::SELECT_NODE || !node.modifiers.empty() || !node.cte_map.map.empty()) {
+			return false;
+		}
+		auto &select = node.Cast<SelectNode>();
+		if (select.select_list.size() != 1 || !select.select_list[0]->Equals(StarExpression()) || !select.from_table ||
+		    select.where_clause || !select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() ||
+		    select.having || select.qualify || select.sample) {
+			return false;
+		}
+		inner = *select.from_table;
+	}
+	if (inner.get().type != TableReferenceType::EXPRESSION_LIST || !inner.get().column_name_alias.empty()) {
+		return false;
+	}
+	auto &values = inner.get().Cast<ExpressionListRef>();
+	if (!ref.alias.empty()) {
+		level_names.insert(ref.alias);
+	}
+	for (auto &name : values.expected_names) {
+		level_names.insert(name);
+	}
+	if (values.expected_names.empty() && !values.values.empty()) {
+		for (idx_t i = 0; i < values.values[0].size(); i++) {
+			level_names.insert(Identifier("col" + to_string(i)));
+		}
+	}
+	return true;
+}
+
+static bool HasTable(TableRef &ref, identifier_set_t &level_names) {
 	if (ref.type == TableReferenceType::JOIN) {
 		auto &join = ref.Cast<JoinRef>();
-		return HasTable(*join.left) || HasTable(*join.right);
+		auto left = HasTable(*join.left, level_names);
+		auto right = HasTable(*join.right, level_names);
+		return left || right;
 	}
-	// a VALUES list binds its expressions in the scope around it
-	return ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::EXPRESSION_LIST;
+	return ref.type != TableReferenceType::EMPTY_FROM && !IsValuesList(ref, level_names);
+}
+
+static identifier_set_t Without(const identifier_set_t &names, const identifier_set_t &removed) {
+	identifier_set_t result;
+	for (auto &name : names) {
+		if (removed.find(name) == removed.end()) {
+			result.insert(name);
+		}
+	}
+	return result;
 }
 
 using folded_expression_callback_t =
@@ -333,16 +381,18 @@ using folded_expression_callback_t =
 static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, bool outer_in_scope, bool in_scope,
                                const folded_expression_callback_t &callback);
 
-// Hands each expression of a folded subquery the names that may still read the lambda's parameter there.
+// A reference binds the parameter where no table of its level or a level around it, and no name of its level, has it.
 static void EnumerateFoldedNode(QueryNode &node, const identifier_set_t &names, bool table_in_scope,
                                 const folded_expression_callback_t &callback) {
 	static const identifier_set_t none;
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
 		auto &select = node.Cast<SelectNode>();
-		auto in_scope = table_in_scope || (select.from_table && HasTable(*select.from_table));
+		identifier_set_t level_names;
+		auto in_scope = table_in_scope || (select.from_table && HasTable(*select.from_table, level_names));
+		auto unbound_names = Without(names, level_names);
 		identifier_set_t clause_names;
-		for (auto &name : names) {
+		for (auto &name : unbound_names) {
 			bool aliased = false;
 			for (auto &item : select.select_list) {
 				aliased = aliased || item->GetAlias() == name;
@@ -351,7 +401,7 @@ static void EnumerateFoldedNode(QueryNode &node, const identifier_set_t &names, 
 				clause_names.insert(name);
 			}
 		}
-		auto &select_names = in_scope ? none : names;
+		auto &select_names = in_scope ? none : unbound_names;
 		auto &level_clause_names = in_scope ? none : clause_names;
 		for (auto &expr : select.select_list) {
 			callback(expr, select_names, in_scope);
@@ -402,9 +452,15 @@ static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, boo
 	case TableReferenceType::JOIN: {
 		auto &join = ref.Cast<JoinRef>();
 		EnumerateFoldedRef(*join.left, names, outer_in_scope, in_scope, callback);
-		EnumerateFoldedRef(*join.right, names, outer_in_scope, in_scope, callback);
+		// the right side sees the left side's tables, with or without LATERAL
+		identifier_set_t left_names;
+		auto left_has_table = HasTable(*join.left, left_names);
+		EnumerateFoldedRef(*join.right, Without(names, left_names), outer_in_scope || left_has_table, in_scope,
+		                   callback);
 		if (join.condition) {
-			callback(join.condition, in_scope ? none : names, in_scope);
+			identifier_set_t join_names;
+			HasTable(join, join_names);
+			callback(join.condition, in_scope ? none : Without(names, join_names), in_scope);
 		}
 		break;
 	}
@@ -920,16 +976,14 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
 	}
 
-	// The bind callbacks that keep only the type of these arguments: typeof, get_type (type_functions.cpp),
-	// can_cast_implicitly, st_crs (geometry_functions.cpp), the type argument of cast_to_type and replace_type, and
-	// pg_typeof, a built in macro over typeof (default_functions.cpp).
+	// Bind callbacks that keep only the type of a subquery argument, and pg_typeof, a built in macro over typeof.
 	bool FoldedArguments(FunctionExpression &function, vector<bool> &folded) {
 		if (subquery_depth > 0 || !function.HasSubquery()) {
 			return false;
 		}
 		bool dot_call;
 		auto entry = FindFunction(function, QualifyingBinder(), dot_call);
-		if (!entry || dot_call || !entry->ParentCatalog().IsSystemCatalog()) {
+		if (!entry || !entry->ParentCatalog().IsSystemCatalog()) {
 			return false;
 		}
 		auto &name = entry->name;
@@ -940,17 +994,10 @@ private:
 				folded.assign(count, true);
 			}
 		} else if (entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-			if (name == "typeof" || name == "get_type" || name == "can_cast_implicitly" || name == "st_crs") {
+			// a value argument of cast_to_type that reads the lambda's parameter already fails at CREATE MACRO
+			if (name == "typeof" || name == "get_type" || name == "can_cast_implicitly" || name == "st_crs" ||
+			    name == "cast_to_type" || name == "replace_type") {
 				folded.assign(count, true);
-			} else if (name == "cast_to_type") {
-				folded.assign(count, false);
-				for (idx_t i = 1; i < count && i < 2; i++) {
-					folded[i] = true;
-				}
-			} else if (name == "replace_type") {
-				for (idx_t i = 1; i < count && i < 3; i++) {
-					folded[i] = true;
-				}
 			}
 		}
 		for (auto fold : folded) {

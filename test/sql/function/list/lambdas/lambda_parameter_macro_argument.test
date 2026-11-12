@@ -1570,9 +1570,9 @@ SELECT field_type();
 ----
 [VARCHAR]
 
-# the bind callbacks that keep only the type of an argument fold that argument: every argument of typeof, get_type,
-# can_cast_implicitly and st_crs, the type argument of cast_to_type, the type arguments of replace_type, and
-# pg_typeof, a built in macro over typeof; each call gives what the expression gives with the argument written in
+# the bind callbacks that keep only the type of an argument fold every argument: typeof, get_type,
+# can_cast_implicitly, st_crs, cast_to_type, replace_type, and pg_typeof, a built in macro over typeof; each call
+# gives what the expression gives with the argument written in
 
 statement ok
 CREATE MACRO tctt(a) AS list_transform([1], lambda x: cast_to_type(a, (SELECT x)));
@@ -1807,3 +1807,240 @@ query I
 SELECT alias_type(x.z) FROM (VALUES ('!')) AS x(z);
 ----
 [VARCHAR!]
+
+# in a folded subquery the right side of a join sees the left side's tables, with or without LATERAL
+
+statement ok
+CREATE MACRO lateral_type(a) AS list_transform([1::BIGINT], lambda x: typeof((SELECT d.v FROM (VALUES ('s')) AS t(x), LATERAL (SELECT x AS v) AS d)) || ':' || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda x: typeof((SELECT d.v FROM (VALUES ('s')) AS t(x), LATERAL (SELECT x AS v) AS d)) || ':' || '!');
+----
+['VARCHAR:!']
+
+query I
+SELECT lateral_type(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['VARCHAR:!']
+
+query II
+SELECT 1::INTEGER AS x, lateral_type(x);
+----
+1	['VARCHAR:1']
+
+statement ok
+CREATE MACRO derived_type(a) AS list_transform([1::BIGINT], lambda x: typeof((SELECT d.v FROM (VALUES ('s')) AS t(x), (SELECT x AS v) AS d)) || ':' || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda x: typeof((SELECT d.v FROM (VALUES ('s')) AS t(x), (SELECT x AS v) AS d)) || ':' || '!');
+----
+['VARCHAR:!']
+
+query I
+SELECT derived_type(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['VARCHAR:!']
+
+statement ok
+CREATE MACRO lateral_fn(a) AS list_transform([1::BIGINT], lambda x: typeof((SELECT max(r.range) FROM (VALUES (2::TINYINT)) AS t(x), range(x) AS r)) || ':' || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda x: typeof((SELECT max(r.range) FROM (VALUES (2::TINYINT)) AS t(x), range(x) AS r)) || ':' || '!');
+----
+['BIGINT:!']
+
+query I
+SELECT lateral_fn(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['BIGINT:!']
+
+statement ok
+CREATE MACRO lateral_unnest(a) AS list_transform([1::BIGINT], lambda x: typeof((SELECT u FROM (VALUES (['s'])) AS t(x), unnest(x) AS w(u))) || ':' || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda x: typeof((SELECT u FROM (VALUES (['s'])) AS t(x), unnest(x) AS w(u))) || ':' || '!');
+----
+['VARCHAR:!']
+
+query I
+SELECT lateral_unnest(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['VARCHAR:!']
+
+# every argument of cast_to_type and replace_type folds, so a type argument written first by name is reached
+
+statement ok
+CREATE MACRO named_first(a) AS list_transform([2::BIGINT], lambda x: cast_to_type(type := (SELECT x), param := x * 10 + a));
+
+query I
+SELECT list_transform([2::BIGINT], lambda x: cast_to_type(type := (SELECT x), param := x * 10 + 3));
+----
+[23]
+
+query I
+SELECT named_first(x.z) FROM (VALUES (3)) AS x(z);
+----
+[23]
+
+statement ok
+CREATE MACRO named_rt_first(a) AS list_transform([2::BIGINT], lambda x: replace_type(type1 := (SELECT x), param := x * 10 + a, type2 := 0.5::DOUBLE));
+
+query I
+SELECT list_transform([2::BIGINT], lambda x: replace_type(type1 := (SELECT x), param := x * 10 + 3, type2 := 0.5::DOUBLE));
+----
+[23.0]
+
+query I
+SELECT named_rt_first(x.z) FROM (VALUES (3)) AS x(z);
+----
+[23.0]
+
+# a dot call folds as its call form does
+
+statement ok
+CREATE MACRO dot_cast(a) AS list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: y.cast_to_type((SELECT x.d)) + a));
+
+query I
+SELECT list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: y.cast_to_type((SELECT x.d)) + 3));
+----
+[[4.5]]
+
+query I
+SELECT dot_cast(x.z) FROM (VALUES (50, 3)) AS x(d, z);
+----
+[[4.5]]
+
+# a reference qualified by a table is never substituted, whatever its last name
+
+statement ok
+CREATE MACRO qualified_last(a, b) AS list_transform([1], lambda x: b + first((SELECT list_transform([-1], lambda x: x.abs() + t.a)[1] FROM (VALUES (-7, 1)) AS t(x, a))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], lambda x: x.abs() + t.a)[1] FROM (VALUES (-7, 1)) AS t(x, a))));
+----
+[11]
+
+query I
+SELECT qualified_last(x.z, x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[11]
+
+# a VALUES list in a folded subquery counts as no table, also as the derived table without column aliases it prints
+# as, and gives its level only its alias and its column names
+
+statement ok
+CREATE MACRO values_limit(a) AS list_transform([1], lambda x: typeof((VALUES (1) LIMIT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((VALUES (1) LIMIT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_limit(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_printed(a) AS list_transform([1], lambda x: typeof((SELECT * FROM (VALUES (1)) AS valueslist LIMIT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT * FROM (VALUES (1)) AS valueslist LIMIT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_printed(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_printed_twice(a) AS list_transform([1], lambda x: typeof((SELECT * FROM (SELECT * FROM (VALUES (1)) AS valueslist) AS valueslist LIMIT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT * FROM (SELECT * FROM (VALUES (1)) AS valueslist) AS valueslist LIMIT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_printed_twice(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_derived(a) AS list_transform([1], lambda x: typeof((SELECT x FROM (VALUES ('s')) AS v)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x FROM (VALUES ('s')) AS v)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_derived(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_join(a) AS list_transform([1], lambda x: typeof((SELECT x FROM (VALUES ('s')) AS v, (VALUES (2)) AS w)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x FROM (VALUES ('s')) AS v, (VALUES (2)) AS w)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_join(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_col(a) AS list_transform([1], lambda col0: typeof((SELECT col0 FROM (VALUES ('s')) AS v)) || a);
+
+query I
+SELECT list_transform([1], lambda col0: typeof((SELECT col0 FROM (VALUES ('s')) AS v)) || '!');
+----
+[VARCHAR!]
+
+query I
+SELECT values_col(col0.z) FROM (VALUES ('!')) AS col0(z);
+----
+[VARCHAR!]
+
+statement ok
+CREATE MACRO values_alias(a) AS list_transform([1], lambda v: typeof((SELECT v FROM (VALUES ('s')) AS v)) || a);
+
+query I
+SELECT list_transform([1], lambda v: typeof((SELECT v FROM (VALUES ('s')) AS v)) || '!');
+----
+['STRUCT(col0 VARCHAR)!']
+
+query I
+SELECT values_alias(v.z) FROM (VALUES ('!')) AS v(z);
+----
+['STRUCT(col0 VARCHAR)!']
+
+statement ok
+CREATE MACRO values_on(a) AS list_transform([{'q': 1}], lambda col1: typeof((SELECT 1 FROM (VALUES ('s')) AS v JOIN (VALUES (1, 2)) AS w ON col1 + 1 = 3)) || a);
+
+query I
+SELECT list_transform([{'q': 1}], lambda col1: typeof((SELECT 1 FROM (VALUES ('s')) AS v JOIN (VALUES (1, 2)) AS w ON col1 + 1 = 3)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_on(col1.z) FROM (VALUES ('!')) AS col1(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO values_lateral(a) AS list_transform([{'q': 1}], lambda col1: typeof((SELECT k FROM (VALUES (1, 2)) AS w, (SELECT col1 + 1 AS k) AS d)) || a);
+
+query I
+SELECT list_transform([{'q': 1}], lambda col1: typeof((SELECT k FROM (VALUES (1, 2)) AS w, (SELECT col1 + 1 AS k) AS d)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT values_lateral(col1.z) FROM (VALUES ('!')) AS col1(z);
+----
+[INTEGER!]
