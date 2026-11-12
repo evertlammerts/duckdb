@@ -309,7 +309,8 @@ public:
 	BoundStatement BindAlterAddIndex(BoundStatement &result, CatalogEntry &entry, unique_ptr<AlterInfo> alter_info);
 
 	void SetCatalogLookupCallback(catalog_entry_callback_t callback);
-	//! Resolves names in the schema of a trigger, then in its catalog's default schema, then as the session does
+	//! Resolves names in the session's temporary schema, the schema of a trigger and its catalog's default schema,
+	//! then through the session's search path
 	void SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema);
 	//! Binds as a fired trigger's body: in the trigger's schema, recording nothing for a trigger being created
 	void PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema);
