@@ -205,7 +205,7 @@ private:
 
 //! The scope a generated CTE holding a fired trigger's body binds in
 struct TriggerBodyCTE {
-	//! The schema of the trigger, which the body's names resolve in first
+	//! The schema of the trigger, which the body's names resolve in after the session's temporary schema
 	reference<const SchemaCatalogEntry> schema;
 	//! The CTE of the firing statement's changed rows, the one name outside the body it can read; empty for BEFORE
 	Identifier transition_source;
