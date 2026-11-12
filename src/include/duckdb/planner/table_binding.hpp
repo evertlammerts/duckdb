@@ -188,6 +188,8 @@ struct CTEBindState {
 	idx_t active_binder_count;
 	//! The schema of the fired trigger whose body this CTE holds, if it holds one
 	optional_ptr<const SchemaCatalogEntry> trigger_body_schema;
+	//! The CTE of the firing statement's changed rows, the one name outside the body it can read
+	Identifier trigger_transition_source;
 	shared_ptr<Binder> query_binder;
 	BoundStatement query;
 	vector<Identifier> names;

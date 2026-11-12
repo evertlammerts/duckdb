@@ -107,8 +107,8 @@ static constexpr const char *TRIGGER_BASE_CTE_PREFIX = "__duckdb_trigger_base_";
 static constexpr const char *TRIGGER_BODY_CTE_PREFIX = "__duckdb_trigger_body_";
 static constexpr const char *TRIGGER_BEFORE_BODY_CTE_PREFIX = "__duckdb_trigger_before_body_";
 
-//! The generated CTE nodes holding fired trigger bodies, each with the schema of its trigger
-using trigger_body_list_t = vector<pair<reference<QueryNode>, reference<const SchemaCatalogEntry>>>;
+//! The generated CTE nodes holding fired trigger bodies, each with the scope it binds in
+using trigger_body_list_t = vector<pair<reference<QueryNode>, TriggerBodyCTE>>;
 
 static unique_ptr<CommonTableExpressionInfo> MakeTransitionTableAliasCTE(const Identifier &base_cte_name,
                                                                          const identifier_set_t &exclude_columns) {
@@ -344,7 +344,7 @@ static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<
 		trig_cte->query_node = trigger.trigger_action->Copy();
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		trigger_bodies.emplace_back(*trig_cte->query_node, trigger.ParentSchema());
+		trigger_bodies.emplace_back(*trig_cte->query_node, TriggerBodyCTE {trigger.ParentSchema(), base_cte_name});
 
 		// Scoped to this body so sibling triggers can't see the alias.
 		auto &body_map = trig_cte->query_node->cte_map.map;
@@ -392,7 +392,8 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 		trig_cte->query_node = before_triggers[i].get().trigger_action->Copy();
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		trigger_bodies.emplace_back(*trig_cte->query_node, before_triggers[i].get().ParentSchema());
+		trigger_bodies.emplace_back(*trig_cte->query_node,
+		                            TriggerBodyCTE {before_triggers[i].get().ParentSchema(), Identifier()});
 		outer->cte_map.map[body_cte_name] = std::move(trig_cte);
 	}
 
@@ -661,6 +662,14 @@ void Binder::PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema) {
 	SetTriggerBodySearchPath(trigger_schema);
 }
 
+shared_ptr<Binder> Binder::CreateTriggerBodyScope(Binder &parent, const Identifier &transition_source) {
+	auto scope = CreateBinder(parent.context, &parent, BinderType::TRIGGER_BODY_BINDER);
+	if (!transition_source.empty()) {
+		scope->trigger_transition_source = BindingAlias(transition_source);
+	}
+	return scope;
+}
+
 unique_ptr<ExpressionBinder> Binder::SetupRowScope(TableIndex table_index, const vector<Identifier> &col_names,
                                                    const vector<LogicalType> &col_types, const string &scope_name) {
 	bind_context.AddGenericBinding(table_index, Identifier(scope_name), col_names, col_types);
@@ -719,13 +728,14 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 	new_rows_proj->ResolveOperatorTypes();
 
 	auto row_scope_name = RowScopeName(event_type);
-	auto new_scope_binder = SetupRowScope(proj_idx, col_names, col_types, row_scope_name);
+	auto row_scope = CreateTriggerBodyScope(*this);
+	auto new_scope_binder = row_scope->SetupRowScope(proj_idx, col_names, col_types, row_scope_name);
 
 	unique_ptr<LogicalOperator> trigger_plan = std::move(new_rows_proj);
 	for (idx_t i = 0; i < triggers.size(); i++) {
 		auto &trigger = triggers[i].get();
 
-		auto child_binder = Binder::CreateBinder(context, this);
+		auto child_binder = Binder::CreateBinder(context, row_scope.get());
 		child_binder->PrepareFiredTriggerBody(trigger.ParentSchema());
 		auto body_copy = trigger.trigger_action->Copy();
 		auto bound_body = child_binder->Bind(*body_copy);
@@ -756,8 +766,7 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 		logi_trig->ResolveOperatorTypes();
 		trigger_plan = std::move(logi_trig);
 	}
-	// remove row_scope_binder
-	PopScope();
+	row_scope->PopScope();
 
 	Identifier trigger_cte_name(string(TRIGGER_BODY_CTE_PREFIX) + "row_" + uuid_suffix);
 	auto trigger_cte_idx = GenerateTableIndex();

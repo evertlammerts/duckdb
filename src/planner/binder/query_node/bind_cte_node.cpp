@@ -127,11 +127,13 @@ bool CTEBindState::IsBound() const {
 void CTEBindState::Bind(CTEBinding &binding) {
 	// we are lazily binding the CTE
 	// we need to bind it as if we were binding it during PrepareCTE
-	query_binder = Binder::CreateBinder(parent_binder.context, parent_binder);
-	query_binder->SetCanContainNulls(true);
 	if (trigger_body_schema) {
+		query_binder = Binder::CreateTriggerBodyScope(parent_binder, trigger_transition_source);
 		query_binder->PrepareFiredTriggerBody(*trigger_body_schema);
+	} else {
+		query_binder = Binder::CreateBinder(parent_binder.context, parent_binder);
 	}
+	query_binder->SetCanContainNulls(true);
 
 	// we clear any expression binders that were added in the mean-time, to ensure we are not binding to any newly added
 	// correlated columns
@@ -179,7 +181,8 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases);
 	auto trigger_body = global_binder_state->trigger_body_ctes.find(*statement.query_node);
 	if (trigger_body != global_binder_state->trigger_body_ctes.end()) {
-		result.cte_bind_state->trigger_body_schema = &trigger_body->second.get();
+		result.cte_bind_state->trigger_body_schema = &trigger_body->second.schema.get();
+		result.cte_bind_state->trigger_transition_source = trigger_body->second.transition_source;
 	}
 
 	result.child_binder = Binder::CreateBinder(context, this);

@@ -25,6 +25,7 @@
 #include "duckdb/parser/tableref/delimgetref.hpp"
 #include "duckdb/parser/tokens.hpp"
 #include "duckdb/planner/bind_context.hpp"
+#include "duckdb/planner/binding_alias.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/bound_tokens.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -118,7 +119,7 @@ enum class BindingMode : uint8_t {
 	EXTRACT_REPLACEMENT_SCANS,
 	EXTRACT_QUALIFIED_NAMES
 };
-enum class BinderType : uint8_t { REGULAR_BINDER, VIEW_BINDER };
+enum class BinderType : uint8_t { REGULAR_BINDER, VIEW_BINDER, TRIGGER_BODY_BINDER };
 
 struct CorrelatedColumnInfo {
 	ColumnBinding binding;
@@ -202,6 +203,14 @@ private:
 	idx_t delim_index;
 };
 
+//! The scope a generated CTE holding a fired trigger's body binds in
+struct TriggerBodyCTE {
+	//! The schema of the trigger, which the body's names resolve in after the session's temporary schema
+	reference<const SchemaCatalogEntry> schema;
+	//! The CTE of the firing statement's changed rows, the one name outside the body it can read; empty for BEFORE
+	Identifier transition_source;
+};
+
 //! GlobalBinderState is state shared over the ENTIRE query, including subqueries, views, etc
 struct GlobalBinderState {
 	//! The count of bound_tables
@@ -229,9 +238,9 @@ struct GlobalBinderState {
 	//! table order, under which the captured OLD image is exposed via SQL aliases. Only populated for capture
 	//! requests presented through a CTE; a consumer that reads the OLD image directly leaves it absent.
 	reference_map_t<QueryNode, vector<Identifier>> trigger_old_capture_cte_names;
-	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the schema of that
-	//! trigger, in which the body binds. A trigger being created does not depend on what those bodies resolve.
-	reference_map_t<QueryNode, reference<const SchemaCatalogEntry>> trigger_body_ctes;
+	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the scope the body
+	//! binds in. A trigger being created does not depend on what those bodies resolve.
+	reference_map_t<QueryNode, TriggerBodyCTE> trigger_body_ctes;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
@@ -314,6 +323,9 @@ public:
 	void SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema);
 	//! Binds as a fired trigger's body: in the trigger's schema, recording nothing for a trigger being created
 	void PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema);
+	//! Hides the firing statement's CTEs and columns from a fired trigger body, except a given CTE of its changed rows
+	static shared_ptr<Binder> CreateTriggerBodyScope(Binder &parent,
+	                                                 const Identifier &transition_source = Identifier());
 	void BindCreateViewInfo(CreateViewInfo &base);
 	static void BindView(ClientContext &context, const SelectStatement &stmt, const Identifier &catalog_name,
 	                     const vector<Identifier> &schema_path, optional_ptr<LogicalDependencyList> dependencies,
@@ -468,6 +480,8 @@ private:
 	shared_ptr<Binder> parent;
 	//! What kind of node we are binding using this binder
 	BinderType binder_type = BinderType::REGULAR_BINDER;
+	//! For a trigger body scope, the one CTE of the firing statement it can see, if any
+	BindingAlias trigger_transition_source;
 	//! Global binder state
 	shared_ptr<GlobalBinderState> global_binder_state;
 	//! Active binders
@@ -498,6 +512,8 @@ private:
 private:
 	//! Determine the depth of the binder
 	idx_t GetBinderDepth() const;
+	//! Whether the CTE lookup for the given name continues past this binder to its parent
+	bool SeesOuterCTE(const BindingAlias &name) const;
 	//! Increase the depth of the binder
 	void IncreaseDepth();
 	//! Bind the expressions of generated columns to check for errors
