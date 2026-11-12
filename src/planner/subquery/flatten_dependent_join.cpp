@@ -1730,6 +1730,10 @@ FlattenDependentJoins::PushDownCorrelatedNodeInternal(unique_ptr<LogicalOperator
 		// the modified row count is a side effect
 		return PushDownDML(plan, false, std::move(state));
 	}
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		// Only row trigger firings reach here, and one batched MERGE cannot see the rows other firings write.
+		throw NotImplementedException(
+		    "MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger");
 	case LogicalOperatorType::LOGICAL_PIVOT:
 		throw BinderException("PIVOT is not supported in correlated subqueries yet");
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
