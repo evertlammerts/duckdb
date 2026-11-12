@@ -422,6 +422,37 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 	return outer;
 }
 
+// Registers a chain's OLD capture request and fired body CTE nodes in the global binder state while the chain binds,
+// and removes them however the bind ends, because the registered nodes are destroyed with the chain.
+class TriggerChainBindState {
+public:
+	TriggerChainBindState(GlobalBinderState &state, const trigger_body_list_t &trigger_bodies,
+	                      optional_ptr<QueryNode> capture_base, const vector<Identifier> &old_capture_names)
+	    : state(state), capture_base(capture_base), trigger_bodies(trigger_bodies) {
+		if (capture_base) {
+			state.trigger_old_capture.insert(*capture_base);
+			state.trigger_old_capture_cte_names[*capture_base] = old_capture_names;
+		}
+		for (auto &body : trigger_bodies) {
+			state.trigger_body_ctes.emplace(body.first, body.second);
+		}
+	}
+	~TriggerChainBindState() {
+		if (capture_base) {
+			state.trigger_old_capture.erase(*capture_base);
+			state.trigger_old_capture_cte_names.erase(*capture_base);
+		}
+		for (auto &body : trigger_bodies) {
+			state.trigger_body_ctes.erase(body.first);
+		}
+	}
+
+private:
+	GlobalBinderState &state;
+	optional_ptr<QueryNode> capture_base;
+	trigger_body_list_t trigger_bodies;
+};
+
 BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
                                       const vector<const_reference<TriggerCatalogEntry>> &before_triggers,
                                       const vector<const_reference<TriggerCatalogEntry>> &after_triggers) {
@@ -456,20 +487,10 @@ BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
 	// Request OLD capture on the generated base UPDATE in scoped binder state, active only while binding this
 	// chain. BindNode(UpdateQueryNode) reads the request by node identity, so it never touches the parsed AST.
 	// The reserved CTE presentation names are separate, optional state for the statement-trigger CTE consumer.
-	if (capture_base) {
-		global_binder_state->trigger_old_capture.insert(*capture_base);
-		global_binder_state->trigger_old_capture_cte_names[*capture_base] = old_capture_names;
-	}
-	for (auto &body : trigger_bodies) {
-		global_binder_state->trigger_body_ctes.emplace(body.first, body.second);
-	}
-	auto chain = Bind(*outer);
-	if (capture_base) {
-		global_binder_state->trigger_old_capture.erase(*capture_base);
-		global_binder_state->trigger_old_capture_cte_names.erase(*capture_base);
-	}
-	for (auto &body : trigger_bodies) {
-		global_binder_state->trigger_body_ctes.erase(body.first);
+	BoundStatement chain;
+	{
+		TriggerChainBindState chain_state(*global_binder_state, trigger_bodies, capture_base, old_capture_names);
+		chain = Bind(*outer);
 	}
 
 	if (!has_returning) {

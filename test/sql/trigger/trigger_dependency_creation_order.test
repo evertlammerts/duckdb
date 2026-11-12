@@ -791,8 +791,8 @@ SELECT list(id ORDER BY id) FROM a16;
 ----
 [1, 2, 3]
 
-# A reached trigger whose unqualified body resolves to another database in the writer's session no longer
-# refuses the writer, in either order; the refusal of the writer's own reference stays
+# A writer whose reached trigger resolves an unqualified name to another database in the writer's session is
+# accepted in either order; a trigger's own reference to another database is refused
 statement ok
 ATTACH '{TEST_DIR}/trigger_dependency_creation_order.db' AS o17 (STORAGE_VERSION 'v2.0.0');
 
