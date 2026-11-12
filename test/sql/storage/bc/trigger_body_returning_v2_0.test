@@ -1,0 +1,154 @@
+# name: test/sql/storage/bc/trigger_body_returning_v2_0.test
+# description: A stored trigger whose body has RETURNING, written by v2.0.0, is refused when it fires; the file loads and its other triggers fire
+# group: [bc]
+
+# data/storage/trigger_body_returning_v2_0.db.gz was written by DuckDB v2.0.0 with
+# CREATE TABLE r(id INTEGER);
+# CREATE TABLE tgt(id INTEGER);
+# CREATE TABLE log(id INTEGER);
+# CREATE TRIGGER st AFTER INSERT ON tgt FOR EACH STATEMENT INSERT INTO log VALUES (1);
+# CREATE TRIGGER rr AFTER INSERT ON r FOR EACH ROW INSERT INTO tgt VALUES (NEW.id) RETURNING id * 9;
+# CREATE TABLE s(id INTEGER);
+# CREATE TABLE slog(k VARCHAR, id INTEGER);
+# CREATE TRIGGER s_after AFTER INSERT ON s FOR EACH STATEMENT INSERT INTO slog VALUES ('after', 1) RETURNING id;
+# CREATE TRIGGER s_before BEFORE DELETE ON s FOR EACH STATEMENT UPDATE slog SET id = id + 1 RETURNING id;
+# CREATE TABLE q(id INTEGER);
+# CREATE TRIGGER q_fires_s AFTER INSERT ON q FOR EACH STATEMENT INSERT INTO s SELECT id FROM q;
+# CREATE TABLE k(id INTEGER);
+# CREATE TABLE klog(k VARCHAR, id INTEGER);
+# CREATE TRIGGER k_stmt AFTER INSERT ON k FOR EACH STATEMENT INSERT INTO klog VALUES ('stmt', 0);
+# CREATE TABLE kr(id INTEGER);
+# CREATE TRIGGER kr_row AFTER INSERT ON kr FOR EACH ROW INSERT INTO klog VALUES ('row', NEW.id);
+# CHECKPOINT;
+
+unzip data/storage/trigger_body_returning_v2_0.db.gz {TEST_DIR}/trigger_body_returning_v2_0.db
+
+statement ok
+ATTACH '{TEST_DIR}/trigger_body_returning_v2_0.db' AS v20;
+
+query T
+SELECT trigger_name FROM duckdb_triggers() WHERE database_name = 'v20' ORDER BY ALL;
+----
+k_stmt
+kr_row
+q_fires_s
+rr
+s_after
+s_before
+st
+
+statement error
+INSERT INTO v20.r VALUES (1), (2);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rr" on table "r")
+
+statement error
+INSERT INTO v20.s VALUES (1);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s_after" on table "s")
+
+statement error
+DELETE FROM v20.s;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s_before" on table "s")
+
+statement error
+INSERT INTO v20.q VALUES (3);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s_after" on table "s")
+
+statement error
+CREATE TRIGGER k_fires_s AFTER DELETE ON v20.k FOR EACH STATEMENT INSERT INTO s VALUES (9);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s_after" on table "s")
+
+query IIIIII
+SELECT (SELECT count(*) FROM v20.r), (SELECT count(*) FROM v20.s), (SELECT count(*) FROM v20.q),
+	(SELECT count(*) FROM v20.tgt), (SELECT count(*) FROM v20.log), (SELECT count(*) FROM v20.slog);
+----
+0	0	0	0	0	0
+
+statement ok
+INSERT INTO v20.k VALUES (1);
+
+statement ok
+INSERT INTO v20.kr VALUES (4), (5);
+
+statement ok
+INSERT INTO v20.tgt VALUES (7);
+
+query TI
+SELECT k, id FROM v20.klog ORDER BY ALL;
+----
+row	4
+row	5
+stmt	0
+
+query I
+FROM v20.log;
+----
+1
+
+# Dropping or replacing a refused trigger makes its table writable again
+statement ok
+DROP TRIGGER rr ON v20.r;
+
+statement ok
+CREATE TRIGGER rr AFTER INSERT ON v20.r FOR EACH ROW INSERT INTO tgt VALUES (NEW.id);
+
+statement ok
+INSERT INTO v20.r VALUES (1), (2);
+
+query I
+SELECT id FROM v20.tgt ORDER BY id;
+----
+1
+2
+7
+
+statement ok
+CREATE OR REPLACE TRIGGER s_after AFTER INSERT ON v20.s FOR EACH STATEMENT INSERT INTO slog VALUES ('after', 1);
+
+statement ok
+DROP TRIGGER s_before ON v20.s;
+
+statement ok
+INSERT INTO v20.q VALUES (3);
+
+query TI
+SELECT k, id FROM v20.slog;
+----
+after	1
+
+query I
+FROM v20.s;
+----
+3
+
+statement ok
+DETACH v20;
+
+statement ok
+ATTACH '{TEST_DIR}/trigger_body_returning_v2_0.db' AS v20;
+
+query T
+SELECT trigger_name FROM duckdb_triggers() WHERE database_name = 'v20' ORDER BY ALL;
+----
+k_stmt
+kr_row
+q_fires_s
+rr
+s_after
+st
+
+statement ok
+DELETE FROM v20.s;
+
+statement ok
+INSERT INTO v20.s VALUES (4);
+
+query TI
+SELECT k, id FROM v20.slog ORDER BY ALL;
+----
+after	1
+after	1

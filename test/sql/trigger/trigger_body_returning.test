@@ -1,5 +1,5 @@
 # name: test/sql/trigger/trigger_body_returning.test
-# description: A RETURNING list binds with the catalog lookups of its statement, in a trigger body too; the RETURNING * the trigger expansion adds records nothing
+# description: RETURNING in a trigger body is refused at CREATE TRIGGER; a body without it fires; the RETURNING * the trigger expansion adds and a writer's own list record nothing
 # group: [trigger]
 
 require noforcestorage
@@ -21,7 +21,7 @@ JOIN (
 WHERE t.trigger_name = trg
 ORDER BY ALL;
 
-# A statement body's RETURNING list makes the trigger depend on the macro it calls
+# A statement body with RETURNING is refused, and the same body without it fires
 statement ok
 CREATE TABLE c(id INTEGER);
 
@@ -31,20 +31,26 @@ CREATE TABLE log(id INTEGER);
 statement ok
 CREATE MACRO f(x) AS x + 1;
 
-statement ok
+statement error
 CREATE TRIGGER sc AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (2) RETURNING f(id);
-
-query II
-FROM trigger_deps('sc');
 ----
-c	a
-f	n
-log	n
+Binder Error: RETURNING is not allowed in a trigger body (trigger "sc" on table "c")
 
 statement error
-DROP MACRO f;
+CREATE TRIGGER sc AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (2) RETURNING *;
 ----
-trigger "sc" on table "c" depends on macro function "f"
+Binder Error: RETURNING is not allowed in a trigger body (trigger "sc" on table "c")
+
+query I
+SELECT count(*) FROM duckdb_triggers() WHERE trigger_name = 'sc';
+----
+0
+
+statement ok
+DROP MACRO f;
+
+statement ok
+CREATE TRIGGER sc AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (2);
 
 statement ok
 INSERT INTO c VALUES (1);
@@ -57,40 +63,6 @@ FROM log;
 statement ok
 DROP TRIGGER sc ON c;
 
-statement ok
-DROP MACRO f;
-
-statement ok
-INSERT INTO c VALUES (2);
-
-query I
-SELECT count(*) FROM c;
-----
-2
-
-# DROP ... CASCADE takes the trigger with the macro
-statement ok
-CREATE MACRO f(x) AS x + 1;
-
-statement ok
-CREATE TRIGGER sc AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (2) RETURNING f(id);
-
-statement ok
-DROP MACRO f CASCADE;
-
-query I
-SELECT count(*) FROM duckdb_triggers() WHERE trigger_name = 'sc';
-----
-0
-
-statement ok
-INSERT INTO c VALUES (3);
-
-query I
-SELECT count(*) FROM log;
-----
-1
-
 # FOR EACH ROW bodies: INSERT with NEW, DELETE with OLD
 statement ok
 CREATE TABLE r(id INTEGER);
@@ -101,38 +73,32 @@ CREATE TABLE rlog(id INTEGER);
 statement ok
 CREATE MACRO fr(x) AS x * 10;
 
-statement ok
-CREATE MACRO fd(x) AS x * 100;
-
-statement ok
+statement error
 CREATE TRIGGER ri AFTER INSERT ON r FOR EACH ROW INSERT INTO rlog VALUES (NEW.id) RETURNING fr(id);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "ri" on table "r")
+
+statement error
+CREATE TRIGGER rd AFTER DELETE ON r FOR EACH ROW DELETE FROM rlog WHERE id = OLD.id RETURNING id;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rd" on table "r")
+
+# The refusal comes before the body binds: a list naming NEW or OLD gets it too
+statement error
+CREATE TRIGGER rn AFTER INSERT ON r FOR EACH ROW INSERT INTO rlog VALUES (1) RETURNING NEW.id;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rn" on table "r")
+
+statement error
+CREATE TRIGGER rn AFTER DELETE ON r FOR EACH ROW INSERT INTO rlog VALUES (OLD.id) RETURNING OLD.id;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rn" on table "r")
 
 statement ok
-CREATE TRIGGER rd AFTER DELETE ON r FOR EACH ROW DELETE FROM rlog WHERE id = OLD.id RETURNING fd(id);
+CREATE TRIGGER ri AFTER INSERT ON r FOR EACH ROW INSERT INTO rlog VALUES (NEW.id);
 
-query II
-FROM trigger_deps('ri');
-----
-fr	n
-r	a
-rlog	n
-
-query II
-FROM trigger_deps('rd');
-----
-fd	n
-r	a
-rlog	n
-
-statement error
-DROP MACRO fr;
-----
-trigger "ri" on table "r" depends on macro function "fr"
-
-statement error
-DROP MACRO fd;
-----
-trigger "rd" on table "r" depends on macro function "fd"
+statement ok
+CREATE TRIGGER rd AFTER DELETE ON r FOR EACH ROW DELETE FROM rlog WHERE id = OLD.id;
 
 statement ok
 INSERT INTO r VALUES (1), (2), (3);
@@ -146,23 +112,7 @@ SELECT id FROM rlog ORDER BY id;
 1
 3
 
-# NEW or OLD stay out of a RETURNING list: a write correlated only there would run once for all firing rows
-statement error
-CREATE TRIGGER rn AFTER INSERT ON r FOR EACH ROW INSERT INTO rlog VALUES (1) RETURNING NEW.id;
-----
-Referenced table "NEW" not found
-
-statement error
-CREATE TRIGGER rn AFTER INSERT ON r FOR EACH ROW INSERT INTO rlog VALUES (NEW.id) RETURNING NEW.id;
-----
-Referenced table "NEW" not found
-
-statement error
-CREATE TRIGGER rn AFTER DELETE ON r FOR EACH ROW INSERT INTO rlog VALUES (OLD.id) RETURNING OLD.id;
-----
-Referenced table "OLD" not found
-
-# A BEFORE body, UPDATE and DELETE bodies, and a function, a user type and a sequence in RETURNING
+# A BEFORE body, UPDATE and DELETE bodies
 statement ok
 CREATE TABLE s1(id INTEGER);
 
@@ -170,61 +120,31 @@ statement ok
 CREATE TABLE s1log(id INTEGER, n INTEGER);
 
 statement ok
-CREATE MACRO fb(x) AS x - 1;
-
-statement ok
-CREATE MACRO fu(x) AS x + 100;
-
-statement ok
-CREATE FUNCTION fdel(x) AS x * 2;
-
-statement ok
-CREATE TYPE mood AS ENUM ('ok', 'bad');
-
-statement ok
 CREATE SEQUENCE sq;
 
-statement ok
-CREATE TRIGGER s1b BEFORE INSERT ON s1 FOR EACH STATEMENT INSERT INTO s1log VALUES (0, 0) RETURNING fb(id);
-
-statement ok
-CREATE TRIGGER s1u AFTER INSERT ON s1 FOR EACH STATEMENT UPDATE s1log SET n = n + 1 RETURNING fu(n), 'ok'::mood;
-
-statement ok
-CREATE TRIGGER s1d AFTER DELETE ON s1 FOR EACH STATEMENT DELETE FROM s1log WHERE n > 5 RETURNING fdel(id), nextval('sq');
-
-query II
-FROM trigger_deps('s1b');
+statement error
+CREATE TRIGGER s1b BEFORE INSERT ON s1 FOR EACH STATEMENT INSERT INTO s1log VALUES (0, 0) RETURNING id - 1;
 ----
-fb	n
-s1	a
-s1log	n
-
-query II
-FROM trigger_deps('s1u');
-----
-fu	n
-mood	n
-s1	a
-s1log	n
-
-query II
-FROM trigger_deps('s1d');
-----
-fdel	n
-s1	a
-s1log	n
-sq	n
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s1b" on table "s1")
 
 statement error
-DROP TYPE mood;
+CREATE TRIGGER s1u AFTER INSERT ON s1 FOR EACH STATEMENT UPDATE s1log SET n = n + 1 RETURNING n + 100;
 ----
-trigger "s1u" on table "s1" depends on type "mood"
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s1u" on table "s1")
 
 statement error
-DROP SEQUENCE sq;
+CREATE TRIGGER s1d AFTER DELETE ON s1 FOR EACH STATEMENT DELETE FROM s1log WHERE n > 5 RETURNING id * 2, nextval('sq');
 ----
-trigger "s1d" on table "s1" depends on sequence "sq"
+Binder Error: RETURNING is not allowed in a trigger body (trigger "s1d" on table "s1")
+
+statement ok
+CREATE TRIGGER s1b BEFORE INSERT ON s1 FOR EACH STATEMENT INSERT INTO s1log VALUES (0, 0);
+
+statement ok
+CREATE TRIGGER s1u AFTER INSERT ON s1 FOR EACH STATEMENT UPDATE s1log SET n = n + 1;
+
+statement ok
+CREATE TRIGGER s1d AFTER DELETE ON s1 FOR EACH STATEMENT DELETE FROM s1log WHERE n > 5;
 
 statement ok
 INSERT INTO s1 VALUES (1);
@@ -246,31 +166,33 @@ SELECT count(*) FROM s1log;
 ----
 2
 
-# An upsert body binds through the MERGE rewrite and records its RETURNING list too
+query I
+SELECT count(*) FROM duckdb_sequences() WHERE sequence_name = 'sq' AND last_value IS NULL;
+----
+1
+
+# An upsert body, which binds through the MERGE rewrite, and a MERGE INTO body
 statement ok
 CREATE TABLE u(id INTEGER);
 
 statement ok
 CREATE TABLE ukeys(id INTEGER PRIMARY KEY, v INTEGER);
 
-statement ok
-CREATE MACRO fv(x) AS x * 3;
+statement error
+CREATE TRIGGER su AFTER INSERT ON u FOR EACH STATEMENT
+	INSERT INTO ukeys SELECT id, 0 FROM u ON CONFLICT DO UPDATE SET v = v + 1 RETURNING v * 3;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "su" on table "u")
+
+statement error
+CREATE TRIGGER su AFTER INSERT ON u FOR EACH STATEMENT
+	INSERT OR REPLACE INTO ukeys SELECT id, 0 FROM u RETURNING v;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "su" on table "u")
 
 statement ok
 CREATE TRIGGER su AFTER INSERT ON u FOR EACH STATEMENT
-	INSERT INTO ukeys SELECT id, 0 FROM u ON CONFLICT DO UPDATE SET v = v + 1 RETURNING fv(v);
-
-query II
-FROM trigger_deps('su');
-----
-fv	n
-u	a
-ukeys	n
-
-statement error
-DROP MACRO fv;
-----
-trigger "su" on table "u" depends on macro function "fv"
+	INSERT INTO ukeys SELECT id, 0 FROM u ON CONFLICT DO UPDATE SET v = v + 1;
 
 statement ok
 INSERT INTO u VALUES (1);
@@ -284,33 +206,24 @@ SELECT id, v FROM ukeys ORDER BY id;
 1	1
 2	0
 
-# A MERGE INTO body's RETURNING list, merge_action included
 statement ok
 CREATE TABLE m(id INTEGER);
 
 statement ok
 CREATE TABLE mk(id INTEGER PRIMARY KEY, v INTEGER);
 
-statement ok
-CREATE MACRO fm(x) AS x + 5;
+statement error
+CREATE TRIGGER sm AFTER INSERT ON m FOR EACH STATEMENT
+	MERGE INTO mk USING (SELECT id FROM m) src ON mk.id = src.id
+	WHEN MATCHED THEN UPDATE SET v = v + 1 WHEN NOT MATCHED THEN INSERT VALUES (src.id, 0)
+	RETURNING merge_action, v + 5;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "sm" on table "m")
 
 statement ok
 CREATE TRIGGER sm AFTER INSERT ON m FOR EACH STATEMENT
 	MERGE INTO mk USING (SELECT id FROM m) src ON mk.id = src.id
-	WHEN MATCHED THEN UPDATE SET v = v + 1 WHEN NOT MATCHED THEN INSERT VALUES (src.id, 0)
-	RETURNING merge_action, fm(v);
-
-query II
-FROM trigger_deps('sm');
-----
-fm	n
-m	a
-mk	n
-
-statement error
-DROP MACRO fm;
-----
-trigger "sm" on table "m" depends on macro function "fm"
+	WHEN MATCHED THEN UPDATE SET v = v + 1 WHEN NOT MATCHED THEN INSERT VALUES (src.id, 0);
 
 statement ok
 INSERT INTO m VALUES (1);
@@ -324,30 +237,43 @@ SELECT id, v FROM mk ORDER BY id;
 1	1
 2	0
 
-# The body's RETURNING resolves bare names in the trigger's schema, whoever fires it
+# A body with a WITH clause carries its RETURNING on its own statement; a data modifying WITH stays refused in a row body
+statement error
+CREATE TRIGGER sw AFTER INSERT ON c FOR EACH STATEMENT WITH x AS (SELECT 4 AS id) INSERT INTO log SELECT id FROM x RETURNING id;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "sw" on table "c")
+
+statement error
+CREATE TRIGGER rw AFTER INSERT ON r FOR EACH ROW WITH x AS (SELECT NEW.id AS id) INSERT INTO rlog SELECT id FROM x RETURNING id;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rw" on table "r")
+
+statement error
+CREATE TRIGGER rw AFTER INSERT ON r FOR EACH ROW WITH x AS (DELETE FROM rlog RETURNING id) INSERT INTO log SELECT NEW.id + id FROM x;
+----
+WITH clause containing a data-modifying statement must be at the top level
+
+statement ok
+CREATE TRIGGER sw AFTER INSERT ON c FOR EACH STATEMENT WITH x AS (SELECT 4 AS id) INSERT INTO log SELECT id FROM x;
+
+statement ok
+INSERT INTO c VALUES (5);
+
+query I
+SELECT id FROM log ORDER BY id;
+----
+2
+4
+
+statement ok
+DROP TRIGGER sw ON c;
+
+# A trigger in another schema, and a body writing into a table with a statement trigger
 statement ok
 CREATE SCHEMA sch;
 
 statement ok
-CREATE MACRO sch.only_s() AS 's';
-
-statement ok
-CREATE MACRO main.twice() AS 'main';
-
-statement ok
-CREATE MACRO sch.twice() AS 's';
-
-statement ok
-CREATE SEQUENCE main.bq START 100;
-
-statement ok
-CREATE SEQUENCE sch.bq START 200;
-
-statement ok
 CREATE TABLE sch.t(id INTEGER);
-
-statement ok
-CREATE TABLE sch.t2(id INTEGER);
 
 statement ok
 CREATE TABLE sch.tlog(v VARCHAR);
@@ -358,95 +284,15 @@ CREATE TABLE sch.t3(id INTEGER);
 statement ok
 CREATE TRIGGER s3 AFTER INSERT ON sch.t3 FOR EACH STATEMENT INSERT INTO sch.tlog VALUES ('t3');
 
-statement ok
-SET search_path = 'sch';
-
-statement ok
-CREATE TRIGGER st AFTER INSERT ON t FOR EACH STATEMENT INSERT INTO tlog VALUES ('a') RETURNING only_s(), twice(), nextval('bq');
-
-statement ok
-CREATE TRIGGER rt AFTER INSERT ON t2 FOR EACH ROW INSERT INTO tlog VALUES (NEW.id::VARCHAR) RETURNING twice(), nextval('bq');
-
-# The written table has a statement trigger, so this list binds in the expansion of the body's own INSERT
-statement ok
-CREATE TRIGGER sx AFTER INSERT ON t FOR EACH STATEMENT INSERT INTO t3 VALUES (3) RETURNING only_s(), twice();
-
-statement ok
-RESET search_path;
-
-query II
-FROM trigger_deps('st');
+statement error
+CREATE TRIGGER sx AFTER INSERT ON sch.t FOR EACH STATEMENT INSERT INTO sch.t3 VALUES (3) RETURNING id;
 ----
-bq	n
-only_s	n
-t	a
-tlog	n
-twice	n
-
-query II
-FROM trigger_deps('rt');
-----
-bq	n
-t2	a
-tlog	n
-twice	n
-
-query II
-FROM trigger_deps('sx');
-----
-only_s	n
-t	a
-t3	n
-twice	n
-
-statement ok
-INSERT INTO sch.t VALUES (1);
-
-statement ok
-DROP MACRO main.twice;
-
-statement ok
-DROP SEQUENCE main.bq;
+Binder Error: RETURNING is not allowed in a trigger body (trigger "sx" on table "t")
 
 statement error
-DROP MACRO sch.twice;
+CREATE TRIGGER rx AFTER INSERT ON sch.t FOR EACH ROW INSERT INTO sch.t3 VALUES (NEW.id) RETURNING id;
 ----
-depends on macro function "twice"
-
-statement error
-DROP SEQUENCE sch.bq;
-----
-depends on sequence "bq"
-
-statement ok
-INSERT INTO sch.t2 VALUES (1);
-
-statement ok
-SET search_path = 'sch';
-
-statement ok
-INSERT INTO t VALUES (2);
-
-statement ok
-INSERT INTO t2 VALUES (2);
-
-statement ok
-RESET search_path;
-
-query T
-SELECT v FROM sch.tlog ORDER BY v;
-----
-1
-2
-a
-a
-t3
-t3
-
-query I
-SELECT count(*) FROM sch.t3;
-----
-2
+Binder Error: RETURNING is not allowed in a trigger body (trigger "rx" on table "t")
 
 # The expansion's RETURNING * over a generated column calling a macro records nothing, in both creation orders
 statement ok
@@ -529,102 +375,35 @@ SELECT id, count(*) FROM glog GROUP BY id ORDER BY id;
 2	2
 3	2
 
-# A writer's own RETURNING * over that generated column is the user's list, in both creation orders
+# A body's own RETURNING over a written table with a generated column and statement triggers is refused
 statement ok
 CREATE TABLE ga(id INTEGER, g INTEGER GENERATED ALWAYS AS (fg(id)));
 
-statement ok
+statement error
 CREATE TRIGGER wa_first AFTER INSERT ON gw FOR EACH STATEMENT INSERT INTO ga SELECT id FROM gw RETURNING *;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "wa_first" on table "gw")
 
 statement ok
 CREATE TRIGGER ga_ins AFTER INSERT ON ga FOR EACH STATEMENT INSERT INTO glog VALUES (4);
 
-statement ok
+statement error
 CREATE TRIGGER wa_second AFTER INSERT ON gw FOR EACH STATEMENT INSERT INTO ga SELECT id FROM gw RETURNING *;
-
-query II
-FROM trigger_deps('wa_first');
 ----
-fg	n
-ga	n
-gw	a
-
-query II
-FROM trigger_deps('wa_second');
-----
-fg	n
-ga	n
-gw	a
-
-statement ok
-INSERT INTO gw VALUES (2);
-
-query II
-SELECT id, g FROM ga ORDER BY ALL;
-----
-2	14
-2	14
-
-# UPDATE and DELETE lists bound in the expansion of a table with statement triggers are the user's too, the
-# generated column read by the DELETE's list included
-statement ok
-CREATE MACRO fx(x) AS x - 1;
-
-statement ok
-CREATE TRIGGER ga_upd AFTER UPDATE ON ga FOR EACH STATEMENT INSERT INTO glog VALUES (5);
-
-statement ok
-CREATE TRIGGER ga_del AFTER DELETE ON ga FOR EACH STATEMENT INSERT INTO glog VALUES (6);
-
-statement ok
-CREATE TRIGGER wa_upd AFTER DELETE ON gw FOR EACH STATEMENT UPDATE ga SET id = id + 1 RETURNING fx(id);
-
-statement ok
-CREATE TRIGGER wa_del AFTER DELETE ON gw FOR EACH STATEMENT DELETE FROM ga WHERE id > 100 RETURNING fx(g);
-
-query II
-FROM trigger_deps('wa_upd');
-----
-fx	n
-ga	n
-gw	a
-
-query II
-FROM trigger_deps('wa_del');
-----
-fg	n
-fx	n
-ga	n
-gw	a
-
-statement ok
-DELETE FROM gw;
-
-query II
-SELECT id, count(*) FROM glog WHERE id >= 5 GROUP BY id ORDER BY id;
-----
-5	1
-6	1
-
-# A temporary entry in a body's RETURNING list is refused, as in the rest of the body
-statement ok
-CREATE TEMP MACRO tmac(x) AS x;
+Binder Error: RETURNING is not allowed in a trigger body (trigger "wa_second" on table "gw")
 
 statement error
-CREATE TRIGGER tt AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (1) RETURNING tmac(id);
+CREATE TRIGGER wa_upd AFTER DELETE ON gw FOR EACH STATEMENT UPDATE ga SET id = id + 1 RETURNING g;
 ----
-Trigger "tt" cannot reference "tmac" from a different catalog ("temp")
+Binder Error: RETURNING is not allowed in a trigger body (trigger "wa_upd" on table "gw")
+
+statement error
+CREATE TRIGGER wa_del AFTER DELETE ON gw FOR EACH STATEMENT DELETE FROM ga WHERE id > 100 RETURNING g;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "wa_del" on table "gw")
 
 statement ok
 ATTACH ':memory:' AS other;
-
-statement ok
-CREATE MACRO other.omac(x) AS x;
-
-statement error
-CREATE TRIGGER tt AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (1) RETURNING other.omac(id);
-----
-Trigger "tt" cannot reference "omac" from a different catalog ("other")
 
 # Outside triggers RETURNING resolves as before, and a prepared statement rebinds instead of recording
 statement ok
@@ -766,9 +545,6 @@ statement ok
 SET VARIABLE rseq = 'bseq';
 
 statement ok
-CREATE SEQUENCE bseq;
-
-statement ok
 CREATE TABLE bc(id INTEGER);
 
 statement ok
@@ -790,19 +566,13 @@ CREATE TRIGGER b_pruned AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SEL
 statement ok
 CREATE TRIGGER b_query AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SELECT 'query', * FROM query('SELECT $bv::INTEGER');
 
-# The RETURNING list's output is discarded, but nextval resolves the sequence its $rseq names when the body binds
-statement ok
+statement error
 CREATE TRIGGER b_ret AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl VALUES ('ret', 20) RETURNING nextval($rseq);
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "b_ret" on table "bc")
 
 statement ok
 CREATE TRIGGER b_row AFTER INSERT ON br FOR EACH ROW INSERT INTO bl VALUES ('row', NEW.id + $bv);
-
-query II
-FROM trigger_deps('b_ret');
-----
-bc	a
-bl	n
-bseq	n
 
 statement ok
 INSERT INTO bc VALUES (0);
@@ -817,12 +587,12 @@ SET VARIABLE bv = 6;
 statement ok
 EXECUTE bp;
 
-# Named parameters of the firing statement do not reach the bodies, here one that names no sequence
+# A named parameter of the firing statement does not reach the bodies
 statement ok
-PREPARE bq AS INSERT INTO bc SELECT $bv WHERE $rseq <> '';
+PREPARE bq AS INSERT INTO bc VALUES ($bv);
 
 statement ok
-EXECUTE bq(bv := 7, rseq := 'no_such_sequence');
+EXECUTE bq(bv := 7);
 
 statement ok
 PREPARE bpr AS INSERT INTO br VALUES ($bv);
@@ -839,9 +609,6 @@ pruned	10
 query	5
 query	6
 query	6
-ret	20
-ret	20
-ret	20
 row	106
 sub	5
 sub	6
@@ -873,7 +640,7 @@ statement ok
 CREATE TABLE bn(v VARCHAR);
 
 statement ok
-CREATE TRIGGER b_seq AFTER INSERT ON bn FOR EACH STATEMENT INSERT INTO bl SELECT 'seq', nextval($sq) RETURNING nextval($sq);
+CREATE TRIGGER b_seq AFTER INSERT ON bn FOR EACH STATEMENT INSERT INTO bl SELECT 'seq', nextval($sq);
 
 query II
 FROM trigger_deps('b_seq');
@@ -918,32 +685,96 @@ SELECT count(*) FROM bc;
 ----
 3
 
-# The recorded dependencies survive a restart
-load {TEST_DIR}/trigger_body_returning.db
+# A row body with RETURNING into a table with a statement trigger is refused at CREATE instead of failing to schedule
+statement ok
+CREATE TABLE er(id INTEGER);
 
 statement ok
-CREATE TABLE c(id INTEGER);
+CREATE TABLE etgt(id INTEGER);
 
 statement ok
-CREATE TABLE log(id INTEGER);
+CREATE TABLE elog(id INTEGER);
 
 statement ok
-CREATE MACRO f(x) AS x + 1;
-
-statement ok
-CREATE TRIGGER sc AFTER INSERT ON c FOR EACH STATEMENT INSERT INTO log VALUES (2) RETURNING f(id);
-
-restart
+CREATE TRIGGER est AFTER INSERT ON etgt FOR EACH STATEMENT INSERT INTO elog VALUES (1);
 
 statement error
-DROP MACRO f;
+CREATE TRIGGER err AFTER INSERT ON er FOR EACH ROW INSERT INTO etgt VALUES (NEW.id) RETURNING id * 9;
 ----
-trigger "sc" on table "c" depends on macro function "f"
+Binder Error: RETURNING is not allowed in a trigger body (trigger "err" on table "er")
 
 statement ok
-INSERT INTO c VALUES (1);
+CREATE TRIGGER err AFTER INSERT ON er FOR EACH ROW INSERT INTO etgt VALUES (NEW.id);
+
+statement error
+CREATE OR REPLACE TRIGGER err AFTER INSERT ON er FOR EACH ROW INSERT INTO etgt VALUES (NEW.id) RETURNING id * 9;
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "err" on table "er")
+
+statement ok
+INSERT INTO er VALUES (1), (2);
 
 query I
-FROM log;
+SELECT id FROM etgt ORDER BY id;
 ----
+1
 2
+
+query I
+SELECT DISTINCT id FROM elog;
+----
+1
+
+# nextval and error() in a RETURNING list, whose evaluation depended on the plan, are refused in both body kinds
+statement ok
+CREATE SEQUENCE es;
+
+statement ok
+CREATE TABLE est_src(id INTEGER);
+
+statement error
+CREATE TRIGGER e_seq_row AFTER INSERT ON er FOR EACH ROW INSERT INTO elog VALUES (NEW.id) RETURNING nextval('es');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_seq_row" on table "er")
+
+statement error
+CREATE TRIGGER e_err_row AFTER INSERT ON er FOR EACH ROW INSERT INTO elog VALUES (NEW.id) RETURNING error('boom');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_err_row" on table "er")
+
+statement error
+CREATE TRIGGER e_seq_st AFTER INSERT ON est_src FOR EACH STATEMENT INSERT INTO elog VALUES (0) RETURNING nextval('es');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_seq_st" on table "est_src")
+
+statement error
+CREATE TRIGGER e_seq_before BEFORE INSERT ON est_src FOR EACH STATEMENT UPDATE elog SET id = id RETURNING nextval('es');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_seq_before" on table "est_src")
+
+statement error
+CREATE TRIGGER e_err_before BEFORE INSERT ON est_src FOR EACH STATEMENT INSERT INTO elog VALUES (0) RETURNING error('boom');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_err_before" on table "est_src")
+
+statement error
+CREATE TRIGGER e_err_st AFTER INSERT ON est_src FOR EACH STATEMENT INSERT INTO elog VALUES (0) RETURNING error('boom');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_err_st" on table "est_src")
+
+statement ok
+INSERT INTO est_src VALUES (1);
+
+statement ok
+INSERT INTO er VALUES (3);
+
+query I
+SELECT count(*) FROM duckdb_sequences() WHERE sequence_name = 'es' AND last_value IS NULL;
+----
+1
+
+query I
+SELECT trigger_name FROM duckdb_triggers() WHERE trigger_name LIKE 'e%' ORDER BY ALL;
+----
+err
+est

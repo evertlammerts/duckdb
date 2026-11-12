@@ -14,6 +14,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -239,6 +240,34 @@ static vector<unique_ptr<ParsedExpression>> &GetDMLReturningList(QueryNode &node
 	}
 }
 
+static bool HasReturningList(const QueryNode &node) {
+	switch (node.type) {
+	case QueryNodeType::INSERT_QUERY_NODE:
+		return !node.Cast<InsertQueryNode>().returning_list.empty();
+	case QueryNodeType::UPDATE_QUERY_NODE:
+		return !node.Cast<UpdateQueryNode>().returning_list.empty();
+	case QueryNodeType::DELETE_QUERY_NODE:
+		return !node.Cast<DeleteQueryNode>().returning_list.empty();
+	case QueryNodeType::MERGE_QUERY_NODE:
+		return !node.Cast<MergeQueryNode>().returning_list.empty();
+	default:
+		return false;
+	}
+}
+
+void Binder::VerifyTriggerBodyHasNoReturning(const QueryNode &body, const Identifier &trigger_name,
+                                             const Identifier &table_name) {
+	if (HasReturningList(body)) {
+		throw BinderException("RETURNING is not allowed in a trigger body (trigger %s on table %s)", trigger_name,
+		                      table_name);
+	}
+}
+
+static unique_ptr<QueryNode> CopyFiredTriggerBody(const TriggerCatalogEntry &trigger, const TableCatalogEntry &table) {
+	Binder::VerifyTriggerBodyHasNoReturning(*trigger.trigger_action, trigger.name, table.name);
+	return trigger.trigger_action->Copy();
+}
+
 static Identifier GetTableAlias(const QueryNode &node, const Identifier &fallback) {
 	switch (node.type) {
 	case QueryNodeType::INSERT_QUERY_NODE: {
@@ -341,7 +370,7 @@ static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<
 		Identifier body_cte_name(string(TRIGGER_BODY_CTE_PREFIX) + to_string(i + 1) + "_" + uuid_suffix);
 
 		auto trig_cte = make_uniq<CommonTableExpressionInfo>();
-		trig_cte->query_node = trigger.trigger_action->Copy();
+		trig_cte->query_node = CopyFiredTriggerBody(trigger, table);
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
 		trigger_bodies.emplace_back(*trig_cte->query_node, TriggerBodyCTE {trigger.ParentSchema(), base_cte_name});
@@ -388,7 +417,7 @@ BuildTriggerChain(const QueryNode &node, const TableCatalogEntry &table,
 	for (idx_t i = 0; i < before_triggers.size(); i++) {
 		Identifier body_cte_name(string(TRIGGER_BEFORE_BODY_CTE_PREFIX) + to_string(i + 1) + "_" + uuid_suffix);
 		auto trig_cte = make_uniq<CommonTableExpressionInfo>();
-		trig_cte->query_node = before_triggers[i].get().trigger_action->Copy();
+		trig_cte->query_node = CopyFiredTriggerBody(before_triggers[i].get(), table);
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
 		trigger_bodies.emplace_back(*trig_cte->query_node,
@@ -750,7 +779,7 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 
 		auto child_binder = Binder::CreateBinder(context, row_scope.get());
 		child_binder->PrepareFiredTriggerBody(trigger.ParentSchema());
-		auto body_copy = trigger.trigger_action->Copy();
+		auto body_copy = CopyFiredTriggerBody(trigger, table);
 		auto bound_body = child_binder->Bind(*body_copy);
 
 		CorrelatedColumns corr_cols = std::move(child_binder->correlated_columns);

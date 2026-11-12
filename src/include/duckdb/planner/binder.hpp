@@ -342,6 +342,9 @@ public:
 	void SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema);
 	//! Binds as a fired trigger's body: in the trigger's schema, recording nothing for a trigger being created
 	void PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema);
+	//! Refuses a trigger body with a RETURNING list, at CREATE TRIGGER and for a stored body when it fires
+	static void VerifyTriggerBodyHasNoReturning(const QueryNode &body, const Identifier &trigger_name,
+	                                            const Identifier &table_name);
 	//! Hides the firing statement's CTEs and columns from a fired trigger body, except a given CTE of its changed rows
 	static shared_ptr<Binder> CreateTriggerBodyScope(Binder &parent,
 	                                                 const Identifier &transition_source = Identifier());
