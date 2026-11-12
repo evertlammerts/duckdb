@@ -207,7 +207,7 @@ bool FlattenDependentJoins::ReturnsUncorrelatedRows(LogicalOperator &op,
 	if (IsWrite(op.type)) {
 		return !access.correlated;
 	}
-	if (access.correlated || (!perform_delim && access.volatile_expression)) {
+	if (access.correlated || (!perform_delim && access.volatile_expression && !IsWriteStatement(op))) {
 		return false;
 	}
 	switch (op.type) {

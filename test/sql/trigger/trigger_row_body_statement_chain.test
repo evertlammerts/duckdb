@@ -382,7 +382,14 @@ DROP TRIGGER s7 ON s
 statement ok
 DROP TRIGGER s8 ON s
 
-# A volatile row body still runs once per firing row, equal firing rows included
+# A volatile row body still runs once per firing row, equal firing rows included, also when its write fires statement
+# triggers with a transition table, which then hold each written row once
+
+statement ok
+CREATE TRIGGER s1 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'st', id FROM n
+
+statement ok
+CREATE TRIGGER s2 AFTER INSERT ON s REFERENCING NEW TABLE AS n FOR EACH STATEMENT INSERT INTO out SELECT 'cnt', count(*) FROM n
 
 statement ok
 DELETE FROM out
@@ -418,6 +425,34 @@ SELECT id FROM s ORDER BY ALL
 2
 3
 
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+cnt	3
+st	1
+st	2
+st	3
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW WITH x AS (SELECT NEW.id * 0 + nextval('rseq') AS v) INSERT INTO s SELECT v FROM x
+
+statement ok
+DELETE FROM out
+
+statement ok
+INSERT INTO r VALUES (7), (7), (7)
+
+query TI
+SELECT * FROM out ORDER BY ALL
+----
+cnt	3
+st	4
+st	5
+st	6
+
 statement ok
 DELETE FROM rv
 
@@ -434,6 +469,12 @@ DROP TRIGGER r9 ON r
 
 statement ok
 DROP TRIGGER r1 ON r
+
+statement ok
+DROP TRIGGER s1 ON s
+
+statement ok
+DROP TRIGGER s2 ON s
 
 statement ok
 CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
@@ -701,3 +742,72 @@ SELECT id FROM s ORDER BY ALL
 ----
 101
 102
+
+# A volatile generated column in the written table: the transition table holds each written row once, as when the
+# same table is written in plain SQL
+
+statement ok
+CREATE TABLE gaudit(k VARCHAR, n BIGINT)
+
+statement ok
+CREATE TABLE gr(id INTEGER)
+
+statement ok
+CREATE TABLE gs(id INTEGER, stamp DOUBLE GENERATED ALWAYS AS (random()))
+
+statement ok
+CREATE TRIGGER gs_count AFTER INSERT ON gs REFERENCING NEW TABLE AS nt FOR EACH STATEMENT INSERT INTO gaudit SELECT 'cnt', count(*) FROM nt
+
+statement ok
+CREATE TRIGGER gs_ids AFTER INSERT ON gs REFERENCING NEW TABLE AS nt FOR EACH STATEMENT INSERT INTO gaudit SELECT 'id', id FROM nt
+
+statement ok
+CREATE TRIGGER gr_row AFTER INSERT ON gr FOR EACH ROW INSERT INTO gs VALUES (NEW.id)
+
+statement ok
+INSERT INTO gr VALUES (1), (2)
+
+query TI
+SELECT * FROM gaudit ORDER BY ALL
+----
+cnt	2
+id	1
+id	2
+
+statement ok
+DELETE FROM gaudit
+
+statement ok
+INSERT INTO gs VALUES (8), (9)
+
+query TI
+SELECT * FROM gaudit ORDER BY ALL
+----
+cnt	2
+id	8
+id	9
+
+statement ok
+CREATE TABLE gu(id INTEGER, u UUID GENERATED ALWAYS AS (gen_random_uuid()))
+
+statement ok
+CREATE TRIGGER gu_count AFTER INSERT ON gu REFERENCING NEW TABLE AS nt FOR EACH STATEMENT INSERT INTO gaudit SELECT 'ucnt', count(*) FROM nt
+
+statement ok
+CREATE TRIGGER gr_row_u AFTER INSERT ON gr FOR EACH ROW INSERT INTO gu VALUES (NEW.id)
+
+statement ok
+DELETE FROM gaudit
+
+statement ok
+INSERT INTO gr VALUES (1), (2), (3)
+
+query TI
+SELECT * FROM gaudit WHERE k = 'ucnt'
+----
+ucnt	3
+
+query I
+SELECT count(DISTINCT u) FROM gu
+----
+3

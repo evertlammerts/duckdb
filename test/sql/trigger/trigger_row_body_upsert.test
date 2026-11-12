@@ -345,3 +345,74 @@ SELECT * FROM a ORDER BY id;
 106	2
 107	0
 108	0
+
+# an ON CONFLICT DO UPDATE body over a transition table holding one key twice gives what the same insert gives in
+# plain SQL
+statement ok
+CREATE TABLE ka(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE TABLE kp(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE TABLE ks(id INTEGER);
+
+statement ok
+CREATE TABLE kb(id INTEGER);
+
+statement ok
+CREATE TRIGGER ks_up AFTER INSERT ON ks REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
+    INSERT INTO ka SELECT id, 0 FROM nt ON CONFLICT DO UPDATE SET n = n + 1;
+
+statement ok
+CREATE TRIGGER kb_row AFTER INSERT ON kb FOR EACH ROW
+    INSERT INTO ks VALUES (NEW.id + 100);
+
+statement ok
+INSERT INTO kb VALUES (9), (9);
+
+statement ok
+INSERT INTO kp SELECT * FROM (VALUES (109, 0), (109, 0)) v(id, n) ON CONFLICT DO UPDATE SET n = n + 1;
+
+query II
+SELECT * FROM ka ORDER BY id;
+----
+109	0
+
+query II
+SELECT * FROM kp ORDER BY id;
+----
+109	0
+
+# a volatile generated column in the written table keeps each written row once in the transition table, so a MERGE
+# body matches an existing key once
+statement ok
+CREATE TABLE ga(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+INSERT INTO ga VALUES (106, 0);
+
+statement ok
+CREATE TABLE gs(id INTEGER, stamp DOUBLE GENERATED ALWAYS AS (random()));
+
+statement ok
+CREATE TABLE gb(id INTEGER);
+
+statement ok
+CREATE TRIGGER gs_merge AFTER INSERT ON gs REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
+    MERGE INTO ga USING nt ON ga.id = nt.id
+    WHEN MATCHED THEN UPDATE SET n = ga.n + 1
+    WHEN NOT MATCHED THEN INSERT VALUES (nt.id, 0);
+
+statement ok
+CREATE TRIGGER gb_row AFTER INSERT ON gb FOR EACH ROW
+    INSERT INTO gs VALUES (NEW.id + 100);
+
+statement ok
+INSERT INTO gb VALUES (6), (7);
+
+query II
+SELECT * FROM ga ORDER BY id;
+----
+106	1
+107	0
