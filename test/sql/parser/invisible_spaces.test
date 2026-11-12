@@ -132,6 +132,12 @@ SELECT length($$a{unicode_space}b$$), length($tag$a{unicode_space}b$tag$);
 ----
 3	3
 
+# unicode space where a dollar quote tag would be ends the tag, so no dollar quoted string opens
+statement error
+SELECT $a{unicode_space}b$ x $a{unicode_space}b$;
+----
+syntax error at or near "x"
+
 # unicode space in a literal after other apostrophes outside literals
 query II
 SELECT 'it''s', length('a{unicode_space}b');

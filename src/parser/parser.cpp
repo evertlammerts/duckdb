@@ -129,7 +129,7 @@ static UnicodeType ValidateUTF8Query(const string &query) {
 	                                   optional_idx(NumericCast<idx_t>(invalid_pos)));
 }
 
-bool Parser::StripUnicodeSpaces(const string &query_str, string &new_query) {
+bool Parser::StripUnicodeSpaces(const string &query_str, string &new_query, const Tokenizer &tokenizer) {
 	vector<UnicodeSpace> unicode_spaces;
 	for (idx_t pos = 0; pos < query_str.size();) {
 		auto length = UnicodeSpaceLength(query_str, pos);
@@ -143,12 +143,10 @@ bool Parser::StripUnicodeSpaces(const string &query_str, string &new_query) {
 	if (unicode_spaces.empty()) {
 		return false;
 	}
-	// The tokenizer reads a Unicode space as part of a word, so it finds the token boundaries the parser will see
-	// only once every Unicode space is rewritten.
+	// The tokenizer reads a Unicode space as part of a word, so it must see every one rewritten.
 	string candidate;
 	RewriteUnicodeSpaces(query_str, candidate, unicode_spaces);
 	TokenRangeTokenizerBehavior behavior(candidate);
-	Tokenizer tokenizer(DuckDBKeywordHelper::Instance());
 	tokenizer.TokenizeInput(behavior);
 
 	vector<UnicodeSpace> between_tokens;
@@ -166,6 +164,11 @@ bool Parser::StripUnicodeSpaces(const string &query_str, string &new_query) {
 	if (between_tokens.empty()) {
 		return false;
 	}
+	if (between_tokens.size() == unicode_spaces.size()) {
+		new_query = std::move(candidate);
+		return true;
+	}
+	new_query.clear();
 	RewriteUnicodeSpaces(query_str, new_query, between_tokens);
 	return true;
 }
@@ -207,20 +210,20 @@ void Parser::ThrowParserOverrideError(ParserOverrideResult &result) {
 	}
 }
 
-string Parser::NormalizeSQLString(const string &query) {
+string Parser::NormalizeSQLString(const string &query, const Tokenizer &tokenizer) {
 	// Validate before strip: StripUnicodeSpaces walks multi-byte sequences and assumes valid UTF-8.
 	if (ValidateUTF8Query(query) == UnicodeType::ASCII) {
 		return query;
 	}
 	string normalized;
-	if (StripUnicodeSpaces(query, normalized)) {
+	if (StripUnicodeSpaces(query, normalized, tokenizer)) {
 		return normalized;
 	}
 	return query;
 }
 
 void Parser::ParseQuery(const string &query_p) {
-	const string query = NormalizeSQLString(query_p);
+	const string query = NormalizeSQLString(query_p, GetGrammar().GetTokenizer());
 	if (options.extensions) {
 		bool has_strict_extension_error = false;
 		ErrorData last_strict_extension_error;
@@ -386,14 +389,14 @@ public:
 };
 
 bool Parser::IsQueryComplete(const string &query_p) {
+	auto &grammar = GetGrammar();
 	string query;
 	try {
-		query = NormalizeSQLString(query_p);
+		query = NormalizeSQLString(query_p, grammar.GetTokenizer());
 	} catch (ParserException &) {
 		// invalid UTF-8 - submit the input so the error surfaces
 		return true;
 	}
-	auto &grammar = GetGrammar();
 	CompletenessTokenizerBehavior behavior(query);
 	grammar.GetTokenizer().TokenizeInput(behavior);
 	if (behavior.fatal_token) {

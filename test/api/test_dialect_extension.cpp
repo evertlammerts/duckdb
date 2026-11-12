@@ -2,6 +2,7 @@
 #include "test_helpers.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/peg/dialect_extension.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
 #include "duckdb/parser/peg/parsed_grammar.hpp"
@@ -197,4 +198,37 @@ TEST_CASE("Tokenizer preserves delimiters and incomplete input across long runs"
 			}
 		}
 	}
+}
+
+class BackslashEscapeDialect final : public DialectExtension {
+public:
+	BackslashEscapeDialect() : DialectExtension("backslash_escape") {
+	}
+	unique_ptr<Tokenizer> CreateTokenizer(CreateTokenizerInput &input) override {
+		return make_uniq<HookTokenizer>(input.keyword_helper, true, true, false);
+	}
+};
+
+TEST_CASE("Unicode spaces are rewritten with the tokenizer of the dialect", "[api][dialect_extension]") {
+	DBConfig config;
+	DialectExtension::Register(config, make_shared_ptr<BackslashEscapeDialect>());
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET current_dialect = 'backslash_escape'"));
+
+	// U+00A0 inside the second literal, which follows a literal holding a backslash escaped quote
+	const string sql = "SELECT 'it\\'s' AS a, length('x\xC2\xA0y') AS n, strlen('x\xC2\xA0y') AS o";
+	auto result = con.Query(sql);
+	REQUIRE(CHECK_COLUMN(result, 1, {3}));
+	REQUIRE(CHECK_COLUMN(result, 2, {4}));
+
+	Parser parser(*con.context);
+	parser.ParseQuery(sql);
+	REQUIRE(parser.statements.size() == 1);
+	REQUIRE(parser.statements[0]->query.find("x\xC2\xA0y") != string::npos);
+
+	// U+00A0 between tokens is still rewritten
+	result = con.Query("SELECT\xC2\xA0'it\\'s' AS a,\xC2\xA0"
+	                   "42 AS b");
+	REQUIRE(CHECK_COLUMN(result, 1, {42}));
 }

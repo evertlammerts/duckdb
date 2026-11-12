@@ -203,7 +203,8 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
 	idx_t max_token_index = 0;
 	vector<UnicodeSpace> unicode_spaces;
 	string clean_sql;
-	const string &sql_ref = Parser::StripUnicodeSpaces(sql, clean_sql) ? clean_sql : sql;
+	const string &sql_ref =
+	    Parser::StripUnicodeSpaces(sql, clean_sql, compiled_grammar->GetTokenizer()) ? clean_sql : sql;
 	AutoCompleteTokenizerBehavior behavior(sql_ref, suggestions);
 	if (!compiled_grammar->GetTokenizer().TokenizeInput(behavior)) {
 		return {};

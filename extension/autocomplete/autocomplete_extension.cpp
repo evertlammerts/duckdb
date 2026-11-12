@@ -550,10 +550,11 @@ static duckdb::unique_ptr<FunctionData> CheckPEGParserBind(ClientContext &contex
 
 	const auto sql = StringValue::Get(input.inputs[0]);
 
-	string clean_sql;
-	const string &sql_ref = Parser::StripUnicodeSpaces(sql, clean_sql) ? clean_sql : sql;
-	ParserTokenizerBehavior behavior(sql_ref);
 	auto compiled_grammar = CompiledGrammar::Get(context);
+	string clean_sql;
+	const string &sql_ref =
+	    Parser::StripUnicodeSpaces(sql, clean_sql, compiled_grammar->GetTokenizer()) ? clean_sql : sql;
+	ParserTokenizerBehavior behavior(sql_ref);
 	if (!compiled_grammar->GetTokenizer().TokenizeInput(behavior)) {
 		return nullptr;
 	}

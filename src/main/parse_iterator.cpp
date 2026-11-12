@@ -19,7 +19,7 @@ ParseIterator::ParseIterator(ClientContext &context_p, const string &sql_p, bool
                              optional_ptr<ClientContextLock> held_lock_p)
     : context(context_p), apply_invalidation_policy(apply_invalidation_policy_p), held_lock(held_lock_p) {
 	try {
-		sql = Parser::NormalizeSQLString(sql_p);
+		sql = Parser::NormalizeSQLString(sql_p, CompiledGrammar::Get(context)->GetTokenizer());
 	} catch (std::exception &ex) {
 		ApplyInvalidationPolicy(ErrorData(ex));
 		throw;
