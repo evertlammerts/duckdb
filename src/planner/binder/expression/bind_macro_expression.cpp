@@ -684,8 +684,9 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY:
+			// the IN, ANY or ALL operand is a child of the subquery expression, read below
 			ProbeFoldedNode(*expr.Cast<SubqueryExpression>().Subquery()->node, names, table_in_scope, inner_parameters);
-			return;
+			break;
 		default:
 			break;
 		}

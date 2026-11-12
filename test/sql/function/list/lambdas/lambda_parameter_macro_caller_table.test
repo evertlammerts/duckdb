@@ -608,7 +608,7 @@ SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d UNION ALL SELEC
 [VARCHAR]
 
 statement ok
-CREATE MACRO cte_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT 1 AS k) SELECT x.d)));
+CREATE MACRO cte_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT x.d AS k) SELECT k FROM c)));
 
 query I
 SELECT cte_sub() FROM x;
@@ -616,7 +616,7 @@ SELECT cte_sub() FROM x;
 [VARCHAR]
 
 query I
-SELECT list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT 1 AS k) SELECT x.d))) FROM x AS q;
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT x.d AS k) SELECT k FROM c))) FROM x AS q;
 ----
 [VARCHAR]
 
@@ -660,6 +660,116 @@ query I
 SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d WHERE EXISTS (SELECT 1 FROM range(1))))) FROM x AS q;
 ----
 [VARCHAR]
+
+# the IN, ANY or ALL operand of a folded subquery is read in the lambda's scope too
+
+statement ok
+CREATE MACRO membership_type() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT upper(x.d) IN (SELECT 'A'))));
+
+query I
+SELECT membership_type() FROM x;
+----
+[BOOLEAN]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT upper(x.d) IN (SELECT 'A')))) FROM x AS q;
+----
+[BOOLEAN]
+
+statement ok
+CREATE MACRO any_type() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT upper(x.d) = ANY (SELECT 'A'))));
+
+query I
+SELECT any_type() FROM x;
+----
+[BOOLEAN]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT upper(x.d) = ANY (SELECT 'A')))) FROM x AS q;
+----
+[BOOLEAN]
+
+# a lambda inside a folded subquery that declares the name shadows the outer parameter there
+
+statement ok
+CREATE MACRO shadow_guard() AS list_transform([{'d': 1}], lambda x: typeof((SELECT list_transform([{'d': 1}], lambda x: x.d))) || ':' || typeof((SELECT x FROM range(1))));
+
+query I
+SELECT shadow_guard() FROM x;
+----
+['INTEGER[]:STRUCT(d INTEGER)']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof((SELECT list_transform([{'d': 1}], lambda x: x.d))) || ':' || typeof((SELECT x FROM range(1)))) FROM x AS q;
+----
+['INTEGER[]:STRUCT(d INTEGER)']
+
+# pg_typeof, the type argument of cast_to_type and replace_type, and cast_to_type as a dot call fold too
+
+statement ok
+CREATE MACRO pg_typeof_sub() AS list_transform([{'d': 'a'}], lambda x: pg_typeof((SELECT x.d)));
+
+query I
+SELECT pg_typeof_sub() FROM x;
+----
+[varchar]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: pg_typeof((SELECT x.d))) FROM x AS q;
+----
+[varchar]
+
+statement ok
+CREATE MACRO cast_type_arg() AS list_transform([{'d': 'a'}], lambda x: typeof(cast_to_type(1, (SELECT x.d))));
+
+query I
+SELECT cast_type_arg() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof(cast_to_type(1, (SELECT x.d)))) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO replace_type_arg() AS list_transform([{'d': 'a'}], lambda x: typeof(replace_type('5', (SELECT x.d), 2)));
+
+query I
+SELECT replace_type_arg() FROM x;
+----
+[INTEGER]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof(replace_type('5', (SELECT x.d), 2))) FROM x AS q;
+----
+[INTEGER]
+
+statement ok
+CREATE MACRO call_cast() AS list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: cast_to_type(y, (SELECT x.d))));
+
+query I
+SELECT call_cast() FROM x;
+----
+[[1.5]]
+
+query I
+SELECT list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: cast_to_type(y, (SELECT x.d)))) FROM x AS q;
+----
+[[1.5]]
+
+statement ok
+CREATE MACRO dot_cast() AS list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: y.cast_to_type((SELECT x.d))));
+
+query I
+SELECT dot_cast() FROM x;
+----
+[[1.5]]
+
+query I
+SELECT list_transform([{'d': 0.0}], lambda x: list_transform([1.5], lambda y: y.cast_to_type((SELECT x.d)))) FROM x AS q;
+----
+[[1.5]]
 
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
