@@ -286,6 +286,33 @@ tt	3
 statement ok
 DELETE FROM out;
 
+statement ok
+CREATE TABLE tto(id INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO tto VALUES (1, 0), (4, 0);
+
+statement ok
+CREATE TRIGGER tto_upd AFTER UPDATE ON tto REFERENCING OLD TABLE AS o FOR EACH STATEMENT INSERT INTO out SELECT 'tto update', id * 10 + w FROM o;
+
+statement ok
+CREATE TRIGGER tto_del AFTER DELETE ON tto REFERENCING OLD TABLE AS o FOR EACH STATEMENT INSERT INTO out SELECT 'tto delete', id * 10 + w FROM o;
+
+statement ok
+WITH o AS (SELECT 50 AS id, 50 AS w) UPDATE tto SET w = 7 WHERE id = 1;
+
+statement ok
+WITH o AS (SELECT 50 AS id, 50 AS w) DELETE FROM tto WHERE id = 4;
+
+query TI
+SELECT v, id FROM out ORDER BY v;
+----
+tto delete	40
+tto update	10
+
+statement ok
+DELETE FROM out;
+
 # CTEs of the writer named new and old: a FOR EACH ROW body reads its NEW row and the table named new
 statement ok
 CREATE TABLE "new"(id INTEGER);
