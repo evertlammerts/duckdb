@@ -1569,3 +1569,241 @@ query I
 SELECT field_type();
 ----
 [VARCHAR]
+
+# the bind callbacks that keep only the type of an argument fold that argument: every argument of typeof, get_type,
+# can_cast_implicitly and st_crs, the type argument of cast_to_type, the type arguments of replace_type, and
+# pg_typeof, a built in macro over typeof; each call gives what the expression gives with the argument written in
+
+statement ok
+CREATE MACRO tctt(a) AS list_transform([1], lambda x: cast_to_type(a, (SELECT x)));
+
+query I
+SELECT list_transform([1], lambda x: cast_to_type('7', (SELECT x)));
+----
+[7]
+
+query I
+SELECT tctt(x.z) FROM (VALUES ('7')) AS x(z);
+----
+[7]
+
+statement ok
+CREATE MACRO cast_probe(a) AS list_transform([1], lambda x: cast_to_type(42, (SELECT x)) + a);
+
+query I
+SELECT list_transform([1], lambda x: cast_to_type(42, (SELECT x)) + 3);
+----
+[45]
+
+query I
+SELECT cast_probe(x.z) FROM (VALUES (3)) AS x(z);
+----
+[45]
+
+statement ok
+CREATE MACRO tct(a) AS list_transform([1.5], lambda x: cast_to_type(x + a, (SELECT x)));
+
+query I
+SELECT list_transform([1.5], lambda x: cast_to_type(x + 3, (SELECT x)));
+----
+[4.5]
+
+query II
+SELECT 3 AS x, tct(x);
+----
+3	[4.5]
+
+statement ok
+CREATE MACRO crs_probe(a) AS list_transform(['POINT(0 1)'::GEOMETRY('OGC:CRS84')], lambda x: st_crs((SELECT x)) || a);
+
+query I
+SELECT list_transform(['POINT(0 1)'::GEOMETRY('OGC:CRS84')], lambda x: st_crs((SELECT x)) || '!');
+----
+['OGC:CRS84!']
+
+query I
+SELECT crs_probe(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['OGC:CRS84!']
+
+statement ok
+CREATE MACRO rt2b(a) AS list_transform([1], lambda x: replace_type(x, (SELECT x), 0.5)::VARCHAR || a);
+
+query I
+SELECT list_transform([1], lambda x: replace_type(x, (SELECT x), 0.5)::VARCHAR || '!');
+----
+[1.0!]
+
+query I
+SELECT rt2b(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[1.0!]
+
+statement ok
+CREATE MACRO rt3(a) AS list_transform([1], lambda x: replace_type(x + 0, 0, (SELECT x)) + a);
+
+query I
+SELECT list_transform([1], lambda x: replace_type(x + 0, 0, (SELECT x)) + 3);
+----
+[4]
+
+query I
+SELECT rt3(x.z) FROM (VALUES (3)) AS x(z);
+----
+[4]
+
+statement ok
+CREATE MACRO pgt(a) AS list_transform([1], lambda x: pg_typeof((SELECT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: pg_typeof((SELECT x)) || '!');
+----
+[integer!]
+
+query I
+SELECT pgt(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[integer!]
+
+statement ok
+CREATE MACRO cci1(a) AS list_transform([1], lambda x: can_cast_implicitly((SELECT x), 1::BIGINT)::VARCHAR || a);
+
+query I
+SELECT list_transform([1], lambda x: can_cast_implicitly((SELECT x), 1::BIGINT)::VARCHAR || '!');
+----
+[true!]
+
+query I
+SELECT cci1(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[true!]
+
+statement ok
+CREATE MACRO cci2(a) AS list_transform([1], lambda x: can_cast_implicitly(1::TINYINT, (SELECT x))::VARCHAR || a);
+
+query I
+SELECT list_transform([1], lambda x: can_cast_implicitly(1::TINYINT, (SELECT x))::VARCHAR || '!');
+----
+[true!]
+
+query I
+SELECT cci2(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[true!]
+
+# an inner lambda in a subquery is renamed only where the substitution places an argument naming one of its
+# parameters, which a qualified table read never is
+
+statement ok
+CREATE MACRO qualified_read(a, b) AS list_transform([1], lambda x: b + first((SELECT list_transform([-1], lambda x: x.abs() + a.v)[1] FROM (VALUES (-7)) AS t(x), (VALUES (1)) AS a(v))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], lambda x: x.abs() + a.v)[1] FROM (VALUES (-7)) AS t(x), (VALUES (1)) AS a(v))));
+----
+[11]
+
+query I
+SELECT qualified_read(0, x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[11]
+
+query I
+SELECT qualified_read(x.z, x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[11]
+
+statement ok
+CREATE MACRO qread4(a, b) AS list_transform([1], lambda x: concat(a, ':', first((SELECT list_transform([-3], lambda x: x.abs() + b)[1] FROM (SELECT -20 AS x) AS s))));
+
+query I
+SELECT list_transform([1], lambda x: concat('!', ':', first((SELECT list_transform([-3], lambda x: x.abs() + 100)[1] FROM (SELECT -20 AS x) AS s))));
+----
+['!:120']
+
+query I
+SELECT qread4(x.z, 100) FROM (VALUES ('!')) AS x(z) GROUP BY x.z;
+----
+['!:120']
+
+# a PIVOT source is walked with its own tables
+
+statement ok
+CREATE MACRO pivot_scope(a, b) AS list_transform([1], lambda x: a + first((SELECT k FROM (PIVOT (SELECT list_transform([{'d': 2}], lambda x: x.d + b)[1] AS v, 'k' AS category FROM (VALUES (60)) AS x(d)) ON category IN ('k') USING sum(v)) AS p)));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT k FROM (PIVOT (SELECT list_transform([{'d': 2}], lambda x: x.d + 3)[1] AS v, 'k' AS category FROM (VALUES (60)) AS x(d)) ON category IN ('k') USING sum(v)) AS p)));
+----
+[66]
+
+query I
+SELECT pivot_scope(x.z, 3) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[66]
+
+# in a folded subquery each reference is decided at its own level: a table only a nested level or a CTE body reads
+# does not count, a VALUES list binds in the level around it, and a select list alias of the level keeps its name
+
+statement ok
+CREATE MACRO t_inner(a) AS list_transform([1], lambda x: typeof((SELECT x + (SELECT count(*) FROM range(3)))) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x + (SELECT count(*) FROM range(3)))) || '!');
+----
+[BIGINT!]
+
+query I
+SELECT t_inner(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[BIGINT!]
+
+statement ok
+CREATE MACRO t_where(a) AS list_transform([1], lambda x: typeof((SELECT x WHERE 1 IN (SELECT 1 FROM range(1)))) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x WHERE 1 IN (SELECT 1 FROM range(1)))) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT t_where(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO tcte2(a) AS list_transform([1], lambda x: typeof((WITH c AS (SELECT k FROM range(1) AS t(k)) SELECT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((WITH c AS (SELECT k FROM range(1) AS t(k)) SELECT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT tcte2(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO tval(a) AS list_transform([1], lambda x: typeof((VALUES (x))) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((VALUES (x))) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT tval(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO alias_type(a) AS list_transform([1], lambda x: typeof((SELECT 's' AS x WHERE length(x) > 0)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT 's' AS x WHERE length(x) > 0)) || '!');
+----
+[VARCHAR!]
+
+query I
+SELECT alias_type(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[VARCHAR!]
