@@ -1,5 +1,5 @@
 # name: test/sql/match_recognize/test_match_recognize_json_arrow.test
-# description: MATCH_RECOGNIZE - the arrow is the JSON operator unless the deprecated lambda arrow is enabled
+# description: MATCH_RECOGNIZE - the arrow is a lambda in the lambda slot of a function that takes one, else the JSON operator
 # group: [match_recognize]
 
 require json
@@ -10,7 +10,7 @@ CREATE TABLE j AS SELECT i, ('{"k": ' || i || '}')::JSON AS v FROM range(1, 5) r
 statement ok
 CREATE TABLE jp AS SELECT * FROM (VALUES (1, '[10,20]'::JSON, 0)) t(i, A, pos);
 
-# under the default setting the arrow binds no name, so a step over it still reads the lambda's parameter
+# outside a lambda slot the arrow binds no name, so a step over it still reads the lambda's parameter
 statement error
 SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(v -> '$.k')) AS z PATTERN (A B) DEFINE B AS true);
 ----
@@ -49,5 +49,118 @@ SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda 
 [1]
 [3]
 
+# The arrow is a lambda only in the lambda slot of a scalar function that takes one, as the binder reads it: not
+# under another function, a macro, nor outside the slot.
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(json_array(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(lower(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(concat('', A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO second_of(a, b) AS b
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(second_of(0, A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(lower(v -> '$.k'))) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(unnest(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+UNNEST not supported here
+
+# invoke takes its lambda first
+statement ok
+CREATE TABLE ts AS SELECT i, {'f': i} AS s FROM range(1, 5) r(i);
+
+query I
+SELECT * FROM ts MATCH_RECOGNIZE (ORDER BY i MEASURES invoke(A -> A.f + 1, {'f': 41}) AS m PATTERN (A B) DEFINE B AS true);
+----
+42
+42
+
+# a method call's receiver is its first argument, so the arrow after it is in the lambda slot
+statement ok
+CREATE TABLE tx AS SELECT i, i * 10 AS x, [{'x': 100}] AS xs FROM range(1, 5) r(i);
+
+statement ok
+CREATE TABLE tl AS SELECT i, [i] AS li FROM range(1, 5) r(i);
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES xs.list_transform(A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[100]
+[100]
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES sum(xs.list_transform(A -> A.x)[1]) AS m PATTERN (A+) DEFINE A AS true);
+----
+400
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS xs.list_transform(A -> A.x)[1] = 100);
+----
+4
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS sum(xs.list_transform(A -> A.x)[1]) < 300);
+----
+2
+2
+
+query I rowsort
+SELECT * FROM tl MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda w: PREV(list_sum(li.list_transform(w -> w)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[3]
+
+# An arrow lambda's parameters are the lambda's, as a keyword lambda's are: not columns of the input, and not
+# readable by a step computed outside it
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40)) v(i, x);
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], x -> PREV(x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1, 2], v -> v + 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+[2, 3]
+[2, 3]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_transform([1, 2], v -> v + 1)[1] = 2);
+----
+4
+
+query I rowsort
+SELECT * FROM ts MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([10, 20], i -> i + A.s.f) AS m PATTERN (A B) DEFINE B AS true);
+----
+[11, 21]
+[13, 23]
+
 statement ok
 RESET lambda_syntax
+
+# Under the default setting the binder still binds an arrow in a lambda slot as a lambda, and then refuses it
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+Deprecated lambda arrow (->) detected

@@ -157,14 +157,13 @@ struct HoistedInputRefs {
 //! ambiguous reference say so rather than quietly taking the first of them.
 static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
                                  const case_insensitive_set_t &aliases, HoistedInputRefs &refs,
-                                 vector<identifier_set_t> &lambda_parameters,
-                                 vector<identifier_set_t> &arrow_parameters) {
+                                 vector<identifier_set_t> &lambda_parameters) {
 	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
 		identifier_set_t parameters;
 		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
 			auto &lambda = expr->Cast<LambdaExpression>();
 			lambda_parameters.push_back(std::move(parameters));
-			HoistInputReferences(lambda.RightMutable(), symbols, aliases, refs, lambda_parameters, arrow_parameters);
+			HoistInputReferences(lambda.RightMutable(), symbols, aliases, refs, lambda_parameters);
 			lambda_parameters.pop_back();
 			return;
 		}
@@ -191,7 +190,7 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 			return;
 		}
 		if (symbols.count(names[0].GetIdentifierName())) {
-			if (names.size() >= 2 && !LambdaExpression::IsLambdaParameter(arrow_parameters, names[0])) {
+			if (names.size() >= 2) {
 				// The column behind a pattern variable is the input's too. Read back under a generated name,
 				// it stays that column once the variable is dropped, where a lambda parameter spelled like
 				// the column would otherwise claim it.
@@ -213,26 +212,22 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 	}
 	const auto call = expr->GetExpressionClass() == ExpressionClass::FUNCTION;
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		// An arrow lambda's references are hoisted as if it were the JSON operator, which renames a parameter and
-		// its uses alike, but a qualifier it binds is not dropped.
 		identifier_set_t parameters;
 		if (call && refs.arrows.IsLambda(expr->Cast<FunctionExpression>(), *child, parameters)) {
-			arrow_parameters.push_back(std::move(parameters));
-			ParsedExpressionIterator::EnumerateChildren(*child, [&](unique_ptr<ParsedExpression> &part) {
-				HoistInputReferences(part, symbols, aliases, refs, lambda_parameters, arrow_parameters);
-			});
-			arrow_parameters.pop_back();
+			lambda_parameters.push_back(std::move(parameters));
+			HoistInputReferences(child->Cast<LambdaExpression>().RightMutable(), symbols, aliases, refs,
+			                     lambda_parameters);
+			lambda_parameters.pop_back();
 			return;
 		}
-		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters, arrow_parameters);
+		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters);
 	});
 }
 
 static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
                                  const case_insensitive_set_t &aliases, HoistedInputRefs &refs) {
 	vector<identifier_set_t> lambda_parameters;
-	vector<identifier_set_t> arrow_parameters;
-	HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters, arrow_parameters);
+	HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters);
 }
 
 //! Whether any part of the pattern sits inside a {- -}
@@ -276,11 +271,7 @@ static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const P
 		identifier_set_t parameters;
 		if (call && arrows.IsLambda(expr.Cast<FunctionExpression>(), child, parameters)) {
 			inner.push_back(std::move(parameters));
-			ParsedExpressionIterator::EnumerateChildren(child, [&](const ParsedExpression &part) {
-				if (!found) {
-					found = FindEnclosingLambdaParameter(part, enclosing, inner, arrows);
-				}
-			});
+			found = FindEnclosingLambdaParameter(child.Cast<LambdaExpression>().Right(), enclosing, inner, arrows);
 			inner.pop_back();
 			return;
 		}
@@ -383,7 +374,16 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			return;
 		}
 	}
+	const auto call = expr->GetExpressionClass() == ExpressionClass::FUNCTION;
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		identifier_set_t parameters;
+		if (call && arrows.IsLambda(expr->Cast<FunctionExpression>(), *child, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			HoistMeasureNavigation(child->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
+			                       hoisted, names, arrows, lambda_parameters);
+			lambda_parameters.pop_back();
+			return;
+		}
 		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, arrows, lambda_parameters);
 	});
 }

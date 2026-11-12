@@ -83,6 +83,21 @@ struct MatchRecognizeConditionInputs {
 	unique_ptr<Expression> ProjectAs(unique_ptr<Expression> value, const string &name);
 };
 
+//! Where the arrow form is a lambda rather than the JSON operator: in the lambda slot of a function that takes one
+//! (ExpressionBinder::GetLambdaArgumentIndex), with a method call's receiver counted as the first argument. The
+//! binder binds a lambda there under every setting and only then refuses a written arrow under the default one; a
+//! lambda bind that fails and falls back to the JSON operator is not seen here, and fails there too.
+class MatchRecognizeArrowScope {
+public:
+	explicit MatchRecognizeArrowScope(Binder &binder);
+
+	//! Whether this argument of the call binds as a lambda, and the names it binds if so
+	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
+
+private:
+	Binder &binder;
+};
+
 //! Where the value being bound is evaluated, which is what decides whether it may read the state the
 //! matcher holds while it assembles a match.
 enum class MatchRecognizeScope : uint8_t {
@@ -150,6 +165,7 @@ private:
 	//! The variable whose condition is being bound
 	string define_name;
 	MatchRecognizeScope scope = MatchRecognizeScope::CANDIDATE_ROW;
+	const MatchRecognizeArrowScope arrows;
 };
 
 //! Binds the MEASURES clause: which rows of the match a value is read from, what a pattern variable in
@@ -196,6 +212,7 @@ private:
 	bool running;
 	//! Whether a value here is already read through something that scopes it to the match
 	bool scoped = false;
+	const MatchRecognizeArrowScope arrows;
 };
 
 //! Everything a reference names behind its first name is navigation into the column, so dropping a
@@ -231,20 +248,6 @@ void MatchRecognizeRejectNestedStep(const ParsedExpression &inner, const string 
 void MatchRecognizeRejectNavigationInAggregate(const ParsedExpression &argument, const string &function_name);
 //! CLASSIFIER(), with or without a variable in front of it, anywhere in the expression
 bool MatchRecognizeContainsClassifier(const ParsedExpression &expr);
-
-//! Where the arrow form is a lambda rather than the JSON operator, decided as the binder decides it: as a direct
-//! argument of a scalar function, under the single arrow setting or when read back from storage before v2.0.0
-class MatchRecognizeArrowScope {
-public:
-	explicit MatchRecognizeArrowScope(Binder &binder);
-
-	//! Whether this argument of the call binds as a lambda, and the names it binds if so
-	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
-
-private:
-	Binder &binder;
-	bool single_arrow;
-};
 
 //! Whether a name is a pattern variable. The two clauses hold their symbols differently, so which
 //! names are theirs is the caller's to say.
