@@ -370,7 +370,15 @@ void Binder::BindCreateViewInfo(CreateViewInfo &base) {
 	// the view keeps working when the database is attached under a different alias
 	auto &view_catalog = base.GetQualifiedName().Catalog();
 	if (base.query && !view_catalog.empty()) {
-		RemotePushdownOptimizer::StripCatalogName(*base.query, view_catalog);
+		auto &catalog = Catalog::GetCatalog(context, view_catalog);
+		CatalogStripLookup lookup(catalog, catalog.GetCatalogTransaction(context));
+		// the view binder resolves a name qualified with only its catalog in the view's schema, then the default one
+		lookup.schema_paths.push_back(base.GetQualifiedName().SchemaPath());
+		auto default_schema = catalog.GetDefaultSchema();
+		if (default_schema) {
+			lookup.schema_paths.push_back(vector<Identifier> {*default_schema});
+		}
+		RemotePushdownOptimizer::StripCatalogName(*base.query, view_catalog, lookup);
 	}
 	if (base.binding_mode == CreateViewBindingMode::SKIP_BINDING) {
 		return;

@@ -1,6 +1,7 @@
 #include "duckdb/optimizer/remote_pushdown_optimizer.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -1305,10 +1306,13 @@ unique_ptr<TableRef> RemotePushdownOptimizer::CreateRemoteFunctionRef(CatalogPus
 namespace {
 
 struct CatalogStripContext {
-	explicit CatalogStripContext(const Identifier &catalog_name) : catalog_name(catalog_name), cte_names(1) {
+	explicit CatalogStripContext(const Identifier &catalog_name,
+	                             optional_ptr<const CatalogStripLookup> lookup = nullptr)
+	    : catalog_name(catalog_name), lookup(lookup), cte_names(1) {
 	}
 
 	const Identifier &catalog_name;
+	optional_ptr<const CatalogStripLookup> lookup;
 	//! the CTE names visible in each query node around the part being stripped, innermost last
 	vector<identifier_set_t> cte_names;
 
@@ -1319,6 +1323,17 @@ struct CatalogStripContext {
 			}
 		}
 		return false;
+	}
+
+	//! The schema path in which the table name a catalog qualified spelling read is found, empty when unknown
+	vector<Identifier> FindTableSchema(const Identifier &table_name) const {
+		for (auto &schema_path : lookup->schema_paths) {
+			auto schema = lookup->catalog.GetSchema(lookup->transaction, schema_path, OnEntryNotFound::RETURN_NULL);
+			if (schema && schema->GetEntry(lookup->transaction, CatalogType::TABLE_ENTRY, table_name)) {
+				return schema_path;
+			}
+		}
+		return vector<Identifier>();
 	}
 };
 
@@ -1357,9 +1372,12 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 		auto &base = ref.Cast<BaseTableRef>();
 		auto name = base.GetQualifiedName();
 		StripCatalogFromName(name, context.catalog_name);
-		if (name.Path().size() == 1 && base.GetQualifiedName().Path().size() > 1 && context.IsCTE(name.Name())) {
-			// a bare name would read the CTE, where the qualified one read the table in the catalog's default schema
-			name = QualifiedName(Identifier(), Identifier(DEFAULT_SCHEMA), name.Name());
+		if (context.lookup && name.Path().size() == 1 && base.GetQualifiedName().Path().size() > 1 &&
+		    (context.lookup->qualify_every_table || context.IsCTE(name.Name()))) {
+			auto schema_path = context.FindTableSchema(name.Name());
+			if (!schema_path.empty()) {
+				name = QualifiedName(std::move(schema_path), name.Name());
+			}
 		}
 		base.SetQualifiedName(std::move(name));
 		break;
@@ -1510,11 +1528,7 @@ static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context) {
 static void StripCatalog(CommonTableExpressionMap &cte_map, CatalogStripContext &context) {
 	for (auto &cte_pair : cte_map.map) {
 		auto &cte = *cte_pair.second;
-		// a CTE's own definition reads the table of that name unless the CTE is recursive
-		bool recursive = cte.query_node && cte.query_node->type == QueryNodeType::RECURSIVE_CTE_NODE;
-		if (recursive) {
-			context.cte_names.back().insert(cte_pair.first);
-		}
+		// a CTE's own definition reads the table of that name, except in the recursive branch of a recursive CTE
 		if (cte.query_node) {
 			StripCatalog(*cte.query_node, context);
 		}
@@ -1759,6 +1773,7 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 		if (rec.left) {
 			StripCatalog(*rec.left, context);
 		}
+		context.cte_names.back().insert(rec.ctename);
 		if (rec.right) {
 			StripCatalog(*rec.right, context);
 		}
@@ -1885,8 +1900,9 @@ void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Ide
 	StripCatalog(expr, context);
 }
 
-void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier &catalog_name) {
-	CatalogStripContext context(catalog_name);
+void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier &catalog_name,
+                                               optional_ptr<const CatalogStripLookup> lookup) {
+	CatalogStripContext context(catalog_name, lookup);
 	StripCatalog(node, context);
 }
 
@@ -1900,8 +1916,9 @@ void RemotePushdownOptimizer::StripCatalogName(AlterInfo &info, const Identifier
 	StripCatalog(info, context);
 }
 
-void RemotePushdownOptimizer::StripCatalogName(SQLStatement &statement, const Identifier &catalog_name) {
-	CatalogStripContext context(catalog_name);
+void RemotePushdownOptimizer::StripCatalogName(SQLStatement &statement, const Identifier &catalog_name,
+                                               optional_ptr<const CatalogStripLookup> lookup) {
+	CatalogStripContext context(catalog_name, lookup);
 	StripCatalog(statement, context);
 }
 

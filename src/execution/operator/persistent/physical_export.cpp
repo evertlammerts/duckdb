@@ -30,7 +30,7 @@ PhysicalExport::PhysicalExport(PhysicalPlan &physical_plan, vector<LogicalType> 
       function(std::move(function)), info(std::move(info)), exported_tables(std::move(exported_tables)) {
 }
 
-static void WriteCatalogEntry(stringstream &ss, CatalogEntry &entry) {
+static void WriteCatalogEntry(CatalogTransaction transaction, stringstream &ss, CatalogEntry &entry) {
 	if (entry.internal) {
 		return;
 	}
@@ -38,8 +38,18 @@ static void WriteCatalogEntry(stringstream &ss, CatalogEntry &entry) {
 	try {
 		if (create_info->type == CatalogType::TRIGGER_ENTRY) {
 			// CREATE TRIGGER stores the body as written, so it may name the exported catalog
+			auto &catalog = entry.ParentCatalog();
+			CatalogStripLookup lookup(catalog, transaction);
+			// a fired body binds through the firing session, where a name qualified with only the catalog resolves in
+			// its default schema; left bare it could read a transition table or a CTE of the body or the firing
+			// statement
+			lookup.qualify_every_table = true;
+			auto default_schema = catalog.GetDefaultSchema();
+			if (default_schema) {
+				lookup.schema_paths.push_back(vector<Identifier> {*default_schema});
+			}
 			RemotePushdownOptimizer::StripCatalogName(*create_info->Cast<CreateTriggerInfo>().trigger_action,
-			                                          create_info->GetQualifiedName().Catalog());
+			                                          create_info->GetQualifiedName().Catalog(), lookup);
 		}
 		// the catalog is implied by the database the export is imported into - keep only the schema path
 		create_info->StripCatalogQualification();
@@ -51,9 +61,9 @@ static void WriteCatalogEntry(stringstream &ss, CatalogEntry &entry) {
 	ss << '\n';
 }
 
-static void WriteCatalogEntries(stringstream &ss, catalog_entry_vector_t &entries) {
+static void WriteCatalogEntries(CatalogTransaction transaction, stringstream &ss, catalog_entry_vector_t &entries) {
 	for (auto &entry : entries) {
-		WriteCatalogEntry(ss, entry.get());
+		WriteCatalogEntry(transaction, ss, entry.get());
 	}
 	ss << '\n';
 }
@@ -68,7 +78,7 @@ static void WriteTriggers(CatalogTransaction transaction, stringstream &ss, Boun
 		return lhs.get().oid < rhs.get().oid;
 	});
 	for (auto &trigger : triggers) {
-		WriteCatalogEntry(ss, trigger.get());
+		WriteCatalogEntry(transaction, ss, trigger.get());
 	}
 }
 
@@ -254,7 +264,7 @@ SourceResultType PhysicalExport::GetDataInternal(ExecutionContext &context, Data
 
 	// write the schema.sql file
 	stringstream ss;
-	WriteCatalogEntries(ss, catalog_entries);
+	WriteCatalogEntries(catalog.GetCatalogTransaction(ccontext), ss, catalog_entries);
 	WriteStringStreamToFile(fs, ss, fs.JoinPath(info->file_path, "schema.sql"));
 
 	// write the load.sql file

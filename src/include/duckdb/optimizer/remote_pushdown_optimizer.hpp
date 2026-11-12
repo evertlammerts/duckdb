@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/optional_ptr.hpp"
@@ -83,6 +84,20 @@ struct RemotePushdownState {
 	vector<CatalogSearchEntry> local_catalogs_in_search_path;
 };
 
+//! Where the strip looks up a table name it leaves bare, so the name keeps reading the table its catalog qualified
+//! spelling read rather than a CTE, a transition table or a table of the binding session
+struct CatalogStripLookup {
+	CatalogStripLookup(Catalog &catalog, CatalogTransaction transaction) : catalog(catalog), transaction(transaction) {
+	}
+
+	Catalog &catalog;
+	CatalogTransaction transaction;
+	//! the schema paths a name qualified with only the catalog resolves in, the first holding the table wins
+	vector<vector<Identifier>> schema_paths;
+	//! qualify every name the strip leaves bare, not only one a CTE in scope would read
+	bool qualify_every_table = false;
+};
+
 class RemotePushdownOptimizer {
 public:
 	explicit RemotePushdownOptimizer(Binder &binder);
@@ -93,8 +108,10 @@ public:
 	//! Drop the given catalog qualifier from the names in the tree. A two-part name (e.g. "db1.t") parses as
 	//! schema.name, so the catalog can sit in either slot. A column reference of three or more names loses a leading
 	//! name spelled like the catalog, whatever the binder reads it as
-	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
-	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
+	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name,
+	                             optional_ptr<const CatalogStripLookup> lookup = nullptr);
+	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name,
+	                             optional_ptr<const CatalogStripLookup> lookup = nullptr);
 	static void StripCatalogName(TableRef &ref, const Identifier &catalog_name);
 	static void StripCatalogName(CreateInfo &info, const Identifier &catalog_name);
 	static void StripCatalogName(AlterInfo &info, const Identifier &catalog_name);

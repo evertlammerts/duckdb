@@ -442,6 +442,38 @@ CREATE TRIGGER bound_shadow AFTER UPDATE ON bound FOR EACH STATEMENT INSERT INTO
 statement ok
 CREATE TABLE sibling(id INTEGER);
 
+# a table named with the catalog beside a transition table of its name, and from a trigger outside the main schema,
+# where the body read the default schema's table
+statement ok
+CREATE TABLE saved(c INTEGER);
+
+statement ok
+INSERT INTO saved VALUES (42);
+
+statement ok
+CREATE TABLE fire_saved(c INTEGER);
+
+statement ok
+CREATE TRIGGER saved_shadow AFTER INSERT ON fire_saved REFERENCING NEW TABLE AS saved FOR EACH STATEMENT INSERT INTO log SELECT 'saved ' || c FROM src.saved;
+
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE s.tt(c INTEGER);
+
+statement ok
+INSERT INTO s.tt VALUES (7);
+
+statement ok
+CREATE TABLE s.sfire(id INTEGER);
+
+statement ok
+CREATE TRIGGER s_both AFTER INSERT ON s.sfire FOR EACH STATEMENT INSERT INTO src.main.log SELECT 's both ' || c FROM src.tt;
+
+statement ok
+CREATE TRIGGER s_main AFTER DELETE ON s.sfire FOR EACH STATEMENT INSERT INTO src.main.log SELECT 's main ' || sum(v) FROM src.p;
+
 statement ok
 CREATE TRIGGER sibling_setop AFTER INSERT ON sibling FOR EACH STATEMENT INSERT INTO log SELECT 'sibling ' || (SELECT max(x) FROM (SELECT 0 AS x FROM range(0) AS src(r) UNION ALL SELECT src.tt.c) s) FROM tt;
 
@@ -467,6 +499,15 @@ DELETE FROM bound;
 statement ok
 INSERT INTO sibling VALUES (1);
 
+statement ok
+INSERT INTO fire_saved VALUES (7);
+
+statement ok
+INSERT INTO s.sfire VALUES (1);
+
+statement ok
+DELETE FROM s.sfire;
+
 query T rowsort
 SELECT msg FROM src.log;
 ----
@@ -474,6 +515,9 @@ level 1
 match 2
 outer 1
 pivot 12
+s both 1
+s main 12
+saved 42
 shadow 1
 sibling 1
 unpivot 5
@@ -488,13 +532,16 @@ SELECT line FROM (SELECT unnest(string_split(content, chr(10))) AS line FROM rea
 CREATE TRIGGER bound_level AFTER INSERT ON bound FOR EACH STATEMENT INSERT INTO log SELECT ('level ' || tt.c) FROM tt , rows_like AS src;
 CREATE TRIGGER bound_outer AFTER DELETE ON bound FOR EACH STATEMENT INSERT INTO log SELECT ('outer ' || (SELECT tt.c FROM tt)) FROM rows_like AS src;
 CREATE TRIGGER bound_shadow AFTER UPDATE ON bound FOR EACH STATEMENT INSERT INTO log WITH tt (c) AS (SELECT * FROM (VALUES (99)) AS valueslist) SELECT ('shadow ' || c) FROM main.tt;
-CREATE TRIGGER own_delete AFTER DELETE ON own FOR EACH ROW INSERT INTO log SELECT ((('deleted ' || "OLD".id) || ' beside ') || main.other.id) FROM other;
+CREATE TRIGGER own_delete AFTER DELETE ON own FOR EACH ROW INSERT INTO log SELECT ((('deleted ' || "OLD".id) || ' beside ') || main.other.id) FROM main.other;
 CREATE TRIGGER own_insert AFTER INSERT ON own FOR EACH STATEMENT INSERT INTO main.log SELECT ('own ' || count_star()) FROM main.other;
+CREATE TRIGGER s_both AFTER INSERT ON s.sfire FOR EACH STATEMENT INSERT INTO main.log SELECT ('s both ' || c) FROM main.tt;
+CREATE TRIGGER s_main AFTER DELETE ON s.sfire FOR EACH STATEMENT INSERT INTO main.log SELECT ('s main ' || sum(v)) FROM main.p;
 CREATE TRIGGER same_name AFTER INSERT ON base FOR EACH STATEMENT INSERT INTO log (VALUES ('base'));
 CREATE TRIGGER same_name AFTER INSERT ON other FOR EACH STATEMENT INSERT INTO log (VALUES ('other'));
+CREATE TRIGGER saved_shadow AFTER INSERT ON fire_saved REFERENCING NEW TABLE AS saved FOR EACH STATEMENT INSERT INTO log SELECT ('saved ' || c) FROM main.saved;
 CREATE TRIGGER shaped_match AFTER UPDATE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('match ' || n) FROM main.p MATCH_RECOGNIZE(ORDER BY v MEASURES count_star() AS n PATTERN (A+) DEFINE A AS (v > 0));
 CREATE TRIGGER shaped_pivot AFTER INSERT ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('pivot ' || a) FROM main.p PIVOT (sum(v) FOR (kind) IN ('a'));
-CREATE TRIGGER shaped_unpivot AFTER DELETE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('unpivot ' || val) FROM p UNPIVOT (val FOR col IN (v));
+CREATE TRIGGER shaped_unpivot AFTER DELETE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('unpivot ' || val) FROM main.p UNPIVOT (val FOR col IN (v));
 CREATE TRIGGER sibling_setop AFTER INSERT ON sibling FOR EACH STATEMENT INSERT INTO log SELECT ('sibling ' || (SELECT max(x) FROM ((SELECT 0 AS x FROM "range"(0) AS src(r)) UNION ALL (SELECT tt.c)) AS s)) FROM tt;
 
 statement ok
@@ -539,6 +586,15 @@ DELETE FROM bound;
 statement ok
 INSERT INTO sibling VALUES (1);
 
+statement ok
+INSERT INTO fire_saved VALUES (7);
+
+statement ok
+INSERT INTO s.sfire VALUES (1);
+
+statement ok
+DELETE FROM s.sfire;
+
 query T rowsort
 SELECT msg FROM dst.log;
 ----
@@ -554,6 +610,12 @@ outer 1
 own 1
 pivot 12
 pivot 12
+s both 1
+s both 1
+s main 12
+s main 12
+saved 42
+saved 42
 shadow 1
 shadow 1
 sibling 1
