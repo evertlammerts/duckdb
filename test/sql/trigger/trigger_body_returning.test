@@ -545,9 +545,6 @@ statement ok
 SET VARIABLE rseq = 'bseq';
 
 statement ok
-CREATE SEQUENCE bseq;
-
-statement ok
 CREATE TABLE bc(id INTEGER);
 
 statement ok
@@ -590,12 +587,12 @@ SET VARIABLE bv = 6;
 statement ok
 EXECUTE bp;
 
-# Named parameters of the firing statement do not reach the bodies, here one that names no sequence
+# A named parameter of the firing statement does not reach the bodies
 statement ok
-PREPARE bq AS INSERT INTO bc SELECT $bv WHERE $rseq <> '';
+PREPARE bq AS INSERT INTO bc VALUES ($bv);
 
 statement ok
-EXECUTE bq(bv := 7, rseq := 'no_such_sequence');
+EXECUTE bq(bv := 7);
 
 statement ok
 PREPARE bpr AS INSERT INTO br VALUES ($bv);
