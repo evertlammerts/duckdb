@@ -1,10 +1,12 @@
-
 #include "duckdb/function/match_recognize.hpp"
 
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_match_recognize.hpp"
 
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -24,6 +26,7 @@
 
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/column_qualifier.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -99,20 +102,75 @@ static unique_ptr<MatchRecognizePattern> BuildPattern(const ParsedExpression &ex
 	}
 }
 
+//! Expands a macro call the way the binder does, so that the clause reads an arrow argument where the body puts it
+class MatchRecognizeMacroExpander : public ExpressionBinder {
+public:
+	explicit MatchRecognizeMacroExpander(Binder &binder) : ExpressionBinder(binder, binder.context) {
+	}
+
+	//! The body replaces the call, which BindMacro would bind and then cast to the declared return type
+	void Expand(FunctionExpression &call, ScalarMacroCatalogEntry &macro, unique_ptr<ParsedExpression> &expr) {
+		RegisterMacroRead(macro);
+		auto saved_lambda_bindings = binder.lambda_bindings;
+		const auto location = call.GetQueryLocation();
+		try {
+			auto &member = UnfoldMacroExpression(call, macro, expr, 0);
+			if (member.return_type.id() != LogicalTypeId::UNKNOWN) {
+				expr = make_uniq<CastExpression>(member.return_type, std::move(expr));
+				expr->SetQueryLocation(location);
+			}
+		} catch (...) {
+			binder.lambda_bindings = saved_lambda_bindings;
+			throw;
+		}
+		binder.lambda_bindings = saved_lambda_bindings;
+	}
+};
+
+//! Whether a macro member takes these arguments by their count and names, before any type is looked at; a method
+//! call's receiver is one more positional argument
+static bool MacroTakesArguments(const MacroFunction &member, const FunctionExpression &call, bool method_call) {
+	idx_t positional = method_call ? 1 : 0;
+	identifier_set_t named;
+	for (auto &argument : call.GetArguments()) {
+		if (argument.HasName()) {
+			named.insert(argument.GetName());
+		} else {
+			positional++;
+		}
+	}
+	auto &parameters = member.parameters;
+	if (positional + named.size() > parameters.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < parameters.size(); i++) {
+		auto &name = parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
+		const auto is_named = named.find(name) != named.end();
+		if (i < positional ? is_named
+		                   : !is_named && member.default_parameters.find(name) == member.default_parameters.end()) {
+			return false;
+		}
+		named.erase(name);
+	}
+	return named.empty();
+}
+
 //! A reference into the input only resolves where the input still is one, and every clause here is
 //! evaluated above a subquery of it - so it is computed down there verbatim and read back under a name
 //! of its own. Computing rather than rewriting is what keeps two tables' columns of the same name
 //! apart, and a struct field behind a qualifier from reading as a column.
 struct HoistedInputRefs {
-	HoistedInputRefs(GeneratedNames &names_p, const case_insensitive_set_t &input_columns_p,
-	                 const case_insensitive_set_t &input_tables_p)
-	    : names(names_p), input_columns(input_columns_p), input_tables(input_tables_p) {
+	HoistedInputRefs(Binder &binder_p, Binder &input_binder_p, GeneratedNames &names_p,
+	                 const case_insensitive_set_t &input_columns_p, const case_insensitive_set_t &input_tables_p)
+	    : binder(binder_p), input_binder(input_binder_p), arrows(binder_p), names(names_p),
+	      input_columns(input_columns_p), input_tables(input_tables_p) {
 	}
 
-	//! The subquery column standing for this reference, allocated on first use
-	const string &Hoist(const ColumnRefExpression &colref) {
+	//! The subquery column standing for this reference, allocated on first use. Behind a pattern
+	//! variable it reads only that variable's rows, so it is kept apart from the same reference read bare.
+	const string &Hoist(const ColumnRefExpression &colref, bool behind_variable = false) {
 		// length prefixed, so a dot inside a quoted identifier cannot read as a component boundary
-		string key;
+		string key = behind_variable ? "@" : "";
 		for (auto &name : colref.ColumnNames()) {
 			const auto &identifier = name.GetIdentifierName();
 			key += to_string(identifier.size());
@@ -128,7 +186,7 @@ struct HoistedInputRefs {
 		// a reference the input itself answers reads the row pattern input, and so every row of the
 		// match; one it does not is the surrounding query's, and the same value on all of them
 		const auto &root = colref.ColumnNames()[0].GetIdentifierName();
-		if (input_columns.count(root) || input_tables.count(root)) {
+		if (!behind_variable && (input_columns.count(root) || input_tables.count(root))) {
 			universal.emplace(column, colref.ToString());
 		}
 		hoisted->SetAlias(Identifier(column));
@@ -136,6 +194,89 @@ struct HoistedInputRefs {
 		return columns.emplace(std::move(key), std::move(column)).first->second;
 	}
 
+	//! Replace a call to a macro that is passed an arrow by the macro's expansion, as the binder will expand it
+	bool ExpandArrowMacro(unique_ptr<ParsedExpression> &expr) {
+		auto &call = expr->Cast<FunctionExpression>();
+		bool passes_arrow = false;
+		for (auto &argument : call.GetArguments()) {
+			auto &value = argument.GetExpression();
+			passes_arrow = passes_arrow ||
+			               (value.GetExpressionClass() == ExpressionClass::LAMBDA &&
+			                value.Cast<LambdaExpression>().GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD);
+		}
+		if (!passes_arrow || ExpressionBinder::IsUnnestFunction(call.FunctionName()) || call.Distinct() ||
+		    call.Filter() || (call.OrderBy() && !call.OrderBy()->orders.empty())) {
+			return false;
+		}
+		FunctionExpression probe(call.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
+		auto entry = ColumnQualifier(binder).QualifyFunction(probe);
+		if (!entry || entry->type != CatalogType::MACRO_ENTRY) {
+			return false;
+		}
+		// The binder chooses the member by argument count and names first, and by argument types only among the
+		// members left, which is known only once the arguments are bound.
+		const auto method_call =
+		    call.GetQualifiedName().Path().size() >= 2 && probe.GetQualifiedName().Path().size() == 1;
+		auto &macro = entry->Cast<ScalarMacroCatalogEntry>();
+		idx_t members = 0;
+		bool typed = false;
+		for (auto &member : macro.macros) {
+			if (!MacroTakesArguments(*member, call, method_call)) {
+				continue;
+			}
+			members++;
+			for (auto &type : member->types) {
+				typed = typed || type.id() != LogicalTypeId::UNKNOWN;
+			}
+		}
+		if (members == 0) {
+			return false;
+		}
+		if (members > 1 && typed) {
+			// Unless an arrow can bind as a lambda, it is the JSON operator in every member, as it is outside a call
+			// the clause expands, and the binder chooses the member once the arguments are bound.
+			bool lambda_possible =
+			    Settings::Get<LambdaSyntaxSetting>(binder.context) == LambdaSyntax::ENABLE_SINGLE_ARROW;
+			for (auto &argument : call.GetArguments()) {
+				auto &value = argument.GetExpression();
+				lambda_possible = lambda_possible || (value.GetExpressionClass() == ExpressionClass::LAMBDA &&
+				                                      value.Cast<LambdaExpression>().GetLambdaSyntaxType() ==
+				                                          LambdaSyntaxType::SINGLE_ARROW_STORAGE);
+			}
+			if (!lambda_possible) {
+				return false;
+			}
+			throw BinderException(call,
+			                      "MATCH_RECOGNIZE cannot pass an arrow lambda to %s(), which chooses its overload by "
+			                      "argument type: write the lambda with the lambda keyword",
+			                      call.FunctionName().GetIdentifierName());
+		}
+		const auto max_expression_depth = Settings::Get<MaxExpressionDepthSetting>(binder.context);
+		if (++macro_depth >= max_expression_depth) {
+			throw BinderException("Max expression depth limit of %lld exceeded. Use \"SET max_expression_depth TO "
+			                      "x\" to increase the maximum expression depth.",
+			                      max_expression_depth);
+		}
+		binder.context.InterruptCheck();
+		// the call may be a whole measure or condition, whose alias names it
+		auto alias = expr->GetAlias();
+		if (method_call) {
+			// a macro called as a method is the plain call on its receiver, as the binder rewrites it
+			auto receiver = ColumnQualifier::CreateDotCallReceiver(call.GetQualifiedName());
+			receiver->SetQueryLocation(call.GetQueryLocation());
+			ColumnQualifier::MakePlainCall(call, std::move(receiver));
+		}
+		MatchRecognizeMacroExpander(input_binder).Expand(call, macro, expr);
+		expr->SetAlias(std::move(alias));
+		return true;
+	}
+
+	Binder &binder;
+	//! The input's scope, where the clause's references are bound, and so where a macro's arguments are read
+	Binder &input_binder;
+	const MatchRecognizeArrowScope arrows;
+	//! How many macro expansions the hoisting is inside of
+	idx_t macro_depth = 0;
 	GeneratedNames &names;
 	const case_insensitive_set_t &input_columns;
 	const case_insensitive_set_t &input_tables;
@@ -147,9 +288,9 @@ struct HoistedInputRefs {
 	vector<unique_ptr<ParsedExpression>> select_list;
 };
 
-//! A reference whose first name is a pattern variable, or one a lambda binds, is not the input's.
-//! Everything else is computed against the input, which is also what makes an ambiguous reference say
-//! so rather than quietly taking the first of them.
+//! A name a lambda binds, a pattern variable and a measure are not the input's, but the column behind
+//! a pattern variable is. Everything else is computed against the input, which is also what makes an
+//! ambiguous reference say so rather than quietly taking the first of them.
 static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
                                  const case_insensitive_set_t &aliases, HoistedInputRefs &refs,
                                  vector<identifier_set_t> &lambda_parameters) {
@@ -163,23 +304,64 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 			return;
 		}
 	}
+	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expr->Cast<FunctionExpression>();
+		auto &name = function.GetQualifiedName();
+		// The parser keeps the receiver of c.f() and X.c.f() in the function's name, and the engine reads it as a
+		// method call when no catalog function has that name. Turned into that call here, with the receiver the
+		// engine builds, the receiver is resolved below like any other reference. One led by a lambda parameter is
+		// left to the engine, which reads it with the lambda's scope of its own, unless the call is one of this
+		// clause's navigations, which the engine does not know.
+		if (MatchRecognizeIsMethodCall(refs.binder, function) &&
+		    (MatchRecognizeIsNavigationName(name.Name()) ||
+		     !LambdaExpression::IsLambdaParameter(lambda_parameters, name.Path()[0]))) {
+			auto receiver = ColumnQualifier::CreateDotCallReceiver(name);
+			receiver->SetQueryLocation(function.GetQueryLocation());
+			ColumnQualifier::MakePlainCall(function, std::move(receiver));
+		}
+		if (refs.ExpandArrowMacro(expr)) {
+			HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters);
+			refs.macro_depth--;
+			return;
+		}
+	}
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
 		auto &names = colref.ColumnNames();
 		if (LambdaExpression::IsLambdaParameter(lambda_parameters, names[0])) {
 			return;
 		}
+		if (symbols.count(names[0].GetIdentifierName())) {
+			if (names.size() >= 2) {
+				// The column behind a pattern variable is the input's too. Read back under a generated name,
+				// it stays that column once the variable is dropped, where a lambda parameter spelled like
+				// the column would otherwise claim it.
+				ColumnRefExpression column(names[1]);
+				column.SetQueryLocation(colref.GetQueryLocation());
+				colref.ColumnNamesMutable()[1] = Identifier(refs.Hoist(column, true));
+			}
+			return;
+		}
 		// alias.<name> names one of this clause's own measures rather than a column of the input
 		const auto is_alias = names.size() == 2 && StringUtil::CIEquals("alias", names[0].GetIdentifierName()) &&
 		                      aliases.count(names[1].GetIdentifierName()) > 0;
-		if (!is_alias && !symbols.count(names[0].GetIdentifierName())) {
+		if (!is_alias && !aliases.count(names[0].GetIdentifierName())) {
 			auto alias = expr->GetAlias();
 			expr = make_uniq<ColumnRefExpression>(Identifier(refs.Hoist(colref)));
 			expr->SetAlias(std::move(alias));
 		}
 		return;
 	}
+	const auto call = expr->GetExpressionClass() == ExpressionClass::FUNCTION;
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		identifier_set_t parameters;
+		if (call && refs.arrows.IsLambda(expr->Cast<FunctionExpression>(), *child, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			HoistInputReferences(child->Cast<LambdaExpression>().RightMutable(), symbols, aliases, refs,
+			                     lambda_parameters);
+			lambda_parameters.pop_back();
+			return;
+		}
 		HoistInputReferences(child, symbols, aliases, refs, lambda_parameters);
 	});
 }
@@ -201,12 +383,72 @@ static bool HasExclusion(const ParsedExpression &expr) {
 	return found;
 }
 
+//! A reference to a parameter of a lambda the expression is written in, rather than of one inside it
+static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const ParsedExpression &expr,
+                                                                         const vector<identifier_set_t> &enclosing,
+                                                                         vector<identifier_set_t> &inner,
+                                                                         const MatchRecognizeArrowScope &arrows) {
+	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
+		identifier_set_t parameters;
+		if (MatchRecognizeLambdaParameters(expr, parameters)) {
+			inner.push_back(std::move(parameters));
+			auto found = FindEnclosingLambdaParameter(expr.Cast<LambdaExpression>().Right(), enclosing, inner, arrows);
+			inner.pop_back();
+			return found;
+		}
+	}
+	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &name = expr.Cast<ColumnRefExpression>().ColumnNames()[0];
+		const auto bound_outside =
+		    !LambdaExpression::IsLambdaParameter(inner, name) && LambdaExpression::IsLambdaParameter(enclosing, name);
+		return bound_outside ? &expr : nullptr;
+	}
+	const auto call = expr.GetExpressionClass() == ExpressionClass::FUNCTION;
+	if (call) {
+		// a method call keeps its receiver in its name until the binder reads it
+		auto &function = expr.Cast<FunctionExpression>();
+		auto &name = function.GetQualifiedName().Path()[0];
+		if (!LambdaExpression::IsLambdaParameter(inner, name) && LambdaExpression::IsLambdaParameter(enclosing, name) &&
+		    arrows.IsMethodCall(function)) {
+			return &expr;
+		}
+	}
+	optional_ptr<const ParsedExpression> found;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (found) {
+			return;
+		}
+		// an arrow lambda's parameters shadow the enclosing ones
+		identifier_set_t parameters;
+		if (call && arrows.IsLambda(expr.Cast<FunctionExpression>(), child, parameters)) {
+			inner.push_back(std::move(parameters));
+			found = FindEnclosingLambdaParameter(child.Cast<LambdaExpression>().Right(), enclosing, inner, arrows);
+			inner.pop_back();
+			return;
+		}
+		found = FindEnclosingLambdaParameter(child, enclosing, inner, arrows);
+	});
+	return found;
+}
+
 //! PREV and NEXT walk the ordered partition rather than the match, so a measure's are computed per
 //! input row below the pattern window and read back from above it
 static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
                                    const case_insensitive_map_t<vector<string>> &symbols,
                                    const case_insensitive_map_t<string> &universal,
-                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names) {
+                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
+                                   const MatchRecognizeArrowScope &arrows,
+                                   vector<identifier_set_t> &lambda_parameters) {
+	if (expr->GetExpressionClass() == ExpressionClass::LAMBDA) {
+		identifier_set_t parameters;
+		if (MatchRecognizeLambdaParameters(*expr, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			HoistMeasureNavigation(expr->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
+			                       hoisted, names, arrows, lambda_parameters);
+			lambda_parameters.pop_back();
+			return;
+		}
+	}
 	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
@@ -235,9 +477,16 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 				// no row is classified below the matcher, so this one is read off the finished match
 				return;
 			}
+			// the step is computed below the matcher, outside every lambda it is written in
+			vector<identifier_set_t> inner_parameters;
+			auto parameter =
+			    FindEnclosingLambdaParameter(arguments[0].GetExpression(), lambda_parameters, inner_parameters, arrows);
+			if (parameter) {
+				throw BinderException(*parameter, "window functions cannot reference lambda parameters");
+			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, universal, hoisted,
-				                       names);
+				                       names, arrows, lambda_parameters);
 			}
 			// a step is a fixed distance through the partition, so the offset is a non-negative
 			// constant - a negative one would step the other way and a column a different way per row
@@ -247,7 +496,7 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			auto inner = std::move(arguments[0].GetExpressionMutable());
 			auto variable = MatchRecognizeNavigationVariable(
 			    inner, [&](const string &name) { return symbols.find(name) != symbols.end(); }, universal,
-			    function_name);
+			    function_name, arrows);
 			// A step names the row it starts from rather than the one it reaches: a pattern variable in
 			// front of it is the row that variable denotes (5.6.2), and FIRST or LAST within it says
 			// which of that variable's rows (5.6.4). Stepping and then reading the row reached is the
@@ -276,9 +525,27 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			return;
 		}
 	}
+	const auto call = expr->GetExpressionClass() == ExpressionClass::FUNCTION;
 	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names);
+		identifier_set_t parameters;
+		if (call && arrows.IsLambda(expr->Cast<FunctionExpression>(), *child, parameters)) {
+			lambda_parameters.push_back(std::move(parameters));
+			HoistMeasureNavigation(child->Cast<LambdaExpression>().RightMutable(), pattern_window, symbols, universal,
+			                       hoisted, names, arrows, lambda_parameters);
+			lambda_parameters.pop_back();
+			return;
+		}
+		HoistMeasureNavigation(child, pattern_window, symbols, universal, hoisted, names, arrows, lambda_parameters);
 	});
+}
+
+static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
+                                   const case_insensitive_map_t<vector<string>> &symbols,
+                                   const case_insensitive_map_t<string> &universal,
+                                   vector<unique_ptr<ParsedExpression>> &hoisted, GeneratedNames &names,
+                                   const MatchRecognizeArrowScope &arrows) {
+	vector<identifier_set_t> lambda_parameters;
+	HoistMeasureNavigation(expr, pattern_window, symbols, universal, hoisted, names, arrows, lambda_parameters);
 }
 
 //! The conditions and the frame are bound against the input but evaluated over the projection above
@@ -448,12 +715,8 @@ static void HoistClauseReferences(MatchRecognizeConfig &config, const MatchRecog
 	for (auto &expr : config.measures_expression_list) {
 		measure_aliases.insert(expr->GetAlias().GetIdentifierName());
 	}
-	auto measure_names = symbols.qualifying;
-	for (auto &alias : measure_aliases) {
-		measure_names.insert(alias);
-	}
 	for (auto &expr : config.measures_expression_list) {
-		HoistInputReferences(expr, measure_names, measure_aliases, input_refs);
+		HoistInputReferences(expr, symbols.qualifying, measure_aliases, input_refs);
 	}
 }
 
@@ -939,6 +1202,8 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	}
 	// a correlated reference is the surrounding query's to resolve, so it is carried out to it
 	MoveCorrelatedExpressions(*input_binder);
+	// the wrapper owns the input's binder from here on, and outlives the clause's references being hoisted
+	auto &input_scope = *input_binder;
 	auto input_ref = make_uniq<BoundRefWrapper>(std::move(bound_input), std::move(input_binder));
 
 	// The matcher's state travels between the select nodes below in a column of its own. Every generated
@@ -950,7 +1215,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	GeneratedNames names(std::move(input_names));
 	const string state_column = names.Reserve("__pattern_window");
 	const string spans_column = names.Reserve(state_column + "_spans");
-	HoistedInputRefs input_refs(names, input_column_names, input_tables);
+	HoistedInputRefs input_refs(*this, input_scope, names, input_column_names, input_tables);
 
 	const auto symbols = CollectSymbols(*ref.config);
 	// {- -} only decides which of a match's rows reach the output, so it is also read again below
@@ -1021,8 +1286,8 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	// PREV() and NEXT() in MEASURES walk the matcher's input, so they are computed down here too
 	vector<unique_ptr<ParsedExpression>> measure_navigation;
 	for (auto &expr : ref.config->measures_expression_list) {
-		HoistMeasureNavigation(expr, *window_template, measure_symbols, input_refs.universal, measure_navigation,
-		                       names);
+		HoistMeasureNavigation(expr, *window_template, measure_symbols, input_refs.universal, measure_navigation, names,
+		                       input_refs.arrows);
 	}
 	if (!measure_navigation.empty()) {
 		SelectBinder navigation_binder(*define_binder, context, define_node);

@@ -1,0 +1,24 @@
+# name: test/sql/match_recognize/test_match_recognize_arrow_memory_catalog.test
+# description: MATCH_RECOGNIZE - an arrow passed to a macro that is named by the default catalog alone
+# group: [match_recognize]
+
+# the default catalog is called memory only in an in-memory database
+require noforcestorage
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40)) v(i, x);
+
+statement ok
+CREATE MACRO memory.main.doubled_here(xs, f) AS list_transform(xs || xs, f)
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES memory.doubled_here([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1, 1]
+[1, 1]
+
+statement ok
+RESET lambda_syntax

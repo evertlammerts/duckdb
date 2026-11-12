@@ -291,13 +291,7 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	}
 	// the function exists in the system catalog - turn this into a dot call
 	ErrorData error;
-	unique_ptr<ColumnRefExpression> colref;
-	if (function.GetQualifiedName().Catalog().empty()) {
-		colref = make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema());
-	} else {
-		colref =
-		    make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema(), function.GetQualifiedName().Catalog());
-	}
+	auto colref = CreateDotCallReceiver(function.GetQualifiedName());
 	auto new_colref = QualifyColumnName(*colref, error);
 	if (!new_colref) {
 		new_colref = std::move(colref);
@@ -305,9 +299,20 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	new_colref->ClearAlias();
 	// we can! transform this into a function call on the column
 	// i.e. "x.lower()" becomes "lower(x)"
-	function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(new_colref));
-	function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+	MakePlainCall(function, std::move(new_colref));
 	return func;
+}
+
+void ColumnQualifier::MakePlainCall(FunctionExpression &function, unique_ptr<ParsedExpression> receiver) {
+	function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(receiver));
+	function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+}
+
+unique_ptr<ColumnRefExpression> ColumnQualifier::CreateDotCallReceiver(const QualifiedName &name) {
+	if (name.Catalog().empty()) {
+		return make_uniq<ColumnRefExpression>(name.Schema());
+	}
+	return make_uniq<ColumnRefExpression>(name.Schema(), name.Catalog());
 }
 
 void ColumnQualifier::QualifyColumnNamesInLambda(FunctionExpression &function,

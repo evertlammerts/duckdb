@@ -251,6 +251,8 @@ public:
 
 	//! Returns true if the function name is an alias for the UNNEST function
 	static bool IsUnnestFunction(const Identifier &function_name);
+	//! The argument position at which the function takes a lambda, if it takes one
+	static optional_idx GetLambdaArgumentIndex(ScalarFunctionCatalogEntry &function);
 
 	//! Continues the expression depth of the binder this one binds a nested expression for
 	void ContinueStackDepth(const ExpressionBinder &parent);
@@ -360,6 +362,8 @@ protected:
 	void UnfoldWindowMacroExpression(unique_ptr<ParsedExpression> &expr, ScalarMacroFunction &macro_def);
 	MacroFunction &UnfoldMacroExpression(FunctionExpression &function, ScalarMacroCatalogEntry &macro_func,
 	                                     unique_ptr<ParsedExpression> &expr, idx_t depth);
+	//! Records the read of a macro's catalog, so that a prepared statement is rebound when the macro changes
+	void RegisterMacroRead(CatalogEntry &macro);
 
 	virtual string UnsupportedAggregateMessage();
 	virtual string UnsupportedWindowMessage();

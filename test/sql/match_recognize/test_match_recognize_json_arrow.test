@@ -1,0 +1,495 @@
+# name: test/sql/match_recognize/test_match_recognize_json_arrow.test
+# description: MATCH_RECOGNIZE - the arrow is a lambda in the lambda slot of a function that takes one, else the JSON operator
+# group: [match_recognize]
+
+require json
+
+statement ok
+CREATE TABLE j AS SELECT i, ('{"k": ' || i || '}')::JSON AS v FROM range(1, 5) r(i);
+
+statement ok
+CREATE TABLE jp AS SELECT * FROM (VALUES (1, '[10,20]'::JSON, 0)) t(i, A, pos);
+
+# outside a lambda slot the arrow binds no name, so a step over it still reads the lambda's parameter
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(v -> '$.k')) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+# and a pattern variable on its right still scopes the navigation
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(A -> A.pos) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+# nor does it bind a lambda parameter named like the column behind the variable
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([99], lambda pos: FIRST(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+# With the deprecated arrow an arrow is a lambda as well, but only where the binder tries one: as a direct argument
+# of a scalar function. Inside a navigation it is still the JSON operator.
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW'
+
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(v -> '$.k')) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(A -> A.pos) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+query I rowsort
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda w: PREV(list_sum(list_transform([i], w -> w)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[3]
+
+# The arrow is a lambda only in the lambda slot of a function that takes one, as the binder reads it: not under
+# another function, outside the slot, nor through a macro whose body puts it in no lambda slot.
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(json_array(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(lower(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(concat('', A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO second_of(a, b) AS b
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(second_of(0, A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement error
+SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['{"k": 99}'::JSON], lambda v: PREV(lower(v -> '$.k'))) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+statement error
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(unnest(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
+----
+UNNEST not supported here
+
+# invoke takes its lambda first
+statement ok
+CREATE TABLE ts AS SELECT i, {'f': i} AS s FROM range(1, 5) r(i);
+
+query I
+SELECT * FROM ts MATCH_RECOGNIZE (ORDER BY i MEASURES invoke(A -> A.f + 1, {'f': 41}) AS m PATTERN (A B) DEFINE B AS true);
+----
+42
+42
+
+# a method call's receiver is its first argument, so the arrow after it is in the lambda slot
+statement ok
+CREATE TABLE tx AS SELECT i, i * 10 AS x, [{'x': 100}] AS xs FROM range(1, 5) r(i);
+
+statement ok
+CREATE TABLE tl AS SELECT i, [i] AS li FROM range(1, 5) r(i);
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES xs.list_transform(A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[100]
+[100]
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES sum(xs.list_transform(A -> A.x)[1]) AS m PATTERN (A+) DEFINE A AS true);
+----
+400
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS xs.list_transform(A -> A.x)[1] = 100);
+----
+4
+
+query I
+SELECT * FROM tx MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS sum(xs.list_transform(A -> A.x)[1]) < 300);
+----
+2
+2
+
+query I rowsort
+SELECT * FROM tl MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda w: PREV(list_sum(li.list_transform(w -> w)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[3]
+
+# An arrow lambda's parameters are the lambda's, as a keyword lambda's are: not columns of the input, and not
+# readable by a step computed outside it
+statement ok
+CREATE TABLE t4 AS SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40)) v(i, x);
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([100], x -> PREV(x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([1, 2], v -> v + 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+[2, 3]
+[2, 3]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS list_transform([1, 2], v -> v + 1)[1] = 2);
+----
+4
+
+query I rowsort
+SELECT * FROM ts MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([10, 20], i -> i + A.s.f) AS m PATTERN (A B) DEFINE B AS true);
+----
+[11, 21]
+[13, 23]
+
+# A macro is expanded before its arguments are bound, and a call that passes one an arrow is expanded here the way
+# the binder expands it, so the arrow is read where the chosen body puts it: through a macro that calls another, a
+# named argument, a subquery, a method call receiver, and a copy in a lambda slot beside one that is not
+statement ok
+CREATE MACRO map_both(xs, ys, f) AS list_transform(xs || ys, f)
+
+statement ok
+CREATE MACRO map_one(xs, g) AS map_both(xs, [], g)
+
+query I
+SELECT m FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([{'x': 1}], [{'x': 2}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1, 2]
+[1, 2]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1] = 1);
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1]) AS s PATTERN (A+) DEFINE A AS true);
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(map_both([{'x': 1}], [{'x': 2}], lambda A: A.x)[1]) AS s PATTERN (A+) DEFINE A AS true);
+----
+4
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([1], [2], x -> PREV(x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([1], [2], v -> v + 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+[2, 3]
+[2, 3]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_one([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[1]
+
+statement ok
+CREATE MACRO doubled(l, f) AS list_transform(l || l, f)
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES doubled(f := A -> A.pos, l := [{'pos': 7}]) AS m PATTERN (A B) DEFINE B AS true);
+----
+[7, 7]
+[7, 7]
+
+statement ok
+CREATE MACRO map_select(xs, f) AS (SELECT list_transform(xs || xs, f))
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_select([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1, 1]
+[1, 1]
+
+statement ok
+CREATE MACRO apply_to(f, value) AS f.invoke(struct_pack(x := value || value))
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES apply_to(A -> A.x, [1]) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1, 1]
+[1, 1]
+
+statement ok
+CREATE MACRO both_ways(l, f) AS struct_pack(a := list_transform(l || l, f), b := f)
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(both_ways([{'pos': 7}], A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+{'a': [7, 7], 'b': 10}
+
+# only the overload the binder chooses is read, and an overload that calls the macro again is not followed
+statement ok
+CREATE MACRO pick(a, f) AS list_transform(a || [], f), (a, f, z) AS json_array(f)
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(pick([1], A -> A.pos, 0)) AS m PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+statement ok
+CREATE MACRO pass_value(v) AS v
+
+statement ok
+CREATE OR REPLACE MACRO pass_value(v) AS v, (v, extra) AS pass_value(v) + pass_value(v) + extra
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(pass_value(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+# a macro that expands into itself stops at the binder's depth limit
+statement ok
+CREATE MACRO again_b(f) AS f
+
+statement ok
+CREATE MACRO again_a(f) AS again_b(f) + again_b(f)
+
+statement ok
+CREATE OR REPLACE MACRO again_b(f) AS again_a(f) + again_a(f)
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES again_a(A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+Max expression depth limit
+
+# The binder chooses a macro's member by argument count and names first, whatever the types, so the chosen body is
+# expanded where that leaves one member; where it leaves several and one is typed, the choice waits for the
+# argument types, and the clause refuses the arrow
+statement ok
+CREATE MACRO typed_value(a INTEGER, f) AS f
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(typed_value(1, A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO mapped_at(xs, f, n INTEGER) AS list_transform(xs || xs, f)[n]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mapped_at([{'x': 7}], A -> A.x, 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+7
+7
+
+statement ok
+CREATE MACRO partly_typed(a INTEGER, f) AS f, (a, f, g) AS list_transform(a || g, f)
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(partly_typed(1, A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO typed_pick(a INTEGER, f) AS 1, (a VARCHAR, f) AS 2
+
+statement ok
+CREATE TABLE jv AS SELECT * FROM (VALUES (1, 'a', '[10,20]'::JSON)) t(i, v, j);
+
+statement error
+SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
+----
+chooses its overload by argument type
+
+# The expansion is the binder's step for a macro call: the result is cast to a declared return type, and the read of
+# the macro is recorded, so that a prepared statement is bound again once the macro is replaced
+statement ok
+CREATE TEMP MACRO as_text(xs, f) RETURNS VARCHAR AS list_transform(xs || xs, f)
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES typeof(as_text([{'x': 1}], A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+VARCHAR
+VARCHAR
+
+# a macro is found by its catalog alone, and a macro called as a method is the plain call on its receiver
+statement ok
+ATTACH ':memory:' AS mr_db
+
+statement ok
+CREATE MACRO mr_db.main.doubled_in(xs, f) AS list_transform(xs || xs, f)
+
+statement ok
+CREATE TEMP MACRO doubled_temp(xs, f) AS list_transform(xs || xs, f)
+
+query II
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'x': 1}], A -> A.x) AS a, temp.doubled_temp([{'x': 1}], A -> A.x) AS c PATTERN (A B) DEFINE B AS true);
+----
+[1, 1]	[1, 1]
+[1, 1]	[1, 1]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([[{'x': 1}]], lambda v: v.map_one(A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+[[1]]
+[[1]]
+
+# a macro's arguments are read where the clause's references are, so a column of the input is the input's
+statement ok
+CREATE MACRO typed_list(n INTEGER, xs, f) AS list_transform(xs || [], f)[1] + n
+
+statement ok
+CREATE TABLE typed_input AS SELECT * FROM (VALUES (1, '17', [11])) t(i, s, xs);
+
+statement error
+SELECT * FROM typed_input MATCH_RECOGNIZE (ORDER BY i MEASURES typed_list(s, xs, x -> x) AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM typed_input MATCH_RECOGNIZE (ORDER BY i MEASURES typed_list(s, xs, lambda x: x) AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement ok
+RESET lambda_syntax
+
+# with the arrow the JSON operator, a typed member reads a column of the input, which hides one of an enclosing
+# query, and refuses one of the wrong type, as the binder does
+statement ok
+CREATE MACRO keep_int(n INTEGER, f) AS n
+
+query I
+SELECT (SELECT m FROM (VALUES (1, 42)) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true)) FROM (VALUES ('outer')) o(n);
+----
+42
+
+statement error
+SELECT (SELECT m FROM (VALUES (1, '17')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true)) FROM (VALUES (5)) o(n);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM (VALUES (1, '17')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM (VALUES (1, '17'), (2, '18')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS keep_int(n, '1'::JSON -> '$') > 0);
+----
+does not support the supplied arguments
+
+# where an arrow cannot bind as a lambda it is the JSON operator in every member, so the binder chooses the member
+query I
+SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
+----
+2
+
+statement ok
+SET lambda_syntax = 'DISABLE_SINGLE_ARROW'
+
+query I
+SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
+----
+2
+
+statement ok
+RESET lambda_syntax
+
+# the same overload sets under the default setting, where the arrow is the JSON operator
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(pick([1], A -> A.pos, 0)) AS m PATTERN (A) DEFINE A AS true);
+----
+[10]
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(pass_value(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement error
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(again_a(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+Max expression depth limit
+
+statement ok
+CREATE MACRO first_of(a) AS a, (a INTEGER, b INTEGER) AS a + b
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(first_of(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO json_after(a INTEGER, f) AS f, (a, f, g) AS f
+
+query I
+SELECT * FROM (SELECT 1 AS i, '{"a": 5}'::JSON AS j) MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(json_after(1, j -> '$.a')) AS m PATTERN (A) DEFINE A AS true);
+----
+5
+
+statement ok
+CREATE TEMP MACRO as_int(f) RETURNS INTEGER AS f
+
+query II
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(as_int(A -> A.pos)) / 4 AS m, typeof(FIRST(as_int(A -> A.pos))) AS t PATTERN (A) DEFINE A AS true);
+----
+2.5	INTEGER
+
+statement ok
+CREATE TEMP MACRO as_small(f) RETURNS SMALLINT AS f::INTEGER * 100000
+
+statement error
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A) DEFINE A AS as_small(A -> A.pos) > 0);
+----
+out of range
+
+statement ok
+CREATE MACRO bump(v) AS v::INTEGER + 1
+
+statement ok
+PREPARE bumped AS SELECT * FROM (SELECT 1 AS i, '10'::JSON AS j) MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(bump(j -> '$')) AS m PATTERN (A) DEFINE A AS true);
+
+query I
+EXECUTE bumped
+----
+11
+
+statement ok
+CREATE OR REPLACE MACRO bump(v) AS v::INTEGER + 100
+
+query I
+EXECUTE bumped
+----
+110
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'pos': 1}], A -> A.pos) AS m PATTERN (A B) DEFINE B AS true);
+----
+Deprecated lambda arrow (->) detected
+
+# a step over a method call on a lambda parameter reads the parameter, which the step cannot
+statement ok
+CREATE TABLE u AS SELECT * FROM (VALUES (1, 'W1'), (2, 'W2'), (3, 'W3'), (4, 'W4')) v(i, w);
+
+statement error
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['Q'], lambda z: PREV(z.lower())) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+# Under the default setting the binder still binds an arrow in a lambda slot as a lambda, and then refuses it
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+Deprecated lambda arrow (->) detected

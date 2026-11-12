@@ -273,6 +273,83 @@ FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
 ----
 Ambiguous reference to column name "x"
 
+# and so does one behind a pattern variable, which reads the same column on that variable's rows
+statement error
+FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
+    ORDER BY t1.x MEASURES LAST(A.x) AS n PATTERN (A+)
+ DEFINE A AS true)
+----
+Ambiguous reference to column name "x"
+
+statement error
+FROM ticks t1 JOIN ticks t2 ON t1.x = t2.x MATCH_RECOGNIZE (
+    ORDER BY t1.x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS A.x > 0)
+----
+Ambiguous reference to column name "x"
+
+# A table's name read as a column is its row, behind a pattern variable as well as bare
+query III
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES LAST(ticks) AS m, LAST(A.ticks) AS n, A.ticks AS o PATTERN (A B+)
+ DEFINE B AS true)
+----
+{'x': 2}	{'x': 1}	{'x': 1}
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS ticks = {'x': 2})
+----
+2
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS B.ticks = {'x': 2})
+----
+2
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES count(*) AS n PATTERN (A B)
+ DEFINE B AS A.ticks.x = 1)
+----
+2
+
+# A call is the catalog's function before it is a method call, so a pattern variable spelled like a
+# catalog or a schema does not take a qualified function from it
+query I
+FROM (VALUES (1, 'W1'), (2, 'W2'), (3, 'W3'), (4, 'W4')) u(i, w) MATCH_RECOGNIZE (
+    ORDER BY i MEASURES system.main.lower(LAST(w)) AS m PATTERN (system B+)
+ DEFINE B AS true)
+----
+w4
+
+query I
+FROM (VALUES (1, 'W1'), (2, 'W2'), (3, 'W3'), (4, 'W4')) u(i, w) MATCH_RECOGNIZE (
+    ORDER BY i MEASURES count(*) AS n PATTERN (A system+)
+ DEFINE system AS system.main.lower(w) <> 'w3')
+----
+2
+2
+
+statement ok
+ATTACH ':memory:' AS mr_catalog
+
+statement ok
+CREATE MACRO mr_catalog.main.plus1(v) AS v + 1
+
+query I
+FROM ticks MATCH_RECOGNIZE (
+    ORDER BY x MEASURES mr_catalog.main.plus1(LAST(x)) AS m PATTERN (mr_catalog B+)
+ DEFINE B AS true)
+----
+3
+
+statement ok
+DETACH mr_catalog
+
 statement error
 FROM ticks MATCH_RECOGNIZE (
     ORDER BY nope MEASURES count(*) AS n PATTERN (A+)

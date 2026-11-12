@@ -83,6 +83,31 @@ struct MatchRecognizeConditionInputs {
 	unique_ptr<Expression> ProjectAs(unique_ptr<Expression> value, const string &name);
 };
 
+//! Where the arrow form is a lambda rather than the JSON operator: in the lambda slot of a function that takes one
+//! (ExpressionBinder::GetLambdaArgumentIndex), with a method call's receiver counted as the first argument. The
+//! binder binds a lambda there under every setting and only then refuses a written arrow unless the setting enables
+//! it; a lambda bind that fails and falls back to the JSON operator is not seen here, and fails there too. A macro
+//! call with an arrow argument reaches the clause expanded the way the binder expands it, so the arrow sits where the
+//! body puts it.
+class MatchRecognizeArrowScope {
+public:
+	explicit MatchRecognizeArrowScope(Binder &binder);
+
+	//! Whether this argument of the call binds as a lambda, and the names it binds if so
+	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
+	//! Whether the binder reads the call as a method call on the names in front of its name
+	bool IsMethodCall(const FunctionExpression &call) const;
+
+private:
+	Binder &binder;
+};
+
+//! Whether the binder reads this call as a method call on the names in front of its name: no function in the catalog
+//! has the qualified name, and one has the bare name or the bare name is one of this clause's navigations.
+bool MatchRecognizeIsMethodCall(Binder &binder, const FunctionExpression &call);
+//! Whether the name is one of this clause's navigations, PREV, NEXT, FIRST, LAST or CLASSIFIER
+bool MatchRecognizeIsNavigationName(const Identifier &name);
+
 //! Where the value being bound is evaluated, which is what decides whether it may read the state the
 //! matcher holds while it assembles a match.
 enum class MatchRecognizeScope : uint8_t {
@@ -136,6 +161,8 @@ private:
 	                         int64_t step = 0);
 	//! Reject something that only means anything while the matcher is assembling a match
 	void OutsideMatch(const string &what) const;
+	//! Whether a qualifier names a pattern variable rather than a parameter of an enclosing lambda
+	bool IsPatternVariable(const string &name) const;
 
 	MatchRecognizeConditionInputs &inputs;
 	const WindowExpression &window_template;
@@ -148,6 +175,7 @@ private:
 	//! The variable whose condition is being bound
 	string define_name;
 	MatchRecognizeScope scope = MatchRecognizeScope::CANDIDATE_ROW;
+	const MatchRecognizeArrowScope arrows;
 };
 
 //! Binds the MEASURES clause: which rows of the match a value is read from, what a pattern variable in
@@ -168,6 +196,8 @@ protected:
 private:
 	//! An aggregate in MEASURES aggregates the rows of the match, which is a window over them
 	BindResult BindOverMatch(FunctionExpression &expr, idx_t depth);
+	//! Whether a qualifier names a pattern variable or SUBSET rather than a parameter of an enclosing lambda
+	bool IsPatternVariable(const string &name) const;
 	//! One field of the matcher's state, as it stands where the measures are projected
 	unique_ptr<ParsedExpression> StateField(const string &field);
 	//! Bind an expression this binder built, whose own parts are not the clause's to interpret again
@@ -192,6 +222,7 @@ private:
 	bool running;
 	//! Whether a value here is already read through something that scopes it to the match
 	bool scoped = false;
+	const MatchRecognizeArrowScope arrows;
 };
 
 //! Everything a reference names behind its first name is navigation into the column, so dropping a
@@ -238,7 +269,8 @@ using MatchRecognizeIsSymbol = std::function<bool(const string &)>;
 //! and the whole match. The qualifiers are dropped and the variable reported back, empty for the match
 //! as a whole.
 string MatchRecognizeNavigationVariable(unique_ptr<ParsedExpression> &inner, const MatchRecognizeIsSymbol &symbols,
-                                        const case_insensitive_map_t<string> &universal, const string &function_name);
+                                        const case_insensitive_map_t<string> &universal, const string &function_name,
+                                        const MatchRecognizeArrowScope &arrows);
 
 //! FIRST() and LAST() count from the end of the match they read from, by a constant the two clauses
 //! spell the same way.
