@@ -138,6 +138,22 @@ SELECT r, typeof(r) FROM (SELECT list_reduce([1, 2], lambda acc, x: x * 0.5, 0.0
 ----
 1.000	DECIMAL(18,3)
 
+# a parameter as the whole body takes the DECIMAL accumulator type also when the type is settled by the first bind;
+# the value is bound as exactly DECIMAL(4,2), since another type rebinds the prepared statement
+
+statement ok
+PREPARE dec_body AS SELECT list_reduce([1], lambda acc, x: $1, 0::DECIMAL(4,2)) AS a, $1::DECIMAL(4,2) AS b;
+
+query II
+EXECUTE dec_body(1.25::DECIMAL(4,2));
+----
+1.25	1.25
+
+query II
+EXECUTE dec_body(1.25);
+----
+1.25	1.25
+
 # NULL initial value and no initial value
 
 query II
