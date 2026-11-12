@@ -18,7 +18,12 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
@@ -184,11 +189,107 @@ static void CollectTableNames(ParsedExpression &expr, identifier_set_t &names) {
 	                                            [&](ParsedExpression &child) { CollectTableNames(child, names); });
 }
 
-static identifier_set_t DeclaredTableNames(QueryNode &node) {
-	identifier_set_t names;
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    node, [&](unique_ptr<ParsedExpression> &) {}, [&](TableRef &ref) { CollectTableName(ref, names); });
-	return names;
+// The right side of a semi or anti join is visible to its join condition only, not to the select list.
+static void CollectScopeTableNames(TableRef &ref, identifier_set_t &names, bool join_condition = false) {
+	if (ref.type != TableReferenceType::JOIN) {
+		CollectTableName(ref, names);
+		return;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	CollectScopeTableNames(*join.left, names);
+	if (join_condition || (join.type != JoinType::SEMI && join.type != JoinType::ANTI)) {
+		CollectScopeTableNames(*join.right, names);
+	}
+}
+
+using scoped_expression_callback_t = std::function<void(unique_ptr<ParsedExpression> &, const identifier_set_t &)>;
+
+static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set_t &declared_above,
+                                           const scoped_expression_callback_t &callback);
+
+static void EnumerateScopedRefExpressions(TableRef &ref, const identifier_set_t &declared_above,
+                                          const identifier_set_t &declared,
+                                          const scoped_expression_callback_t &callback) {
+	auto visit = [&](unique_ptr<ParsedExpression> &child) {
+		callback(child, declared);
+	};
+	switch (ref.type) {
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		EnumerateScopedRefExpressions(*join.left, declared_above, declared, callback);
+		EnumerateScopedRefExpressions(*join.right, declared_above, declared, callback);
+		if (join.condition) {
+			auto condition_declared = declared;
+			CollectScopeTableNames(join, condition_declared, true);
+			callback(join.condition, condition_declared);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY:
+		EnumerateScopedNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, declared_above, callback);
+		break;
+	default:
+		ParsedExpressionIterator::EnumerateTableRefChildren(ref, visit);
+		break;
+	}
+}
+
+// Each select node's expressions see the tables of its own FROM clause and of the query levels around it, not those
+// inside its derived tables, its CTE bodies or other set operation branches.
+static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set_t &declared_above,
+                                           const scoped_expression_callback_t &callback) {
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		auto declared = declared_above;
+		if (select.from_table) {
+			CollectScopeTableNames(*select.from_table, declared);
+		}
+		auto visit = [&](unique_ptr<ParsedExpression> &child) {
+			callback(child, declared);
+		};
+		for (auto &expr : select.select_list) {
+			visit(expr);
+		}
+		for (auto &expr : select.groups.group_expressions) {
+			visit(expr);
+		}
+		for (auto clause : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*clause) {
+				visit(*clause);
+			}
+		}
+		if (select.from_table) {
+			EnumerateScopedRefExpressions(*select.from_table, declared_above, declared, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, visit);
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE:
+		for (auto &child : node.Cast<SetOperationNode>().children) {
+			EnumerateScopedNodeExpressions(*child, declared_above, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, declared_above); });
+		break;
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &cte = node.Cast<RecursiveCTENode>();
+		EnumerateScopedNodeExpressions(*cte.left, declared_above, callback);
+		EnumerateScopedNodeExpressions(*cte.right, declared_above, callback);
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, declared_above); });
+		break;
+	}
+	default:
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, declared_above); });
+		return;
+	}
+	for (auto &entry : node.cte_map.map) {
+		if (entry.second->query_node) {
+			EnumerateScopedNodeExpressions(*entry.second->query_node, declared_above, callback);
+		}
+	}
 }
 
 // The qualifier resolves the receiver of a dot call x.f() or x.v.f() against the tables before lambda parameters.
@@ -204,17 +305,17 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 		}
 	}
 	bool found = false;
-	auto visit = [&](unique_ptr<ParsedExpression> &child) {
-		found = found || HasQualifiedReference(*child, name);
-	};
 	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		auto &node = *expr.Cast<SubqueryExpression>().Subquery()->node;
-		// x.v inside a subquery that declares a table x reads that table
-		if (!DeclaredTableNames(node).count(name)) {
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(node, visit);
-		}
+		// x.v where a select node of the subquery declares a table x reads that table
+		EnumerateScopedNodeExpressions(*expr.Cast<SubqueryExpression>().Subquery()->node, identifier_set_t(),
+		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+			                               if (!declared.count(name)) {
+				                               found = found || HasQualifiedReference(*child, name);
+			                               }
+		                               });
 	}
-	ParsedExpressionIterator::EnumerateChildren(expr, visit);
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || HasQualifiedReference(*child, name); });
 	return found;
 }
 
@@ -226,7 +327,7 @@ struct LambdaScope {
 	reference<LambdaExpression> lambda_expr;
 	vector<reference<ColumnRefExpression>> parameters;
 	identifier_set_t captured;
-	//! Whether the lambda lies in a query of the body, where a table of the body can be in scope
+	//! Whether the lambda lies in a query of the body; a subquery inside the lambda keeps its own tables either way
 	bool in_body_query = false;
 };
 
@@ -465,8 +566,14 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY:
-			// the binder rejects a subquery inside a lambda, so no name of it can be captured by a lambda parameter
-			return;
+			// an aggregate inside a lambda can hold the argument's subquery, where only its own tables shadow a name
+			EnumerateScopedNodeExpressions(*expr.Cast<SubqueryExpression>().Subquery()->node, identifier_set_t(),
+			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+				                               bound.push_back(declared);
+				                               CollectFreeNames(*child, bound, names);
+				                               bound.pop_back();
+			                               });
+			break;
 		default:
 			break;
 		}
@@ -669,17 +776,18 @@ private:
 		case ExpressionClass::SUBQUERY: {
 			// a subquery in an aggregate argument binds, and there its own tables win over the parameter
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
-			auto declared = DeclaredTableNames(*sq->node);
-			identifier_map_t<Identifier> subquery_renames;
-			for (auto &entry : renames) {
-				if (declared.find(entry.first) == declared.end()) {
-					subquery_renames.emplace(entry.first, entry.second);
-				}
-			}
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(
-			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, subquery_renames); });
+			EnumerateScopedNodeExpressions(*sq->node, identifier_set_t(),
+			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+				                               identifier_map_t<Identifier> scope_renames;
+				                               for (auto &entry : renames) {
+					                               if (declared.find(entry.first) == declared.end()) {
+						                               scope_renames.emplace(entry.first, entry.second);
+					                               }
+				                               }
+				                               RenameReferences(child, scope_renames);
+			                               });
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}

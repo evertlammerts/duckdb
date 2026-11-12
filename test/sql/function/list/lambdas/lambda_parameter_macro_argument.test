@@ -931,6 +931,11 @@ SELECT r FROM (VALUES (3)) AS x(z), aggregate_subquery_body(x.z);
 ----
 [53]
 
+query II
+SELECT * FROM (SELECT 3 AS x) t2, aggregate_subquery_body(x);
+----
+3	[53]
+
 # an aliased base table is known by its alias only
 
 statement ok
@@ -950,3 +955,82 @@ query II
 SELECT 5 AS x, top_lambda_beside_subquery(x);
 ----
 5	[6, 2]
+
+# a subquery inside the lambda that declares a table named like the parameter keeps that table
+
+statement ok
+CREATE MACRO subquery_own_table(a) AS list_transform([1], lambda x: sum((SELECT x.v FROM (VALUES (50)) AS x(v))) + a);
+
+query I
+SELECT subquery_own_table(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+query II
+SELECT 3 AS x, subquery_own_table(x);
+----
+3	[53]
+
+# a subquery stops the rename only for a name its own select node declares, not one inside its derived tables, its
+# CTE bodies, other set operation branches or the right side of a semi join, and the rename still enters a subquery
+# that declares nothing
+
+statement ok
+CREATE MACRO hidden_from(a) AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d + a)[1] FROM (SELECT 1 FROM (SELECT 60 AS d) x) y)));
+
+query II
+SELECT {'d': 50} AS x, hidden_from(x['d']);
+----
+{'d': 50}	[53]
+
+statement ok
+CREATE MACRO split_branches(a) AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT sum(r) FROM (SELECT 60 AS r FROM (SELECT 0 AS k) x UNION ALL SELECT list_transform([{'d': 2}], lambda x: x.d + a)[1]) z)));
+
+query II
+SELECT {'d': 50} AS x, split_branches(x['d']);
+----
+{'d': 50}	[113]
+
+statement ok
+CREATE MACRO hidden_cte(a) AS list_transform([{'d': 1}], lambda x: x.d + first((WITH c AS (SELECT 60 AS d FROM (SELECT 1) x) SELECT list_transform([{'d': 2}], lambda x: x.d + a)[1] FROM c y)));
+
+query II
+SELECT {'d': 50} AS x, hidden_cte(x['d']);
+----
+{'d': 50}	[53]
+
+statement ok
+CREATE MACRO hidden_semi(a) AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d + a)[1] FROM (SELECT 1 AS k) y SEMI JOIN (SELECT 1 AS k) x ON y.k = x.k)));
+
+query II
+SELECT {'d': 50} AS x, hidden_semi(x['d']);
+----
+{'d': 50}	[53]
+
+statement ok
+CREATE MACRO subquery_without_table(a) AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d + a)[1] FROM (SELECT 1) y)) + first((SELECT 0 FROM (SELECT 1) x)));
+
+query II
+SELECT {'d': 50} AS x, subquery_without_table(x['d']);
+----
+{'d': 50}	[53]
+
+# a dotted name inside a subquery that declares its own table is no read of the parameter
+
+statement ok
+CREATE MACRO dotted_read_in_own_subquery(a) AS (SELECT list_transform([1], lambda x: x + a + first((SELECT x.d FROM (SELECT 60 AS d) x))));
+
+query II
+SELECT 5 AS x, dotted_read_in_own_subquery(x);
+----
+5	[66]
+
+# an argument's subquery that lands under an aggregate inside the lambda keeps the caller's name
+
+statement ok
+CREATE MACRO aggregate_of_argument(a) AS list_transform([1], lambda x: sum(a));
+
+query II
+SELECT x, aggregate_of_argument((SELECT x + 0)) FROM (SELECT 5 AS x) t GROUP BY x;
+----
+5	[5]
