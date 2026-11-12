@@ -9,11 +9,6 @@ CSVSniffer::CSVSniffer(CSVReaderOptions &options_p, const MultiFileOptions &file
     : state_machine_cache(state_machine_cache_p), options(options_p), file_options(file_options),
       buffer_manager(std::move(buffer_manager_p)), lines_sniffed(0),
       default_null_to_varchar(default_null_to_varchar_p) {
-	// Initialize Format Candidates
-	for (const auto &format_template : format_template_candidates) {
-		auto &logical_type = format_template.first;
-		best_format_candidates[logical_type].clear();
-	}
 	// Initialize max columns found to either 0, or however many were set
 	max_columns_found = set_columns.Size();
 	error_handler = make_shared_ptr<CSVErrorHandler>(options.ignore_errors.GetValue());
@@ -114,6 +109,7 @@ AdaptiveSnifferResult CSVSniffer::MinimalSniff() {
 	}
 
 	// Gather Types
+	SetUserDefinedDateTimeFormat(*state_machine);
 	for (idx_t i = 0; i < state_machine->dialect_options.num_cols; i++) {
 		best_sql_types_candidates_per_column_idx[i] = state_machine->options.auto_type_candidates;
 	}

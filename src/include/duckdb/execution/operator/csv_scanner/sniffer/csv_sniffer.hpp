@@ -10,17 +10,26 @@
 
 #include "duckdb/execution/operator/csv_scanner/csv_state_machine.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/vector_iterator.hpp"
 #include "duckdb/execution/operator/csv_scanner/column_count_scanner.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_schema.hpp"
 #include "duckdb/execution/operator/csv_scanner/header_value.hpp"
 #include "duckdb/execution/operator/csv_scanner/sniffer/sniff_result.hpp"
 
 namespace duckdb {
+//! The date or timestamp formats that read every value sampled so far, in ascending order of preference
 struct DateTimestampSniffing {
 	bool initialized = false;
 	bool had_match = false;
-	vector<string> format;
-	idx_t initial_size;
+	//! Whether the list comes from earlier columns, which did not end as the type
+	bool inherited = false;
+	vector<StrpTimeFormat> format;
+};
+
+//! Every format template for one separator
+struct FormatTemplates {
+	string separator;
+	vector<StrpTimeFormat> formats;
 };
 
 struct QuoteEscapeCombination {
@@ -165,14 +174,18 @@ private:
 	static void SetDateFormat(CSVStateMachine &candidate, const string &format_specifier,
 	                          const LogicalTypeId &sql_type);
 
-	//! Function that initialized the necessary variables used for date and timestamp detection
-	void InitializeDateAndTimeStampDetection(CSVStateMachine &candidate, const string &separator,
-	                                         const LogicalType &sql_type);
+	//! Every format template of the type for the separator, in ascending order of preference
+	const vector<StrpTimeFormat> &GetFormatTemplates(const string &separator, const LogicalTypeId sql_type);
+	//! Whether a template for the value's own separator, whose reading can differ from the plain cast's, reads it
+	bool PlainCastMayMisread(const string_t &value, const LogicalTypeId sql_type);
+	//! Whether the sniffer casts a value of the type without a format
+	bool ReadsWithPlainCast(const CSVStateMachine &state_machine, const LogicalTypeId sql_type) const;
 	//! Sets user defined date and time formats (if any)
 	void SetUserDefinedDateTimeFormat(CSVStateMachine &candidate) const;
-	//! Functions that performs detection for date and timestamp formats
-	void DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type, const string &separator,
-	                                   const string_t &dummy_val);
+	//! Detects the date or timestamp format from the value at row_idx and the column's earlier values, and returns
+	//! false when no reader of the type can read every sampled value of the column
+	bool DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const LogicalType &sql_type,
+	                                   const VectorIterator<string_t> &values, idx_t first_row, idx_t row_idx);
 	//! Sniffs the types from a data chunk
 	void SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machine,
 	                unordered_map<idx_t, vector<LogicalType>> &info_sql_types_candidates, idx_t start_idx_detection);
@@ -186,12 +199,12 @@ private:
 	      "%d-%m-%y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%y-%m-%d %H:%M:%S"}},
 	};
 	unordered_map<idx_t, vector<LogicalType>> best_sql_types_candidates_per_column_idx;
-	map<LogicalTypeId, vector<string>> best_format_candidates;
 	unique_ptr<StringValueScanner> best_candidate;
 	vector<HeaderValue> best_header_row;
 	//! Variable used for sniffing date and timestamp
 	map<LogicalTypeId, DateTimestampSniffing> format_candidates;
-	map<LogicalTypeId, DateTimestampSniffing> original_format_candidates;
+	//! The templates of the separator last asked for, per type
+	map<LogicalTypeId, FormatTemplates> format_templates;
 
 	//! ------------------------------------------------------//
 	//! ------------------ Type Refinement ------------------ //
