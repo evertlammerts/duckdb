@@ -40,9 +40,7 @@ static void WriteCatalogEntry(CatalogTransaction transaction, stringstream &ss, 
 			// CREATE TRIGGER stores the body as written, so it may name the exported catalog
 			auto &catalog = entry.ParentCatalog();
 			CatalogStripLookup lookup(catalog, transaction);
-			// a fired body binds through the firing session, where a name qualified with only the catalog resolves in
-			// its default schema; left bare it could read a transition table or a CTE of the body or the firing
-			// statement
+			// the export keeps the reading of a session whose search path names no other schema of the catalog
 			lookup.qualify_every_table = true;
 			auto default_schema = catalog.GetDefaultSchema();
 			if (default_schema) {
