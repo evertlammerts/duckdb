@@ -1304,65 +1304,17 @@ unique_ptr<TableRef> RemotePushdownOptimizer::CreateRemoteFunctionRef(CatalogPus
 
 namespace {
 
-//! The bindings of one query level that the strip has visited so far
-struct CatalogStripScope {
-	//! tables read without an alias, so a column reference can name them as catalog.table.column
-	identifier_set_t table_names;
-	identifier_set_t cte_names;
-	//! a column reference whose first name is the catalog's may then start with this binding instead
-	bool binding_named_like_catalog = false;
-
-	void Merge(const CatalogStripScope &other) {
-		table_names.insert(other.table_names.begin(), other.table_names.end());
-		binding_named_like_catalog = binding_named_like_catalog || other.binding_named_like_catalog;
-	}
-};
-
 struct CatalogStripContext {
-	explicit CatalogStripContext(const Identifier &catalog_name) : catalog_name(catalog_name), scopes(1) {
+	explicit CatalogStripContext(const Identifier &catalog_name) : catalog_name(catalog_name), cte_names(1) {
 	}
 
 	const Identifier &catalog_name;
-	//! the levels a column reference sees: its own query node's and those of the nodes around it
-	vector<CatalogStripScope> scopes;
-	//! the level of the query node walked last, for a set operation whose modifiers see its children's tables
-	CatalogStripScope last_scope;
+	//! the CTE names visible in each query node around the part being stripped, innermost last
+	vector<identifier_set_t> cte_names;
 
-	void AddBinding(const Identifier &alias) {
-		if (alias == catalog_name) {
-			scopes.back().binding_named_like_catalog = true;
-		}
-	}
-
-	void AddTable(const QualifiedName &name, const Identifier &alias) {
-		if (!alias.empty()) {
-			AddBinding(alias);
-			return;
-		}
-		AddBinding(name.Name());
-		bool is_cte = false;
-		for (auto &scope : scopes) {
-			is_cte = is_cte || scope.cte_names.count(name.Name()) > 0;
-		}
-		if (!is_cte || !name.Schema().empty()) {
-			scopes.back().table_names.insert(name.Name());
-		}
-	}
-
-	//! Follows the binder's order (ColumnQualifier::QualifyColumnNameWithManyDotsInternal): it resolves a reference
-	//! in its own query level before the outer ones, and within a level reads a later name as a catalog qualified
-	//! table first, then the leading name as a binding, then the whole reference as a catalog qualified table's row
-	bool ReadsAsCatalog(const vector<Identifier> &names) const {
-		for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
-			for (idx_t table_index = names.size() - 2; table_index >= 1; table_index--) {
-				if (scope->table_names.count(names[table_index]) > 0) {
-					return true;
-				}
-			}
-			if (scope->binding_named_like_catalog) {
-				return false;
-			}
-			if (scope->table_names.count(names.back()) > 0) {
+	bool IsCTE(const Identifier &name) const {
+		for (auto &names : cte_names) {
+			if (names.count(name) > 0) {
 				return true;
 			}
 		}
@@ -1373,11 +1325,10 @@ struct CatalogStripContext {
 class CatalogStripScopeGuard {
 public:
 	explicit CatalogStripScopeGuard(CatalogStripContext &context) : context(context) {
-		context.scopes.emplace_back();
+		context.cte_names.emplace_back();
 	}
 	~CatalogStripScopeGuard() {
-		context.last_scope = std::move(context.scopes.back());
-		context.scopes.pop_back();
+		context.cte_names.pop_back();
 	}
 
 private:
@@ -1406,9 +1357,12 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 		auto &base = ref.Cast<BaseTableRef>();
 		auto name = base.GetQualifiedName();
 		StripCatalogFromName(name, context.catalog_name);
-		context.AddTable(name, base.alias);
+		if (name.Path().size() == 1 && base.GetQualifiedName().Path().size() > 1 && context.IsCTE(name.Name())) {
+			// a bare name would read the CTE, where the qualified one read the table in the catalog's default schema
+			name = QualifiedName(Identifier(), Identifier(DEFAULT_SCHEMA), name.Name());
+		}
 		base.SetQualifiedName(std::move(name));
-		return;
+		break;
 	}
 	case TableReferenceType::JOIN: {
 		auto &join = ref.Cast<JoinRef>();
@@ -1428,9 +1382,6 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 		auto &tf = ref.Cast<TableFunctionRef>();
 		if (tf.function) {
 			StripCatalog(*tf.function, context);
-			if (tf.alias.empty() && tf.function->GetExpressionType() == ExpressionType::FUNCTION) {
-				context.AddBinding(tf.function->Cast<FunctionExpression>().FunctionName());
-			}
 		}
 		break;
 	}
@@ -1445,8 +1396,6 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	}
 	case TableReferenceType::PIVOT: {
 		auto &pivot = ref.Cast<PivotRef>();
-		// the bindings of the source are not visible outside the pivot
-		CatalogStripScopeGuard source_scope(context);
 		StripCatalog(*pivot.source, context);
 		for (auto &aggregate : pivot.aggregates) {
 			StripCatalog(*aggregate, context);
@@ -1468,8 +1417,6 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	}
 	case TableReferenceType::MATCH_RECOGNIZE: {
 		auto &match = ref.Cast<MatchRecognizeRef>();
-		// the bindings of the input are not visible outside the match
-		CatalogStripScopeGuard input_scope(context);
 		if (match.input) {
 			StripCatalog(*match.input, context);
 		}
@@ -1491,7 +1438,6 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	default:
 		break;
 	}
-	context.AddBinding(ref.alias);
 }
 
 static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context) {
@@ -1504,8 +1450,7 @@ static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context) {
 		// For 4-part  catalog.schema.table.col → schema.table.col
 		// Only the catalog is dropped: the parser keeps arbitrarily deep refs in a single ColumnRef, so trailing
 		// names may be struct fields (catalog.table.s.a.b → table.s.a.b) and must be preserved.
-		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == context.catalog_name &&
-		    context.ReadsAsCatalog(col_ref.ColumnNames())) {
+		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == context.catalog_name) {
 			auto &names = col_ref.ColumnNamesMutable();
 			names.erase(names.begin());
 		}
@@ -1568,7 +1513,7 @@ static void StripCatalog(CommonTableExpressionMap &cte_map, CatalogStripContext 
 		// a CTE's own definition reads the table of that name unless the CTE is recursive
 		bool recursive = cte.query_node && cte.query_node->type == QueryNodeType::RECURSIVE_CTE_NODE;
 		if (recursive) {
-			context.scopes.back().cte_names.insert(cte_pair.first);
+			context.cte_names.back().insert(cte_pair.first);
 		}
 		if (cte.query_node) {
 			StripCatalog(*cte.query_node, context);
@@ -1576,7 +1521,7 @@ static void StripCatalog(CommonTableExpressionMap &cte_map, CatalogStripContext 
 		for (auto &key : cte.key_targets) {
 			StripCatalog(*key, context);
 		}
-		context.scopes.back().cte_names.insert(cte_pair.first);
+		context.cte_names.back().insert(cte_pair.first);
 	}
 }
 
@@ -1645,8 +1590,6 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 		if (insert.select_statement) {
 			StripCatalog(*insert.select_statement->node, context);
 		}
-		// the target is a binding of ON CONFLICT and RETURNING only, not of the inserted query
-		context.AddTable(insert.qualified_name, insert.table_ref ? insert.table_ref->alias : Identifier());
 		if (insert.on_conflict_info) {
 			if (insert.on_conflict_info->condition) {
 				StripCatalog(*insert.on_conflict_info->condition, context);
@@ -1671,11 +1614,11 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 		if (del.table) {
 			StripCatalog(*del.table, context);
 		}
-		for (auto &clause : del.using_clauses) {
-			StripCatalog(*clause, context);
-		}
 		if (del.condition) {
 			StripCatalog(*del.condition, context);
+		}
+		for (auto &clause : del.using_clauses) {
+			StripCatalog(*clause, context);
 		}
 		for (auto &expr : del.returning_list) {
 			StripCatalog(*expr, context);
@@ -1744,8 +1687,6 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 		StripCatalog(setop.cte_map, context);
 		for (auto &child : setop.children) {
 			StripCatalog(*child, context);
-			// the binder resolves the ORDER BY of a set operation against the tables of its children
-			context.scopes.back().Merge(context.last_scope);
 		}
 		for (auto &modifier : setop.modifiers) {
 			switch (modifier->type) {
@@ -1782,14 +1723,6 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &rec = node.Cast<RecursiveCTENode>();
 		StripCatalog(rec.cte_map, context);
-		if (rec.left) {
-			StripCatalog(*rec.left, context);
-			context.scopes.back().Merge(context.last_scope);
-		}
-		if (rec.right) {
-			StripCatalog(*rec.right, context);
-			context.scopes.back().Merge(context.last_scope);
-		}
 		for (auto &key : rec.key_targets) {
 			StripCatalog(*key, context);
 		}
@@ -1822,6 +1755,12 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 			default:
 				break;
 			}
+		}
+		if (rec.left) {
+			StripCatalog(*rec.left, context);
+		}
+		if (rec.right) {
+			StripCatalog(*rec.right, context);
 		}
 		break;
 	}
