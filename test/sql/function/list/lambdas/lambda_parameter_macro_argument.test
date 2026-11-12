@@ -2044,3 +2044,175 @@ query I
 SELECT values_lateral(col1.z) FROM (VALUES ('!')) AS col1(z);
 ----
 [INTEGER!]
+
+# the value argument of cast_to_type and replace_type, which their callbacks keep, does not fold, in every spelling
+
+statement ok
+CREATE MACRO kept_value(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first(cast_to_type((SELECT x.v), 0))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first(cast_to_type((SELECT x.v), 0))) AS r FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), kept_value(x.z);
+----
+[53]
+
+statement ok
+CREATE MACRO kept_rt(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first(replace_type((SELECT x.v), 0, 0))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first(replace_type((SELECT x.v), 0, 0))) AS r FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), kept_rt(x.z);
+----
+[53]
+
+statement ok
+CREATE MACRO kept_named(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first(cast_to_type((SELECT x.v), type := 0))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first(cast_to_type((SELECT x.v), type := 0))) AS r FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), kept_named(x.z);
+----
+[53]
+
+statement ok
+CREATE MACRO kept_rt_named(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first(replace_type(param := (SELECT x.v), type1 := 0, type2 := 0))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first(replace_type(param := (SELECT x.v), type1 := 0, type2 := 0))) AS r FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), kept_rt_named(x.z);
+----
+[53]
+
+statement ok
+CREATE MACRO kept_dot(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first((SELECT x.v).cast_to_type(0))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first((SELECT x.v).cast_to_type(0))) AS r FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), kept_dot(x.z);
+----
+[53]
+
+# a dotted read that the fold moves counts for the body table rule
+
+statement ok
+CREATE TABLE fold_body AS SELECT 5 AS v;
+
+statement ok
+CREATE MACRO body_fold_read(a) AS TABLE SELECT list_transform([{'v': 'str'}], lambda x: typeof((SELECT x.v)) || left(typeof(a), 0)) AS r FROM fold_body AS x;
+
+query I
+SELECT list_transform([{'v': 'str'}], lambda x: typeof((SELECT x.v)) || left(typeof('q'), 0)) AS r FROM fold_body AS x;
+----
+[INTEGER]
+
+query I
+SELECT r FROM (SELECT 'q' AS x) s, body_fold_read(x);
+----
+[INTEGER]
+
+# a set operation's output column wins over the parameter in its modifiers, which still read the parameter otherwise
+
+statement ok
+CREATE MACRO setop_order(a) AS list_transform([1], lambda x: typeof((SELECT 'a' AS x UNION ALL SELECT 'b' ORDER BY x LIMIT 1)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT 'a' AS x UNION ALL SELECT 'b' ORDER BY x LIMIT 1)) || 'q');
+----
+[VARCHARq]
+
+query I
+SELECT setop_order(x.z) FROM (VALUES ('q')) AS x(z);
+----
+[VARCHARq]
+
+query II
+SELECT 'q' AS x, setop_order(x);
+----
+q	[VARCHARq]
+
+statement ok
+CREATE MACRO setop_order_read(a) AS list_transform([1], lambda x: typeof((SELECT 1 AS k UNION ALL SELECT 2 ORDER BY k + x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT 1 AS k UNION ALL SELECT 2 ORDER BY k + x)) || 'q');
+----
+[INTEGERq]
+
+query I
+SELECT setop_order_read(x.z) FROM (VALUES ('q')) AS x(z);
+----
+[INTEGERq]
+
+statement ok
+CREATE MACRO setop_limit(a) AS list_transform([1], lambda x: typeof((SELECT 1 UNION ALL SELECT 2 LIMIT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT 1 UNION ALL SELECT 2 LIMIT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT setop_limit(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+# a SEMI or ANTI join gives its level only its left side's names, and its condition both sides'
+
+statement ok
+CREATE MACRO semi_type(a) AS list_transform([1::BIGINT], lambda col1: typeof((SELECT col1 FROM (VALUES (1)) AS l SEMI JOIN (VALUES (1, 's')) AS r ON l.col0 = r.col0)) || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda col1: typeof((SELECT col1 FROM (VALUES (1)) AS l SEMI JOIN (VALUES (1, 's')) AS r ON l.col0 = r.col0)) || '!');
+----
+[BIGINT!]
+
+query I
+SELECT semi_type(col1.z) FROM (VALUES ('!')) AS col1(z);
+----
+[BIGINT!]
+
+statement ok
+CREATE MACRO anti_type(a) AS list_transform([1::BIGINT], lambda r: typeof((SELECT r FROM (VALUES (1)) AS l ANTI JOIN (VALUES (2)) AS r ON l.col0 = r.col0)) || a);
+
+query I
+SELECT list_transform([1::BIGINT], lambda r: typeof((SELECT r FROM (VALUES (1)) AS l ANTI JOIN (VALUES (2)) AS r ON l.col0 = r.col0)) || '!');
+----
+[BIGINT!]
+
+query I
+SELECT anti_type(r.z) FROM (VALUES ('!')) AS r(z);
+----
+[BIGINT!]
+
+statement ok
+CREATE MACRO semi_on(a) AS list_transform([{'q': 1}], lambda col1: typeof((SELECT 1 FROM (VALUES (1)) AS l SEMI JOIN (VALUES (1, 2)) AS r ON col1 + 1 = 3)) || a);
+
+query I
+SELECT list_transform([{'q': 1}], lambda col1: typeof((SELECT 1 FROM (VALUES (1)) AS l SEMI JOIN (VALUES (1, 2)) AS r ON col1 + 1 = 3)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT semi_on(col1.z) FROM (VALUES ('!')) AS col1(z);
+----
+[INTEGER!]

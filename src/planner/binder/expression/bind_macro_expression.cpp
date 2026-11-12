@@ -302,7 +302,7 @@ static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set
 	}
 }
 
-// The qualifier resolves a dot call's receiver against tables first; reads inside a subquery never move, so skip them.
+// The qualifier resolves a dot call's receiver against tables first; reads inside a subquery move only in a fold.
 static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &column_ref = expr.Cast<ColumnRefExpression>();
@@ -320,8 +320,7 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 	return found;
 }
 
-// A VALUES list, also as the derived table without column aliases it prints as, binds its expressions in the scope
-// around it and gives its level only its alias and its column names.
+// A VALUES list, also in the derived table form it prints as, gives its level only its alias and column names.
 static bool IsValuesList(TableRef &ref, identifier_set_t &level_names) {
 	reference<TableRef> inner = ref;
 	while (inner.get().type == TableReferenceType::SUBQUERY && inner.get().column_name_alias.empty()) {
@@ -355,11 +354,14 @@ static bool IsValuesList(TableRef &ref, identifier_set_t &level_names) {
 	return true;
 }
 
-static bool HasTable(TableRef &ref, identifier_set_t &level_names) {
+static bool HasTable(TableRef &ref, identifier_set_t &level_names, bool in_condition = false) {
 	if (ref.type == TableReferenceType::JOIN) {
 		auto &join = ref.Cast<JoinRef>();
+		// a SEMI or ANTI join binds its right side only in its condition
+		identifier_set_t hidden;
+		auto hides_right = !in_condition && (join.type == JoinType::SEMI || join.type == JoinType::ANTI);
 		auto left = HasTable(*join.left, level_names);
-		auto right = HasTable(*join.right, level_names);
+		auto right = HasTable(*join.right, hides_right ? hidden : level_names);
 		return left || right;
 	}
 	return ref.type != TableReferenceType::EMPTY_FROM && !IsValuesList(ref, level_names);
@@ -370,6 +372,25 @@ static identifier_set_t Without(const identifier_set_t &names, const identifier_
 	for (auto &name : names) {
 		if (removed.find(name) == removed.end()) {
 			result.insert(name);
+		}
+	}
+	return result;
+}
+
+static identifier_set_t SetOperationOutputNames(QueryNode &node) {
+	reference<QueryNode> leftmost = node;
+	while (leftmost.get().type == QueryNodeType::SET_OPERATION_NODE) {
+		leftmost = *leftmost.get().Cast<SetOperationNode>().children[0];
+	}
+	identifier_set_t result;
+	if (leftmost.get().type != QueryNodeType::SELECT_NODE) {
+		return result;
+	}
+	for (auto &item : leftmost.get().Cast<SelectNode>().select_list) {
+		if (!item->GetAlias().empty()) {
+			result.insert(item->GetAlias());
+		} else if (item->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			result.insert(item->Cast<ColumnRefExpression>().ColumnNames().back());
 		}
 	}
 	return result;
@@ -421,14 +442,17 @@ static void EnumerateFoldedNode(QueryNode &node, const identifier_set_t &names, 
 		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, level_clause_names, in_scope); });
 		break;
 	}
-	case QueryNodeType::SET_OPERATION_NODE:
+	case QueryNodeType::SET_OPERATION_NODE: {
+		// an output column wins over the parameter in the modifiers
+		auto modifier_names = Without(names, SetOperationOutputNames(node));
 		for (auto &child : node.Cast<SetOperationNode>().children) {
 			EnumerateFoldedNode(*child, names, table_in_scope, callback);
 		}
 		ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
-			callback(child, table_in_scope ? none : names, table_in_scope);
+			callback(child, table_in_scope ? none : modifier_names, table_in_scope);
 		});
 		break;
+	}
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &cte = node.Cast<RecursiveCTENode>();
 		EnumerateFoldedNode(*cte.left, names, table_in_scope, callback);
@@ -459,7 +483,7 @@ static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, boo
 		                   callback);
 		if (join.condition) {
 			identifier_set_t join_names;
-			HasTable(join, join_names);
+			HasTable(join, join_names, true);
 			callback(join.condition, in_scope ? none : Without(names, join_names), in_scope);
 		}
 		break;
@@ -976,7 +1000,23 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
 	}
 
-	// Bind callbacks that keep only the type of a subquery argument, and pg_typeof, a built in macro over typeof.
+	// The argument named param, or else the first positional one, as the binder places it.
+	static optional_idx ValueArgument(FunctionExpression &function) {
+		auto &arguments = function.GetArguments();
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			if (arguments[i].HasName() && arguments[i].GetName() == Identifier("param")) {
+				return i;
+			}
+		}
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			if (!arguments[i].HasName()) {
+				return i;
+			}
+		}
+		return optional_idx();
+	}
+
+	// The arguments whose bind callback keeps only their type, and that of pg_typeof, a built in macro over typeof.
 	bool FoldedArguments(FunctionExpression &function, vector<bool> &folded) {
 		if (subquery_depth > 0 || !function.HasSubquery()) {
 			return false;
@@ -994,10 +1034,17 @@ private:
 				folded.assign(count, true);
 			}
 		} else if (entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-			// a value argument of cast_to_type that reads the lambda's parameter already fails at CREATE MACRO
-			if (name == "typeof" || name == "get_type" || name == "can_cast_implicitly" || name == "st_crs" ||
-			    name == "cast_to_type" || name == "replace_type") {
+			if (name == "typeof" || name == "get_type" || name == "can_cast_implicitly" || name == "st_crs") {
 				folded.assign(count, true);
+			} else if (name == "cast_to_type" || name == "replace_type") {
+				folded.assign(count, true);
+				// the callback keeps the value argument, which a dot call carries as its receiver
+				if (!dot_call) {
+					auto value = ValueArgument(function);
+					if (value.IsValid()) {
+						folded[value.GetIndex()] = false;
+					}
+				}
 			}
 		}
 		for (auto fold : folded) {
@@ -1006,6 +1053,60 @@ private:
 			}
 		}
 		return false;
+	}
+
+	// Whether the rename of a folded subquery moves a dotted read led by the name, as RenameReferences walks it.
+	bool FoldMovesQualifiedReference(ParsedExpression &expr, const Identifier &name) {
+		bool found = false;
+		auto visit = [&](unique_ptr<ParsedExpression> &child) {
+			found = found || FoldMovesQualifiedReference(*child, name);
+		};
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::FUNCTION: {
+			auto &function = expr.Cast<FunctionExpression>();
+			vector<bool> folded;
+			if (!FoldedArguments(function, folded)) {
+				break;
+			}
+			auto &arguments = function.GetArgumentsMutable();
+			for (idx_t i = 0; i < arguments.size(); i++) {
+				folding += folded[i];
+				visit(arguments[i].GetExpressionMutable());
+				folding -= folded[i];
+			}
+			if (function.FilterMutable()) {
+				visit(function.FilterMutable());
+			}
+			if (function.OrderByMutable()) {
+				for (auto &order : function.OrderByMutable()->orders) {
+					visit(order.expression);
+				}
+			}
+			return found;
+		}
+		case ExpressionClass::SUBQUERY: {
+			if (folding == 0) {
+				return false;
+			}
+			identifier_set_t names {name};
+			EnumerateFoldedNode(
+			    *expr.Cast<SubqueryExpression>().Subquery()->node, names, folded_table_in_scope,
+			    [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &child_names, bool in_scope) {
+				    if (found || child_names.find(name) == child_names.end()) {
+					    return;
+				    }
+				    auto outer = folded_table_in_scope;
+				    folded_table_in_scope = in_scope;
+				    found = HasQualifiedReference(*child, name) || FoldMovesQualifiedReference(*child, name);
+				    folded_table_in_scope = outer;
+			    });
+			return found;
+		}
+		default:
+			break;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, visit);
+		return found;
 	}
 
 	// Renames the references of a folded subquery that may still read the lambda's parameter.
@@ -1053,8 +1154,9 @@ private:
 
 	// x.v may name a body table x by scopes and columns unknown here, so such an x keeps its name.
 	bool ReadsBodyTable(LambdaScope &scope, const Identifier &name) {
+		auto &lambda_body = *scope.lambda_expr.get().RightMutable();
 		return scope.in_body_query && BodyTableNames().count(name) &&
-		       HasQualifiedReference(*scope.lambda_expr.get().RightMutable(), name);
+		       (HasQualifiedReference(lambda_body, name) || FoldMovesQualifiedReference(lambda_body, name));
 	}
 
 	void RenameCaptured(LambdaScope &scope) {
