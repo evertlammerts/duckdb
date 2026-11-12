@@ -235,3 +235,24 @@ query II
 SELECT 10 AS x, json_table_column(x);
 ----
 10	[15]
+
+# an arrow forwarded to a macro inside a subquery keeps its dot call on the subquery's column
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+statement ok
+CREATE MACRO apply_arg(l, f) AS list_transform(l, f);
+
+statement ok
+CREATE MACRO forwarded_dot(a) AS list_transform([1], lambda x: a + first((SELECT apply_arg([-1], x -> x.abs())[1] FROM (VALUES (-7)) AS t(x))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], x -> x.abs())[1] FROM (VALUES (-7)) AS t(x))));
+----
+[10]
+
+query I
+SELECT forwarded_dot(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[10]

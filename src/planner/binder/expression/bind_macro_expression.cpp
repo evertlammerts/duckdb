@@ -701,9 +701,38 @@ private:
 		}
 	}
 
+	bool ReadsMacroParameter(ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() >= 2 && names[names.size() - 2].StartsWith(DummyBinding::DUMMY_NAME)) {
+				return true;
+			}
+			return macro_binding.HasMatchingBinding(names[0]);
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &path = expr.Cast<FunctionExpression>().GetQualifiedName().Path();
+			if (path.size() >= 2 && macro_binding.HasMatchingBinding(path[0])) {
+				return true;
+			}
+		}
+		bool found = false;
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    *expr.Cast<SubqueryExpression>().Subquery()->node,
+			    [&](unique_ptr<ParsedExpression> &child) { found = found || ReadsMacroParameter(*child); });
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || ReadsMacroParameter(*child); });
+		return found;
+	}
+
 	// The binder names a parameter by its alias, so a declaration takes none; an inner one keeps shadowing.
 	void RenameDeclaration(LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters,
 	                       const identifier_map_t<Identifier> &renames) {
+		// a lambda in a subquery only needs the new name where an argument lands in its body
+		if (subquery_depth > 0 && !ReadsMacroParameter(*lambda_expr.RightMutable())) {
+			return;
+		}
 		identifier_map_t<Identifier> own;
 		for (auto &parameter : parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
@@ -730,7 +759,6 @@ private:
 			auto &column_ref = expr->Cast<ColumnRefExpression>();
 			auto &leading_name = column_ref.ColumnNamesMutable()[0];
 			auto entry = renames.find(leading_name);
-			// a reference in a subquery inside a lambda never binds that lambda's parameter
 			if (entry == renames.end() || subquery_depth > 0) {
 				return;
 			}
@@ -742,8 +770,7 @@ private:
 			return;
 		}
 		case ExpressionClass::LAMBDA: {
-			// without an alias the left side names the new name whether the binder reads a column or a declaration;
-			// inside a subquery an arrow off a lambda position is the JSON operator over a column there
+			// without an alias the left side names the new name as a column or a declaration; in a subquery it is JSON
 			auto &lambda_expr = expr->Cast<LambdaExpression>();
 			vector<reference<ColumnRefExpression>> parameters;
 			if (subquery_depth > 0 || !GetLambdaParameters(lambda_expr, parameters)) {
@@ -766,6 +793,24 @@ private:
 				arguments.insert(arguments.begin(), FunctionArgument(std::move(receiver)));
 				function.SetQualifiedName(QualifiedName(qualified_name.Name()));
 			}
+			if (FoldsSubqueryArgument(function)) {
+				EnumerateCallChildren(
+				    function, QualifyingBinder(),
+				    [&](unique_ptr<ParsedExpression> &child) {
+					    if (child->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+						    RenameSubquery(child->Cast<SubqueryExpression>(), renames, true);
+						    ParsedExpressionIterator::EnumerateChildren(
+						        *child,
+						        [&](unique_ptr<ParsedExpression> &operand) { RenameReferences(operand, renames); });
+					    } else {
+						    RenameReferences(child, renames);
+					    }
+				    },
+				    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+					    RenameDeclaration(lambda_expr, parameters, renames);
+				    });
+				return;
+			}
 			if (!function.IsLambdaFunction()) {
 				break;
 			}
@@ -777,32 +822,63 @@ private:
 			    });
 			return;
 		}
-		case ExpressionClass::SUBQUERY: {
-			// a reference in a subquery binds the lambda's parameter only where typeof folds it, so only lambdas move
-			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
-			auto outer_body_is_qualified = body_is_qualified;
-			body_is_qualified = false;
-			subquery_depth++;
-			// a lambda beside a table of its name reads x.v as that table, as without the macro
-			EnumerateScopedNodeExpressions(*sq->node, identifier_set_t(),
-			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
-				                               identifier_map_t<Identifier> scope_renames;
-				                               for (auto &entry : renames) {
-					                               if (declared.find(entry.first) == declared.end()) {
-						                               scope_renames.emplace(entry.first, entry.second);
-					                               }
-				                               }
-				                               RenameReferences(child, scope_renames);
-			                               });
-			subquery_depth--;
-			body_is_qualified = outer_body_is_qualified;
+		case ExpressionClass::SUBQUERY:
+			// outside a folding function a reference in a subquery never binds the lambda's parameter
+			RenameSubquery(expr->Cast<SubqueryExpression>(), renames, false);
 			break;
-		}
 		default:
 			break;
 		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
+	}
+
+	// typeof and other functions with a bind expression callback bind a subquery argument in the lambda's scope.
+	bool FoldsSubqueryArgument(FunctionExpression &function) {
+		if (subquery_depth > 0) {
+			return false;
+		}
+		bool has_subquery = false;
+		for (auto &argument : function.GetArguments()) {
+			has_subquery = has_subquery || argument.GetExpression().GetExpressionClass() == ExpressionClass::SUBQUERY;
+		}
+		if (!has_subquery) {
+			return false;
+		}
+		bool dot_call;
+		auto entry = FindFunction(function, QualifyingBinder(), dot_call);
+		if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+			return false;
+		}
+		for (auto &overload : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
+			if (overload->HasBindExpressionCallback()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// A lambda beside a table of its name reads x.v as that table; a folded subquery renames as the lambda's top.
+	void RenameSubquery(SubqueryExpression &subquery, const identifier_map_t<Identifier> &renames, bool folded) {
+		auto outer_body_is_qualified = body_is_qualified;
+		body_is_qualified = false;
+		if (!folded) {
+			subquery_depth++;
+		}
+		EnumerateScopedNodeExpressions(*subquery.Subquery()->node, identifier_set_t(),
+		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+			                               identifier_map_t<Identifier> scope_renames;
+			                               for (auto &entry : renames) {
+				                               if (declared.find(entry.first) == declared.end()) {
+					                               scope_renames.emplace(entry.first, entry.second);
+				                               }
+			                               }
+			                               RenameReferences(child, scope_renames);
+		                               });
+		if (!folded) {
+			subquery_depth--;
+		}
+		body_is_qualified = outer_body_is_qualified;
 	}
 
 	// x.v may name a body table x by scopes and columns unknown here, so such an x keeps its name.

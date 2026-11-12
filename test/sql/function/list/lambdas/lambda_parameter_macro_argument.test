@@ -1229,3 +1229,144 @@ query I
 SELECT r FROM (VALUES (3)) AS x(z), inner_lambda_field(x.z);
 ----
 [10]
+
+# a lambda in a subquery that holds no argument keeps its name, so its dot calls and its reads stay as the binder
+# reads them; each call gives what the expression gives with the argument's value written in
+
+statement ok
+CREATE MACRO inner_dot(a) AS list_transform([1], lambda x: a + first((SELECT list_transform([-1], lambda x: x.abs())[1] FROM (VALUES (-7)) AS t(x))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], lambda x: x.abs())[1] FROM (VALUES (-7)) AS t(x))));
+----
+[10]
+
+query I
+SELECT inner_dot(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[10]
+
+statement ok
+CREATE MACRO inner_dot2(a) AS list_transform([1], lambda x: a + first((SELECT list_transform([{'v': -1}], lambda x: x.v.abs())[1] FROM (SELECT {'v': -7} AS x) AS t)));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([{'v': -1}], lambda x: x.v.abs())[1] FROM (SELECT {'v': -7} AS x) AS t)));
+----
+[10]
+
+query I
+SELECT inner_dot2(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[10]
+
+statement ok
+CREATE MACRO dc_inner(a) AS list_transform([1], lambda x: a + first((SELECT length(list_transform(['p'], lambda x: x.upper())[1]) FROM (SELECT 'col' AS x) AS t)));
+
+query I
+SELECT list_transform([1], lambda x: 1 + first((SELECT length(list_transform(['p'], lambda x: x.upper())[1]) FROM (SELECT 'col' AS x) AS t)));
+----
+[4]
+
+query II
+SELECT 1 AS x, dc_inner(x);
+----
+1	[4]
+
+statement ok
+CREATE MACRO outer_table_read(a) AS TABLE SELECT list_transform([1], lambda x: a + first((SELECT list_transform([1], lambda x: x.v)[1]))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([1], lambda x: x.v)[1]))) FROM (VALUES (50)) AS x(v);
+----
+[53]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), outer_table_read(x.z);
+----
+[53]
+
+statement ok
+CREATE MACRO pivot_lambda(a) AS list_transform([1], lambda x: a + first((SELECT k FROM (PIVOT (SELECT list_transform([{'d': 2}], lambda x: x.d)[1] AS v, 'k' AS category FROM (VALUES (60)) AS x(d)) ON category IN ('k') USING sum(v)) AS p)));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT k FROM (PIVOT (SELECT list_transform([{'d': 2}], lambda x: x.d)[1] AS v, 'k' AS category FROM (VALUES (60)) AS x(d)) ON category IN ('k') USING sum(v)) AS p)));
+----
+[63]
+
+query I
+SELECT pivot_lambda(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[63]
+
+# a subquery that typeof folds binds in the lambda's scope, so its references are renamed with the lambda
+
+statement ok
+CREATE MACRO inspect_lambda(a) AS list_transform([1], lambda x: typeof((SELECT x)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT inspect_lambda(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO inspect_field(a) AS list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d)) || a);
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d)) || 'z');
+----
+[aVARCHARz]
+
+query II
+SELECT 'z' AS x, inspect_field(x);
+----
+z	[aVARCHARz]
+
+statement ok
+CREATE OR REPLACE TABLE x AS SELECT 50 AS d, 'caller' AS z;
+
+statement ok
+CREATE MACRO whole_type() AS list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x)));
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x)));
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+query I
+SELECT whole_type() FROM x;
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+statement ok
+CREATE MACRO tf() AS list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d)));
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d)));
+----
+[aVARCHAR]
+
+query I
+SELECT tf();
+----
+[aVARCHAR]
+
+statement ok
+CREATE TABLE xe AS SELECT 'v' AS e;
+
+statement ok
+CREATE MACRO aggregate_type() AS list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1]))));
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1]))));
+----
+['1:INTEGER']
+
+query I
+SELECT aggregate_type() FROM xe AS x;
+----
+['1:INTEGER']
