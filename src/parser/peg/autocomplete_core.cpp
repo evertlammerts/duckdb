@@ -147,21 +147,6 @@ static vector<AutoCompleteSuggestion> ComputeSuggestions(vector<AutoCompleteCand
 	return results;
 }
 
-bool ReplaceUnicodeSpaces(const string &query, string &new_query, const vector<UnicodeSpace> &unicode_spaces) {
-	if (unicode_spaces.empty()) {
-		// no unicode spaces found
-		return false;
-	}
-	idx_t prev = 0;
-	for (auto &usp : unicode_spaces) {
-		new_query += query.substr(prev, usp.pos - prev);
-		new_query += " ";
-		prev = usp.pos + usp.bytes;
-	}
-	new_query += query.substr(prev, query.size() - prev);
-	return true;
-}
-
 class AutoCompleteTokenizerBehavior : public TokenizerBehavior {
 public:
 	AutoCompleteTokenizerBehavior(const string &sql, vector<MatcherSuggestion> &suggestions_p)
@@ -201,7 +186,6 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
 	vector<MatcherSuggestion> suggestions;
 	ParseResultAllocator parse_allocator;
 	idx_t max_token_index = 0;
-	vector<UnicodeSpace> unicode_spaces;
 	string clean_sql;
 	const string &sql_ref =
 	    Parser::StripUnicodeSpaces(sql, clean_sql, compiled_grammar->GetTokenizer()) ? clean_sql : sql;

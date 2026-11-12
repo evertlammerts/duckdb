@@ -945,9 +945,8 @@ unique_ptr<QueryResult> ClientContext::QueryInternal(ClientContextLock &lock, co
 	}
 	auto &profiler = QueryProfiler::Get(*this);
 	profiler.StartQuery(query);
-	// ParseIterator's constructor runs UTF-8 validation / Unicode-space strip and can throw — route
-	// through ErrorResult so the source location attaches the same way Peek failures do. ErrorResult also applies
-	// the invalidation policy.
+	// ParseIterator's constructor validates UTF-8 and can throw; route through ErrorResult so the source location
+	// attaches the same way Peek failures do. ErrorResult also applies the invalidation policy.
 	optional_ptr<StatementIterator> iterator_ptr;
 	unique_ptr<StatementIterator> iterator_storage;
 	try {

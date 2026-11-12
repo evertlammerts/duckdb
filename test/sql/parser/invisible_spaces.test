@@ -60,6 +60,12 @@ SELECT /* it's */{unicode_space}42;
 ----
 42
 
+# unicode spaces between tokens are rewritten while the one in the literal stays
+query I
+SELECT /* it's */{unicode_space}length('a{unicode_space}b');
+----
+3
+
 # unicode space inside a block comment is not modified
 query I
 SELECT unicode(right(current_query(), 3)) > 127 /*{unicode_space}*/

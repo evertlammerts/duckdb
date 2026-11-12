@@ -210,9 +210,12 @@ void Parser::ThrowParserOverrideError(ParserOverrideResult &result) {
 	}
 }
 
+bool Parser::ValidateUTF8(const string &query) {
+	return ValidateUTF8Query(query) == UnicodeType::ASCII;
+}
+
 string Parser::NormalizeSQLString(const string &query, const Tokenizer &tokenizer) {
-	// Validate before strip: StripUnicodeSpaces walks multi-byte sequences and assumes valid UTF-8.
-	if (ValidateUTF8Query(query) == UnicodeType::ASCII) {
+	if (ValidateUTF8(query)) {
 		return query;
 	}
 	string normalized;

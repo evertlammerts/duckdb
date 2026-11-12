@@ -322,18 +322,6 @@ static vector<AutoCompleteCandidate> SuggestFileName(ClientContext &context, str
 	return result;
 }
 
-// The following functions have been moved to autocomplete_core.cpp:
-// - UnicodeSpace struct
-// - ReplaceUnicodeSpaces
-// - IsValidDollarQuotedStringTagFirstChar
-// - IsValidDollarQuotedStringTagSubsequentChar
-// - StripUnicodeSpaces
-// - AutoCompleteTokenizer class
-// - GenerateAutoCompleteSuggestions
-
-// Forward declaration for StripUnicodeSpaces (defined in autocomplete_core.cpp)
-bool StripUnicodeSpaces(const string &query_str, string &new_query);
-
 // ClientContext-based provider — wraps existing Suggest* functions for in-process use.
 class ClientContextCatalogProvider : public AutoCompleteCatalogProvider {
 public:
