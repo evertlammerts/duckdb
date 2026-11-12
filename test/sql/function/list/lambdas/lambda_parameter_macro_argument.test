@@ -1127,3 +1127,29 @@ query I
 SELECT column_name FROM (DESCRIBE SELECT * FROM argument_with_lateral((SELECT y.v FROM (SELECT 50 AS v) AS x, LATERAL (SELECT x.v) AS y)));
 ----
 list_transform(list_value(1), (lambda x: (x + "first"((SELECT y.v FROM (SELECT 50 AS v) AS x , (SELECT x.v) AS y)))))
+
+# a lambda in such a subquery beside a table of its name reads x.d as that table, as without the macro
+
+statement ok
+CREATE MACRO beside_table_scalar(a) AS list_transform([{'d': 1}], lambda x: x.d + a + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)));
+
+query II
+SELECT {'d': 50} AS x, beside_table_scalar(x['d']);
+----
+{'d': 50}	[111]
+
+statement ok
+CREATE MACRO beside_table_query(a) AS TABLE SELECT list_transform([{'d': 1}], lambda x: x['d'] + a + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x))) AS r;
+
+query I
+SELECT r FROM (VALUES (50)) AS x(d), beside_table_query(x.d);
+----
+[111]
+
+statement ok
+CREATE MACRO beside_table_argument(a) AS list_transform([1], lambda x: x + a);
+
+query I
+SELECT beside_table_argument(first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)));
+----
+[61]

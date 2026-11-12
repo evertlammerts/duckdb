@@ -320,10 +320,13 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 		found = found || HasQualifiedReference(*child, name, in_subquery);
 	};
 	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		// the rename leaves the references of a subquery alone
-		ParsedExpressionIterator::EnumerateQueryNodeChildren(
-		    *expr.Cast<SubqueryExpression>().Subquery()->node,
-		    [&](unique_ptr<ParsedExpression> &child) { found = found || HasQualifiedReference(*child, name, true); });
+		// the rename leaves a subquery's references alone, and its lambdas where a table of the name is in scope
+		EnumerateScopedNodeExpressions(*expr.Cast<SubqueryExpression>().Subquery()->node, identifier_set_t(),
+		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+			                               if (!declared.count(name)) {
+				                               found = found || HasQualifiedReference(*child, name, true);
+			                               }
+		                               });
 	}
 	ParsedExpressionIterator::EnumerateChildren(expr, visit);
 	return found;
@@ -741,8 +744,17 @@ private:
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
 			subquery_depth++;
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(
-			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
+			// a lambda beside a table of its name reads x.v as that table, as without the macro
+			EnumerateScopedNodeExpressions(*sq->node, identifier_set_t(),
+			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
+				                               identifier_map_t<Identifier> scope_renames;
+				                               for (auto &entry : renames) {
+					                               if (declared.find(entry.first) == declared.end()) {
+						                               scope_renames.emplace(entry.first, entry.second);
+					                               }
+				                               }
+				                               RenameReferences(child, scope_renames);
+			                               });
 			subquery_depth--;
 			body_is_qualified = outer_body_is_qualified;
 			break;
