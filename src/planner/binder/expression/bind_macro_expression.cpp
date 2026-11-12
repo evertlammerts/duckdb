@@ -471,10 +471,20 @@ public:
 			}
 			vector<bool> folded;
 			if (body_is_qualified && FoldedArguments(function, folded)) {
-				caller_scope_folding++;
-				ParsedExpressionIterator::EnumerateChildren(
-				    *expr, [&](unique_ptr<ParsedExpression> &child) { Rename(child); });
-				caller_scope_folding--;
+				auto &arguments = function.GetArgumentsMutable();
+				for (idx_t i = 0; i < arguments.size(); i++) {
+					caller_scope_folding += folded[i];
+					Rename(arguments[i].GetExpressionMutable());
+					caller_scope_folding -= folded[i];
+				}
+				if (function.FilterMutable()) {
+					Rename(function.FilterMutable());
+				}
+				if (function.OrderByMutable()) {
+					for (auto &order : function.OrderByMutable()->orders) {
+						Rename(order.expression);
+					}
+				}
 				return;
 			}
 			if (!function.IsLambdaFunction()) {
@@ -493,7 +503,7 @@ public:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
-			// the dummy qualification does not enter a subquery, so its references stay as written
+			// the dummy qualification does not enter a subquery; the caller's scope is asked about a folded one only
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
 			if (body_is_qualified && caller_scope_folding > 0) {
 				identifier_set_t names;
@@ -593,18 +603,28 @@ private:
 			}
 			return;
 		}
-		case ExpressionClass::LAMBDA: {
-			auto &lambda_expr = expr.Cast<LambdaExpression>();
-			vector<reference<ColumnRefExpression>> parameters;
-			if (!GetLambdaParameters(lambda_expr, parameters)) {
-				break;
+		case ExpressionClass::FUNCTION: {
+			// a dot call's receiver and an arrow at a lambda position are read as at the top of the lambda
+			auto &function = expr.Cast<FunctionExpression>();
+			auto &path = function.GetQualifiedName().Path();
+			if (path.size() >= 3 && names.count(path[0]) &&
+			    !LambdaExpression::IsLambdaParameter(inner_parameters, path[0]) && IsDotCall(function, ProbeBinder())) {
+				auto &qualified_name = function.GetQualifiedName();
+				CaptureByCallerScope(ColumnRefExpression(qualified_name.Schema(), qualified_name.Catalog()));
 			}
-			inner_parameters.emplace_back();
-			for (auto &parameter : parameters) {
-				inner_parameters.back().insert(parameter.get().GetColumnName());
-			}
-			ProbeFoldedSubquery(*lambda_expr.RightMutable(), names, table_in_scope, inner_parameters);
-			inner_parameters.pop_back();
+			EnumerateCallChildren(
+			    function, ProbeBinder(),
+			    [&](unique_ptr<ParsedExpression> &child) {
+				    ProbeFoldedSubquery(*child, names, table_in_scope, inner_parameters);
+			    },
+			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+				    inner_parameters.emplace_back();
+				    for (auto &parameter : parameters) {
+					    inner_parameters.back().insert(parameter.get().GetColumnName());
+				    }
+				    ProbeFoldedSubquery(*lambda_expr.RightMutable(), names, table_in_scope, inner_parameters);
+				    inner_parameters.pop_back();
+			    });
 			return;
 		}
 		case ExpressionClass::SUBQUERY:

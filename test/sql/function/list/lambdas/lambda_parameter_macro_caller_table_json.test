@@ -29,3 +29,18 @@ query I
 SELECT jd() FROM x AS q;
 ----
 [42]
+
+# inside a folded subquery an arrow off a lambda position is the JSON operator, so its left side reads the parameter
+
+statement ok
+CREATE MACRO json_fold() AS list_transform([{'d': 'k', 'K': 42}], lambda x: typeof((SELECT x -> upper(x.d))));
+
+query I
+SELECT json_fold() FROM (SELECT 50 AS d) x;
+----
+[JSON]
+
+query I
+SELECT list_transform([{'d': 'k', 'K': 42}], lambda x: typeof((SELECT x -> upper(x.d)))) FROM (SELECT 50 AS d) q;
+----
+[JSON]

@@ -525,6 +525,142 @@ SELECT list_transform([{'d': 'a'}], lambda x: typeof(x) || typeof((SELECT x.d)))
 ----
 ['STRUCT(d VARCHAR)VARCHAR']
 
+# a dot call on the parameter inside a folded subquery is asked about, as at the top of the lambda
+
+statement ok
+CREATE MACRO dot_fold() AS list_transform([{'d': 1::BIGINT}], lambda x: typeof((SELECT x.d.abs())));
+
+query I
+SELECT dot_fold() FROM x;
+----
+[BIGINT]
+
+query I
+SELECT list_transform([{'d': 1::BIGINT}], lambda x: typeof((SELECT x.d.abs()))) FROM x AS q;
+----
+[BIGINT]
+
+statement ok
+CREATE MACRO dc_alone() AS list_transform([{'d': -1.5}], lambda x: typeof((SELECT x.d.abs())));
+
+query I
+SELECT dc_alone() FROM x;
+----
+['DECIMAL(2,1)']
+
+query I
+SELECT list_transform([{'d': -1.5}], lambda x: typeof((SELECT x.d.abs()))) FROM x AS q;
+----
+['DECIMAL(2,1)']
+
+# a nested subquery, the other folding functions, a set operation, a CTE and lambdas inside or around the folded subquery
+
+statement ok
+CREATE MACRO deep_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT (SELECT x.d))));
+
+query I
+SELECT deep_sub() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT (SELECT x.d)))) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO get_type_sub() AS list_transform([{'d': 'a'}], lambda x: get_type((SELECT x.d))::VARCHAR);
+
+query I
+SELECT get_type_sub() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: get_type((SELECT x.d))::VARCHAR) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO cast_check() AS list_transform([{'d': 'a'}], lambda x: can_cast_implicitly((SELECT x.d), 1::BIGINT));
+
+query I
+SELECT cast_check() FROM x;
+----
+[false]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: can_cast_implicitly((SELECT x.d), 1::BIGINT)) FROM x AS q;
+----
+[false]
+
+statement ok
+CREATE MACRO set_op_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d UNION ALL SELECT x.d)));
+
+query I
+SELECT set_op_sub() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d UNION ALL SELECT x.d))) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO cte_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT 1 AS k) SELECT x.d)));
+
+query I
+SELECT cte_sub() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((WITH c AS (SELECT 1 AS k) SELECT x.d))) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO lambda_in_sub() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT list_transform([1], lambda z: x.d))));
+
+query I
+SELECT lambda_in_sub() FROM x;
+----
+['VARCHAR[]']
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT list_transform([1], lambda z: x.d)))) FROM x AS q;
+----
+['VARCHAR[]']
+
+statement ok
+CREATE MACRO read_from_inner() AS list_transform([{'d': 'a'}], lambda x: list_transform([1], lambda y: typeof((SELECT x.d))));
+
+query I
+SELECT read_from_inner() FROM x;
+----
+[[VARCHAR]]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: list_transform([1], lambda y: typeof((SELECT x.d)))) FROM x AS q;
+----
+[[VARCHAR]]
+
+# a table only at an inner level leaves the outer level's read to the parameter
+
+statement ok
+CREATE MACRO exists_fold() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d WHERE EXISTS (SELECT 1 FROM range(1)))));
+
+query I
+SELECT exists_fold() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d WHERE EXISTS (SELECT 1 FROM range(1))))) FROM x AS q;
+----
+[VARCHAR]
+
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
 statement ok
