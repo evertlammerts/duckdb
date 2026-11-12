@@ -322,6 +322,7 @@ TEST_CASE("Test arrow in C API", "[capi][arrow]") {
 
 		SECTION("name taken by a table") {
 			REQUIRE_NO_FAIL(tester.Query("CREATE TEMPORARY TABLE foo_taken(id BIGINT)"));
+			auto child_release = arrow_schema.children[0]->release;
 
 			ArrowArrayStream *arrow_array_stream;
 			auto out_stream = reinterpret_cast<duckdb_arrow_stream *>(&arrow_array_stream);
@@ -332,7 +333,7 @@ TEST_CASE("Test arrow in C API", "[capi][arrow]") {
 
 			duckdb_destroy_arrow_stream(out_stream);
 			REQUIRE(arrow_schema.release != nullptr);
-			REQUIRE(arrow_schema.children[0]->release != nullptr);
+			REQUIRE(arrow_schema.children[0]->release == child_release);
 
 			auto table_result = tester.Query("SELECT id FROM foo_taken");
 			REQUIRE_NO_FAIL(*table_result);
@@ -367,6 +368,7 @@ struct ArrowScanStream {
 	ArrowArray child_array = {};
 	ArrowArray *array_children[1] = {&child_array};
 	bool emitted = false;
+	idx_t schema_calls = 0;
 	ArrowArrayStream stream = {};
 
 	ArrowScanStream() {
@@ -379,6 +381,7 @@ struct ArrowScanStream {
 
 	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 		auto &self = *static_cast<ArrowScanStream *>(stream->private_data);
+		self.schema_calls++;
 		self.child_schema = {};
 		self.child_schema.format = "i";
 		self.child_schema.name = "value";
@@ -602,6 +605,35 @@ TEST_CASE("duckdb_arrow_scan fails for a stream without columns", "[capi][arrow]
 	REQUIRE_NO_FAIL(*result);
 	REQUIRE(result->Fetch<int64_t>(0, 0) == 0);
 	REQUIRE(!arrow_stream.emitted);
+}
+
+TEST_CASE("duckdb_arrow_scan fails while a streaming result is open", "[capi][arrow]") {
+	CAPITester tester;
+	CAPIPrepared prepared;
+	CAPIPending pending;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	REQUIRE(prepared.Prepare(tester, "SELECT i FROM range(1000000) tbl(i)"));
+	REQUIRE(pending.PendingStreaming(prepared));
+	auto open_result = pending.Execute();
+	REQUIRE(open_result);
+	REQUIRE(!open_result->HasError());
+	REQUIRE(open_result->StreamChunk());
+
+	ArrowScanStream arrow_stream;
+	REQUIRE(duckdb_arrow_scan(tester.connection, "arrow_input",
+	                          reinterpret_cast<duckdb_arrow_stream>(&arrow_stream.stream)) == DuckDBError);
+	REQUIRE(arrow_stream.schema_calls == 1);
+	REQUIRE(!arrow_stream.emitted);
+
+	auto chunk = open_result->StreamChunk();
+	REQUIRE(chunk);
+	REQUIRE(chunk->size() > 0);
+	chunk.reset();
+	open_result.reset();
+
+	auto result = tester.Query("SELECT count(*) FROM duckdb_views() WHERE view_name = 'arrow_input'");
+	REQUIRE_NO_FAIL(*result);
+	REQUIRE(result->Fetch<int64_t>(0, 0) == 0);
 }
 
 TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {

@@ -501,6 +501,10 @@ duckdb_state Ingest(duckdb_connection connection, const char *table_name, struct
 		if (!input) {
 			return DuckDBError;
 		}
+		// a CONNECT-ed connection routes a statement as its SQL text, which a statement built from parser nodes lacks
+		if (cconn->context->IsConnected()) {
+			return DuckDBError;
+		}
 		auto factory = duckdb::make_shared_ptr<CArrowScanFactory>(*input);
 		auto scan = duckdb::make_uniq<duckdb::TableFunctionRef>();
 		scan->function = duckdb::make_uniq<duckdb::FunctionExpression>(
@@ -511,12 +515,11 @@ duckdb_state Ingest(duckdb_connection connection, const char *table_name, struct
 		node->from_table = std::move(scan);
 		auto select = duckdb::make_uniq<duckdb::SelectStatement>();
 		select->node = std::move(node);
-		auto info = duckdb::make_uniq<duckdb::CreateViewInfo>();
+		auto info = duckdb::make_uniq<duckdb::CreateViewInfo>(duckdb::QualifiedName(
+		    duckdb::Identifier(), duckdb::Identifier::InvalidSchema(), duckdb::Identifier(table_name)));
 		info->query = std::move(select);
 		info->temporary = true;
 		info->on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
-		info->SetQualifiedName(duckdb::QualifiedName(duckdb::Identifier(), duckdb::Identifier::InvalidSchema(),
-		                                             duckdb::Identifier(table_name)));
 		auto statement = duckdb::make_uniq<duckdb::CreateStatement>();
 		statement->info = std::move(info);
 		if (cconn->Query(std::move(statement))->HasError()) {
