@@ -127,11 +127,9 @@ bool CTEBindState::IsBound() const {
 void CTEBindState::Bind(CTEBinding &binding) {
 	// we are lazily binding the CTE
 	// we need to bind it as if we were binding it during PrepareCTE
-	if (is_trigger_body) {
+	if (trigger_body_schema) {
 		query_binder = Binder::CreateTriggerBodyScope(parent_binder, trigger_transition_source);
-		auto trigger_schema = Catalog::GetSchema(parent_binder.context, trigger_catalog, trigger_schema_path,
-		                                         OnEntryNotFound::THROW_EXCEPTION);
-		query_binder->PrepareFiredTriggerBody(*trigger_schema);
+		query_binder->PrepareFiredTriggerBody(*trigger_body_schema);
 	} else {
 		query_binder = Binder::CreateBinder(parent_binder.context, parent_binder);
 	}
@@ -181,10 +179,11 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 	// instead of eagerly binding the CTE here we add the CTE bind state to the list of CTE bindings
 	// the CTE is bound lazily - when referenced for the first time we perform the binding
 	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases);
-	result.cte_bind_state->is_trigger_body = statement.is_trigger_body;
-	result.cte_bind_state->trigger_catalog = statement.trigger_catalog;
-	result.cte_bind_state->trigger_schema_path = statement.trigger_schema_path;
-	result.cte_bind_state->trigger_transition_source = statement.trigger_transition_source;
+	auto trigger_body = global_binder_state->trigger_body_ctes.find(*statement.query_node);
+	if (trigger_body != global_binder_state->trigger_body_ctes.end()) {
+		result.cte_bind_state->trigger_body_schema = &trigger_body->second.schema.get();
+		result.cte_bind_state->trigger_transition_source = trigger_body->second.transition_source;
+	}
 
 	result.child_binder = Binder::CreateBinder(context, this);
 

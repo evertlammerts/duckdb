@@ -691,8 +691,7 @@ void Binder::BindLogicalType(LogicalType &type) {
 
 bool BoundBodyContainsTrigger(const LogicalOperator &op);
 
-// All firings of a statement run as one batch against one snapshot, so a write that reads the rows it changes (an
-// UPDATE, or a MERGE, which an upsert is rewritten into) would not see what other firings of the statement wrote.
+// All firings run as one plan over one snapshot, so an UPDATE, upsert or MERGE body misses other firings' writes.
 static string UnsupportedRowTriggerBodyForm(const QueryNode &body) {
 	switch (body.type) {
 	case QueryNodeType::UPDATE_QUERY_NODE:
