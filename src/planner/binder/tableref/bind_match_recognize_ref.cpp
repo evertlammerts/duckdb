@@ -171,11 +171,11 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto &path = function.GetQualifiedName().Path();
-		// The parser keeps the receiver of X.c.f() in the function's name, and the engine reads it as a method
-		// call when no catalog function has that name. Turned into the call on the column path here, the
-		// reference is resolved below like any other, as the variable's column or a lambda parameter's field.
-		if (path.size() >= 3 && symbols.count(path[0].GetIdentifierName()) &&
-		    !ColumnQualifier::FindFunction(refs.binder, function)) {
+		// The parser keeps the receiver of c.f() and X.c.f() in the function's name, and the engine reads it as a
+		// method call when no catalog function has that name. Turned into the call on the column path here, the
+		// receiver is resolved below like any other reference: an input column, a variable's column, a lambda
+		// parameter's field.
+		if (MatchRecognizeIsMethodCall(refs.binder, function)) {
 			unique_ptr<ParsedExpression> receiver =
 			    make_uniq<ColumnRefExpression>(vector<Identifier>(path.begin(), path.end() - 1));
 			receiver->SetQueryLocation(function.GetQueryLocation());

@@ -95,8 +95,17 @@ public:
 	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
 
 private:
+	//! Whether the call takes a lambda at this argument, through the body of a macro it expands to as well
+	bool TakesLambda(const FunctionExpression &call, idx_t index, idx_t depth) const;
+	//! Whether a macro body passes the parameter, as it is, to a call that takes a lambda there
+	bool PlacesInLambdaSlot(const ParsedExpression &body, const Identifier &parameter, idx_t depth) const;
+
 	Binder &binder;
 };
+
+//! Whether the binder reads this call as a method call on the column path in front of its name: no function in the
+//! catalog has the qualified name, and one has the bare name
+bool MatchRecognizeIsMethodCall(Binder &binder, const FunctionExpression &call);
 
 //! Where the value being bound is evaluated, which is what decides whether it may read the state the
 //! matcher holds while it assembles a match.

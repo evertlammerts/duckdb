@@ -530,3 +530,29 @@ SELECT * FROM (SELECT i, {'g': w} AS st FROM u) MATCH_RECOGNIZE (ORDER BY i MEAS
 
 statement ok
 RESET lambda_syntax
+
+# Every method call the catalog does not name is the call on its receiver, so it meets the same scope checks as the
+# function spelling, whatever the receiver is: a bare or table qualified column, or a lambda parameter.
+
+statement ok
+CREATE TABLE tn AS SELECT * FROM (VALUES (1, -10), (2, -20), (3, -30)) v(i, x);
+
+statement error
+SELECT * FROM tn MATCH_RECOGNIZE (ORDER BY i MEASURES sum(A.x + x.abs()) AS s PATTERN (A B+) DEFINE A AS true, B AS true);
+----
+sum() reads the rows of "A", so "x" cannot also read the whole match
+
+query I
+SELECT * FROM tn t MATCH_RECOGNIZE (ORDER BY i MEASURES LAST(t.x.abs()) AS s PATTERN (A B+) DEFINE A AS true, B AS true);
+----
+30
+
+statement error
+SELECT * FROM (SELECT i, [i] AS li FROM range(1, 5) r(i)) MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([[100]], lambda li: PREV(list_sum(li.list_transform(lambda w: w)))) AS z PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM (VALUES (1, 'ab')) t(i, x) MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['zz'], lambda x: x.upper()) AS m PATTERN (A) DEFINE A AS true);
+----
+[ZZ]

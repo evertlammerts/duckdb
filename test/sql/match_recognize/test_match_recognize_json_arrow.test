@@ -49,8 +49,8 @@ SELECT * FROM j MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([0], lambda 
 [1]
 [3]
 
-# The arrow is a lambda only in the lambda slot of a scalar function that takes one, as the binder reads it: not
-# under another function, a macro, nor outside the slot.
+# The arrow is a lambda only in the lambda slot of a function that takes one, as the binder reads it: not under
+# another function, outside the slot, nor through a macro whose body puts it in no lambda slot.
 query I
 SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(json_array(A -> A.pos)) AS f PATTERN (A) DEFINE A AS true);
 ----
@@ -155,6 +155,52 @@ SELECT * FROM ts MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([10, 20], i
 ----
 [11, 21]
 [13, 23]
+
+# A macro is expanded before its arguments are bound, so an arrow it passes on to a lambda slot is a lambda, through
+# a macro that calls another one as well
+statement ok
+CREATE MACRO map_both(xs, ys, f) AS list_transform(xs || ys, f)
+
+statement ok
+CREATE MACRO map_one(xs, g) AS map_both(xs, [], g)
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([{'x': 1}], [{'x': 2}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1, 2]
+[1, 2]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1] = 1);
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1]) AS s PATTERN (A+) DEFINE A AS true);
+----
+4
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(map_both([{'x': 1}], [{'x': 2}], lambda A: A.x)[1]) AS s PATTERN (A+) DEFINE A AS true);
+----
+4
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([1], [2], x -> PREV(x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_both([1], [2], v -> v + 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+[2, 3]
+[2, 3]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES map_one([{'x': 1}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true);
+----
+[1]
+[1]
 
 statement ok
 RESET lambda_syntax
