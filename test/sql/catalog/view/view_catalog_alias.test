@@ -46,17 +46,231 @@ CREATE VIEW db1.s1.v_schema AS SELECT * FROM db1.s1.t;
 statement ok
 CREATE VIEW db1.v_deferred WITH (DEFER_BINDING) AS SELECT * FROM db1.t;
 
+# the source of a PIVOT, UNPIVOT or MATCH_RECOGNIZE
+statement ok
+CREATE TABLE db1.p(kind VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO db1.p VALUES ('a', 5), ('a', 7);
+
+statement ok
+CREATE VIEW db1.v_pivot AS SELECT * FROM db1.main.p PIVOT (sum(v) FOR kind IN ('a'));
+
+statement ok
+CREATE VIEW db1.v_unpivot AS SELECT col, val FROM db1.p UNPIVOT (val FOR col IN (v)) ORDER BY val;
+
+statement ok
+CREATE VIEW db1.v_match AS SELECT n FROM db1.main.p MATCH_RECOGNIZE (ORDER BY v MEASURES count(*) AS n PATTERN (A+) DEFINE A AS v > 0);
+
+# a column reference whose leading name is the catalog's beside bindings spelled like the catalog
+statement ok
+CREATE TABLE db1.tt(c INTEGER);
+
+statement ok
+INSERT INTO db1.tt VALUES (1);
+
+statement ok
+CREATE TABLE db1.rows_like(tt STRUCT(c INTEGER));
+
+statement ok
+INSERT INTO db1.rows_like VALUES ({'c': 2});
+
+statement ok
+CREATE TABLE db1.u(x INTEGER);
+
+statement ok
+INSERT INTO db1.u VALUES (5);
+
+statement ok
+CREATE VIEW db1.v_bind_level AS SELECT db1.tt.c AS c FROM db1.tt, db1.rows_like AS db1;
+
+statement ok
+CREATE VIEW db1.v_bind_function AS SELECT db1.tt.c AS c FROM db1.tt, range(1) AS db1(x);
+
+statement ok
+CREATE VIEW db1.v_bind_outer AS SELECT (SELECT db1.tt.c FROM db1.tt) AS c FROM db1.rows_like AS db1;
+
+statement ok
+CREATE VIEW db1.v_bind_inner AS SELECT (SELECT db1.tt.c FROM (SELECT {'c': 7} AS tt) AS db1) AS c FROM db1.tt;
+
+statement ok
+CREATE VIEW db1.v_binding_nocol AS SELECT (SELECT db1.t.i FROM db1.u AS db1) AS c FROM db1.t;
+
+statement ok
+CREATE VIEW db1.v_row_function AS SELECT db1.main.t AS r FROM db1.main.t, range(1) AS db1(x);
+
+statement ok
+CREATE VIEW db1.v_lateral AS SELECT z AS c FROM db1.t, LATERAL (SELECT db1.t.i AS z FROM db1.u AS db1);
+
+query IIIIII
+SELECT (SELECT db1.tt.c FROM db1.tt, db1.rows_like AS db1), (SELECT db1.tt.c FROM db1.tt, range(1) AS db1(x)), (SELECT (SELECT db1.tt.c FROM db1.tt) FROM db1.rows_like AS db1), (SELECT (SELECT db1.tt.c FROM (SELECT {'c': 7} AS tt) AS db1) FROM db1.tt), (SELECT (SELECT db1.t.i FROM db1.u AS db1) FROM db1.t), (SELECT z FROM db1.t, LATERAL (SELECT db1.t.i AS z FROM db1.u AS db1));
+----
+1	1	1	7	42	42
+
+# a table in a nested schema, a CTE named like the table its definition reads, the ORDER BY of a set operation, a
+# whole row, a later branch of a set operation or a recursive CTE beside an earlier branch's alias spelled like the
+# catalog, and a table read beside a CTE of its name
+statement ok
+CREATE SCHEMA db1.s1.s2;
+
+statement ok
+CREATE TABLE db1.s1.s2.n(i INTEGER);
+
+statement ok
+INSERT INTO db1.s1.s2.n VALUES (7);
+
+statement ok
+CREATE VIEW db1.v_nested AS SELECT db1.s1.s2.n.i FROM db1.s1.s2.n;
+
+statement ok
+CREATE VIEW db1.v_cte_own AS WITH t AS (SELECT db1.t.i FROM db1.t) SELECT i FROM t;
+
+statement ok
+CREATE VIEW db1.v_setop_order AS SELECT db1.t.i FROM db1.t UNION ALL SELECT db1.t.i FROM db1.t ORDER BY db1.t.i;
+
+statement ok
+CREATE VIEW db1.v_whole_row AS SELECT db1.main.t AS r FROM db1.main.t;
+
+statement ok
+CREATE VIEW db1.v_setop_sibling AS SELECT (SELECT max(x) FROM (SELECT 0 AS x FROM range(0) AS db1(r) UNION ALL SELECT db1.t.i) s) AS c FROM db1.t;
+
+statement ok
+CREATE VIEW db1.v_rec_sibling AS SELECT (SELECT max(x) FROM (WITH RECURSIVE r(x) AS (SELECT 0 FROM range(1) AS db1(q) UNION ALL SELECT x + 1 FROM r WHERE x < db1.t.i) SELECT x FROM r)) AS c FROM db1.t;
+
+statement ok
+CREATE VIEW db1.v_cte_shadow AS WITH t(i) AS (VALUES (99)) SELECT i FROM db1.t;
+
+query III
+SELECT (SELECT (SELECT max(x) FROM (SELECT 0 AS x FROM range(0) AS db1(r) UNION ALL SELECT db1.t.i) s) FROM db1.t), (SELECT (SELECT max(x) FROM (WITH RECURSIVE r(x) AS (SELECT 0 FROM range(1) AS db1(q) UNION ALL SELECT x + 1 FROM r WHERE x < db1.t.i) SELECT x FROM r)) FROM db1.t), (WITH t(i) AS (VALUES (99)) SELECT i FROM db1.t);
+----
+42	42	42
+
+# a recursive view named with its catalog, its schema or another schema reads its own CTE
+statement ok
+CREATE RECURSIVE VIEW db1.nums(n) AS VALUES (1) UNION ALL SELECT n + 1 FROM nums WHERE n < 3;
+
+statement ok
+CREATE RECURSIVE VIEW db1.main.nums_main(n) AS VALUES (1) UNION ALL SELECT n + 1 FROM nums_main WHERE n < 3;
+
+statement ok
+CREATE RECURSIVE VIEW db1.s1.nums_s1(n) AS VALUES (1) UNION ALL SELECT n + 1 FROM nums_s1 WHERE n < 3;
+
+# a table named with only the catalog beside a CTE of its name, in a view outside the main schema, reads the table the
+# same view without the CTE reads: the one in the view's schema, else the one in the default schema
+statement ok
+CREATE TABLE db1.only_main(i INTEGER);
+
+statement ok
+INSERT INTO db1.only_main VALUES (6);
+
+statement ok
+CREATE TABLE db1.s1.only_s1(i INTEGER);
+
+statement ok
+INSERT INTO db1.s1.only_s1 VALUES (5);
+
+statement ok
+CREATE TABLE only_s1(i INTEGER);
+
+statement ok
+INSERT INTO only_s1 VALUES (1000);
+
+statement ok
+CREATE VIEW db1.s1.v_shadow_s1 AS WITH t(i) AS (VALUES (99)) SELECT i FROM db1.t;
+
+statement ok
+CREATE VIEW db1.s1.v_shadow_only_main AS WITH only_main(i) AS (VALUES (99)) SELECT i FROM db1.only_main;
+
+statement ok
+CREATE VIEW db1.s1.v_shadow_only_s1 AS WITH only_s1(i) AS (VALUES (99)) SELECT i FROM db1.only_s1;
+
+statement ok
+CREATE VIEW db1.s1.v_plain_s1 AS SELECT (SELECT i FROM db1.t) AS t, (SELECT i FROM db1.only_s1) AS only_s1;
+
+# a recursive CTE's own name reads the CTE only in its recursive branch, not in its seed
+statement ok
+CREATE VIEW db1.s1.v_seed_s1 AS WITH RECURSIVE t(i) AS (SELECT i FROM db1.t UNION ALL SELECT i FROM t WHERE false) SELECT i FROM t;
+
+statement ok
+CREATE VIEW db1.v_rec_branch AS WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM t WHERE x < (SELECT max(i) FROM db1.t)) SELECT max(x) AS x FROM t;
+
+statement ok con1
+SET search_path = 'db1.s1';
+
+query III con1
+SELECT (SELECT i FROM db1.t), (SELECT i FROM db1.only_s1), (WITH RECURSIVE t(i) AS (SELECT i FROM db1.t UNION ALL SELECT i FROM t WHERE false) SELECT i FROM t);
+----
+84	5	84
+
+statement ok con1
+USE memory;
+
+query II
+SELECT * FROM db1.s1.v_plain_s1;
+----
+84	5
+
+# without a CTE, a view outside the main schema binds a table only in the default schema only from a session on its
+# database; the query reads it from any session
+query II
+SELECT (SELECT i FROM db1.only_main), (WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM t WHERE x < (SELECT max(i) FROM db1.t)) SELECT max(x) FROM t);
+----
+6	42
+
+# a type named with its catalog inside the expressions of a PIVOT and of a MATCH_RECOGNIZE
+statement ok
+CREATE TYPE db1.amount AS INTEGER;
+
+statement ok
+CREATE VIEW db1.v_pivot_cast AS SELECT a FROM db1.p PIVOT (sum(v::db1.amount) FOR kind IN ('a'));
+
+statement ok
+CREATE VIEW db1.v_match_cast AS SELECT n FROM db1.p MATCH_RECOGNIZE (ORDER BY v::db1.amount MEASURES count(*) AS n PATTERN (A+) DEFINE A AS v::db1.amount > 0);
+
+query II
+SELECT (SELECT a FROM db1.p PIVOT (sum(v::db1.amount) FOR kind IN ('a'))), (SELECT n FROM db1.p MATCH_RECOGNIZE (ORDER BY v::db1.amount MEASURES count(*) AS n PATTERN (A+) DEFINE A AS v::db1.amount > 0));
+----
+12	2
+
 # the catalog qualifier is dropped from the stored SQL
 query II
 SELECT view_name, trim(sql, chr(10)) FROM duckdb_views() WHERE database_name='db1' ORDER BY view_name;
 ----
+nums	CREATE VIEW nums (n) AS WITH RECURSIVE nums (n) AS ((SELECT * FROM (VALUES (1)) AS valueslist) UNION ALL (SELECT (n + 1) FROM nums WHERE (n < 3))) SELECT n FROM nums;
+nums_main	CREATE VIEW nums_main (n) AS WITH RECURSIVE nums_main (n) AS ((SELECT * FROM (VALUES (1)) AS valueslist) UNION ALL (SELECT (n + 1) FROM nums_main WHERE (n < 3))) SELECT n FROM nums_main;
+nums_s1	CREATE VIEW s1.nums_s1 (n) AS WITH RECURSIVE nums_s1 (n) AS ((SELECT * FROM (VALUES (1)) AS valueslist) UNION ALL (SELECT (n + 1) FROM nums_s1 WHERE (n < 3))) SELECT n FROM nums_s1;
 v_base	CREATE VIEW v_base AS SELECT * FROM t;
+v_bind_function	CREATE VIEW v_bind_function AS SELECT tt.c AS c FROM tt , "range"(1) AS db1(x);
+v_bind_inner	CREATE VIEW v_bind_inner AS SELECT (SELECT tt.c FROM (SELECT struct_pack(c := 7) AS tt) AS db1) AS c FROM tt;
+v_bind_level	CREATE VIEW v_bind_level AS SELECT tt.c AS c FROM tt , rows_like AS db1;
+v_bind_outer	CREATE VIEW v_bind_outer AS SELECT (SELECT tt.c FROM tt) AS c FROM rows_like AS db1;
+v_binding_nocol	CREATE VIEW v_binding_nocol AS SELECT (SELECT t.i FROM u AS db1) AS c FROM t;
 v_colref	CREATE VIEW v_colref AS SELECT t.i FROM t;
 v_cte	CREATE VIEW v_cte AS WITH c AS (SELECT * FROM t) SELECT * FROM c;
+v_cte_own	CREATE VIEW v_cte_own AS WITH t AS (SELECT t.i FROM t) SELECT i FROM t;
+v_cte_shadow	CREATE VIEW v_cte_shadow AS WITH t (i) AS (SELECT * FROM (VALUES (99)) AS valueslist) SELECT i FROM main.t;
 v_deferred	CREATE VIEW v_deferred AS SELECT * FROM t;
 v_full	CREATE VIEW v_full AS SELECT * FROM main.t;
+v_lateral	CREATE VIEW v_lateral AS SELECT z AS c FROM t , (SELECT t.i AS z FROM u AS db1);
+v_match	CREATE VIEW v_match AS SELECT n FROM main.p MATCH_RECOGNIZE(ORDER BY v MEASURES count_star() AS n PATTERN (A+) DEFINE A AS (v > 0));
+v_match_cast	CREATE VIEW v_match_cast AS SELECT n FROM p MATCH_RECOGNIZE(ORDER BY CAST(v AS amount) MEASURES count_star() AS n PATTERN (A+) DEFINE A AS (CAST(v AS amount) > 0));
+v_nested	CREATE VIEW v_nested AS SELECT s1.s2.n.i FROM s1.s2.n;
+v_pivot	CREATE VIEW v_pivot AS SELECT * FROM main.p PIVOT (sum(v) FOR (kind) IN ('a'));
+v_pivot_cast	CREATE VIEW v_pivot_cast AS SELECT a FROM p PIVOT (sum(CAST(v AS amount)) FOR (kind) IN ('a'));
+v_plain_s1	CREATE VIEW s1.v_plain_s1 AS SELECT (SELECT i FROM t) AS t, (SELECT i FROM only_s1) AS only_s1;
+v_rec_branch	CREATE VIEW v_rec_branch AS WITH RECURSIVE t (x) AS ((SELECT 1) UNION ALL (SELECT (x + 1) FROM t WHERE (x < (SELECT max(i) FROM main.t)))) SELECT max(x) AS x FROM t;
+v_rec_sibling	CREATE VIEW v_rec_sibling AS SELECT (SELECT max(x) FROM (WITH RECURSIVE r (x) AS ((SELECT 0 FROM "range"(1) AS db1(q)) UNION ALL (SELECT (x + 1) FROM r WHERE (x < t.i))) SELECT x FROM r)) AS c FROM t;
+v_row_function	CREATE VIEW v_row_function AS SELECT main.t AS r FROM main.t , "range"(1) AS db1(x);
 v_schema	CREATE VIEW s1.v_schema AS SELECT * FROM s1.t;
+v_seed_s1	CREATE VIEW s1.v_seed_s1 AS WITH RECURSIVE t (i) AS ((SELECT i FROM t) UNION ALL (SELECT i FROM t WHERE false)) SELECT i FROM t;
+v_setop_order	CREATE VIEW v_setop_order AS (SELECT t.i FROM t) UNION ALL (SELECT t.i FROM t) ORDER BY t.i;
+v_setop_sibling	CREATE VIEW v_setop_sibling AS SELECT (SELECT max(x) FROM ((SELECT 0 AS x FROM "range"(0) AS db1(r)) UNION ALL (SELECT t.i)) AS s) AS c FROM t;
+v_shadow_only_main	CREATE VIEW s1.v_shadow_only_main AS WITH only_main (i) AS (SELECT * FROM (VALUES (99)) AS valueslist) SELECT i FROM main.only_main;
+v_shadow_only_s1	CREATE VIEW s1.v_shadow_only_s1 AS WITH only_s1 (i) AS (SELECT * FROM (VALUES (99)) AS valueslist) SELECT i FROM s1.only_s1;
+v_shadow_s1	CREATE VIEW s1.v_shadow_s1 AS WITH t (i) AS (SELECT * FROM (VALUES (99)) AS valueslist) SELECT i FROM s1.t;
 v_subquery	CREATE VIEW v_subquery AS SELECT (SELECT max(i) FROM t) AS i;
+v_unpivot	CREATE VIEW v_unpivot AS SELECT col, val FROM p UNPIVOT (val FOR col IN (v)) ORDER BY val;
+v_whole_row	CREATE VIEW v_whole_row AS SELECT main.t AS r FROM main.t;
 
 statement ok
 DETACH db1;
@@ -98,6 +312,73 @@ query I
 SELECT * FROM db2.v_deferred;
 ----
 42
+
+query I
+SELECT * FROM db2.v_pivot;
+----
+12
+
+query TI rowsort
+SELECT * FROM db2.v_unpivot;
+----
+v	5
+v	7
+
+query I
+SELECT * FROM db2.v_match;
+----
+2
+
+query IIIIII
+SELECT (SELECT c FROM db2.v_bind_level), (SELECT c FROM db2.v_bind_function), (SELECT c FROM db2.v_bind_outer), (SELECT c FROM db2.v_bind_inner), (SELECT c FROM db2.v_binding_nocol), (SELECT c FROM db2.v_lateral);
+----
+1	1	1	7	42	42
+
+query I
+SELECT r FROM db2.v_row_function;
+----
+{'i': 42}
+
+query I
+SELECT * FROM db2.v_nested;
+----
+7
+
+query I
+SELECT * FROM db2.v_cte_own;
+----
+42
+
+query I
+SELECT * FROM db2.v_setop_order;
+----
+42
+42
+
+query I
+SELECT r FROM db2.v_whole_row;
+----
+{'i': 42}
+
+query III
+SELECT (SELECT c FROM db2.v_setop_sibling), (SELECT c FROM db2.v_rec_sibling), (SELECT i FROM db2.v_cte_shadow);
+----
+42	42	42
+
+query I
+SELECT list(n ORDER BY n) FROM (SELECT n FROM db2.nums UNION ALL SELECT n FROM db2.main.nums_main UNION ALL SELECT n FROM db2.s1.nums_s1);
+----
+[1, 1, 1, 2, 2, 2, 3, 3, 3]
+
+query IIIIII
+SELECT (SELECT i FROM db2.s1.v_shadow_s1), (SELECT i FROM db2.s1.v_shadow_only_main), (SELECT i FROM db2.s1.v_shadow_only_s1), (SELECT i FROM db2.s1.v_seed_s1), (SELECT x FROM db2.v_rec_branch), (SELECT list(v_plain_s1) FROM db2.s1.v_plain_s1);
+----
+84	6	5	84	42	[{'t': 84, 'only_s1': 5}]
+
+query II
+SELECT (SELECT a FROM db2.v_pivot_cast), (SELECT n FROM db2.v_match_cast);
+----
+12	2
 
 # views referencing another catalog keep their qualification
 statement ok

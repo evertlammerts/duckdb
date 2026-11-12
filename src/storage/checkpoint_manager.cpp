@@ -41,6 +41,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/common/algorithm.hpp"
 
 namespace duckdb {
 
@@ -143,6 +144,7 @@ unique_ptr<TableDataWriter> SingleFileCheckpointWriter::GetTableDataWriter(Table
 
 static catalog_entry_vector_t GetCatalogEntries(vector<reference<DuckSchemaEntry>> &schemas, VisibilityBound bound) {
 	catalog_entry_vector_t entries;
+	catalog_entry_vector_t triggers;
 	for (auto &schema_p : schemas) {
 		auto &schema = schema_p.get();
 		entries.push_back(schema);
@@ -192,7 +194,7 @@ static catalog_entry_vector_t GetCatalogEntries(vector<reference<DuckSchemaEntry
 			auto &duck_table = table.Cast<DuckTableEntry>();
 			duck_table.ScanTriggers(bound, [&](CatalogEntry &entry) {
 				if (!entry.internal) {
-					entries.push_back(entry);
+					triggers.push_back(entry);
 				}
 			});
 		}
@@ -220,6 +222,11 @@ static catalog_entry_vector_t GetCatalogEntries(vector<reference<DuckSchemaEntry
 			entries.push_back(entry);
 		});
 	}
+	// loading assigns oids in file order, so writing triggers in oid order keeps their creation order across a reload
+	sort(triggers.begin(), triggers.end(), [](const reference<CatalogEntry> &lhs, const reference<CatalogEntry> &rhs) {
+		return lhs.get().oid < rhs.get().oid;
+	});
+	entries.insert(entries.end(), triggers.begin(), triggers.end());
 	return entries;
 }
 

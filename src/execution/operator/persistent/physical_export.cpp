@@ -11,6 +11,8 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/dependency_manager.hpp"
+#include "duckdb/optimizer/remote_pushdown_optimizer.hpp"
+#include "duckdb/parser/parsed_data/create_trigger_info.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -28,23 +30,54 @@ PhysicalExport::PhysicalExport(PhysicalPlan &physical_plan, vector<LogicalType> 
       function(std::move(function)), info(std::move(info)), exported_tables(std::move(exported_tables)) {
 }
 
-static void WriteCatalogEntries(stringstream &ss, catalog_entry_vector_t &entries) {
-	for (auto &entry : entries) {
-		if (entry.get().internal) {
-			continue;
+static void WriteCatalogEntry(CatalogTransaction transaction, stringstream &ss, CatalogEntry &entry) {
+	if (entry.internal) {
+		return;
+	}
+	auto create_info = entry.GetInfo();
+	try {
+		if (create_info->type == CatalogType::TRIGGER_ENTRY) {
+			// CREATE TRIGGER stores the body as written, so it may name the exported catalog
+			auto &catalog = entry.ParentCatalog();
+			CatalogStripLookup lookup(catalog, transaction);
+			// the export keeps the reading of a session whose search path names no other schema of the catalog
+			lookup.qualify_every_table = true;
+			auto default_schema = catalog.GetDefaultSchema();
+			if (default_schema) {
+				lookup.schema_paths.push_back(vector<Identifier> {*default_schema});
+			}
+			RemotePushdownOptimizer::StripCatalogName(*create_info->Cast<CreateTriggerInfo>().trigger_action,
+			                                          create_info->GetQualifiedName().Catalog(), lookup);
 		}
-		auto create_info = entry.get().GetInfo();
-		try {
-			// the catalog is implied by the database the export is imported into - keep only the schema path
-			create_info->StripCatalogQualification();
-			auto to_string = create_info->ToString();
-			ss << to_string;
-		} catch (const NotImplementedException &) {
-			ss << entry.get().ToSQL();
-		}
-		ss << '\n';
+		// the catalog is implied by the database the export is imported into - keep only the schema path
+		create_info->StripCatalogQualification();
+		auto to_string = create_info->ToString();
+		ss << to_string;
+	} catch (const NotImplementedException &) {
+		ss << entry.ToSQL();
 	}
 	ss << '\n';
+}
+
+static void WriteCatalogEntries(CatalogTransaction transaction, stringstream &ss, catalog_entry_vector_t &entries) {
+	for (auto &entry : entries) {
+		WriteCatalogEntry(transaction, ss, entry.get());
+	}
+	ss << '\n';
+}
+
+static void WriteTriggers(CatalogTransaction transaction, stringstream &ss, BoundExportData &exported_tables) {
+	catalog_entry_vector_t triggers;
+	for (auto &exported_table : exported_tables.data) {
+		exported_table.entry.ScanTriggers(transaction, [&](CatalogEntry &trigger) { triggers.push_back(trigger); });
+	}
+	// binding a trigger depends on the triggers that already exist, so they are recreated in creation order
+	sort(triggers.begin(), triggers.end(), [](const reference<CatalogEntry> &lhs, const reference<CatalogEntry> &rhs) {
+		return lhs.get().oid < rhs.get().oid;
+	});
+	for (auto &trigger : triggers) {
+		WriteCatalogEntry(transaction, ss, trigger.get());
+	}
 }
 
 static void WriteStringStreamToFile(FileSystem &fs, stringstream &ss, const string &path) {
@@ -229,7 +262,7 @@ SourceResultType PhysicalExport::GetDataInternal(ExecutionContext &context, Data
 
 	// write the schema.sql file
 	stringstream ss;
-	WriteCatalogEntries(ss, catalog_entries);
+	WriteCatalogEntries(catalog.GetCatalogTransaction(ccontext), ss, catalog_entries);
 	WriteStringStreamToFile(fs, ss, fs.JoinPath(info->file_path, "schema.sql"));
 
 	// write the load.sql file
@@ -239,6 +272,8 @@ SourceResultType PhysicalExport::GetDataInternal(ExecutionContext &context, Data
 		auto exported_table_info = exported_tables->data[i].table_data;
 		WriteCopyStatement(fs, load_ss, *info, exported_table_info);
 	}
+	// COPY FROM fires triggers, so they are created after the data is loaded
+	WriteTriggers(catalog.GetCatalogTransaction(ccontext), load_ss, *exported_tables);
 	WriteStringStreamToFile(fs, load_ss, fs.JoinPath(info->file_path, "load.sql"));
 	state.finished = true;
 
