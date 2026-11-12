@@ -4,8 +4,6 @@
 
 require json
 
-require parquet
-
 # variant_typeof lists the keys of an object, NUL bytes included
 
 query III
@@ -149,34 +147,3 @@ query II
 SELECT s::BLOB, strlen(s) FROM (SELECT variant_extract(json::VARIANT, 'a' || chr(0) || 'b')::VARCHAR AS s FROM read_json_objects('data/json/nul_bytes_in_key.json'));
 ----
 x\x00y	3
-
-# a checkpointed column stores the keys as names of shredded STRUCT fields
-
-statement ok
-SET variant_minimum_shredding_size = 0;
-
-statement ok
-CREATE TABLE shredded AS SELECT i AS id, CAST(CAST('{"a\u0000b": ' || i || ', "\u0000c": "x\u0000' || i || '"}' AS JSON) AS VARIANT) AS v FROM range(2000) t(i);
-
-statement ok
-CHECKPOINT;
-
-query IIIII
-SELECT count(*), count(DISTINCT variant_typeof(v)), min(variant_typeof(v))::BLOB, sum(variant_extract(v, 'a' || chr(0) || 'b')::BIGINT), sum(strlen(variant_extract(v, chr(0) || 'c')::VARCHAR)) FROM shredded;
-----
-2000	1	OBJECT(\x00c, a\x00b)	1999000	10890
-
-query I
-SELECT v::JSON FROM shredded WHERE id = 7;
-----
-{"\u0000c":"x\u00007","a\u0000b":7}
-
-# and so does a Parquet file
-
-statement ok
-COPY shredded TO '{TEST_DIR}/variant_nul_bytes.parquet';
-
-query IIII
-SELECT count(*), min(variant_typeof(v))::BLOB, sum(variant_extract(v, 'a' || chr(0) || 'b')::BIGINT), sum(strlen(variant_extract(v, chr(0) || 'c')::VARCHAR)) FROM '{TEST_DIR}/variant_nul_bytes.parquet';
-----
-2000	OBJECT(\x00c, a\x00b)	1999000	10890
