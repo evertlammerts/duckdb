@@ -1,0 +1,61 @@
+# name: test/sql/types/variant/variant_nul_bytes_shredded.test
+# description: A U+0000 inside a VARIANT object key survives as a shredded field name, in storage and in Parquet
+# group: [variant]
+
+require json
+
+require parquet
+
+load {TEST_DIR}/variant_nul_bytes_shredded.db readwrite v1.5.0
+
+statement ok
+SET variant_minimum_shredding_size = 0;
+
+statement ok
+CREATE TABLE shredded AS SELECT i AS id, CAST(CAST('{"a\u0000b": ' || i || ', "\u0000c": "x\u0000' || i || '"}' AS JSON) AS VARIANT) AS v FROM range(2000) t(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT DISTINCT vector_type(v) FROM shredded;
+----
+SHREDDED_VECTOR
+
+query IIIII
+SELECT count(*), count(DISTINCT variant_typeof(v)), min(variant_typeof(v))::BLOB, sum(variant_extract(v, 'a' || chr(0) || 'b')::BIGINT), sum(strlen(variant_extract(v, chr(0) || 'c')::VARCHAR)) FROM shredded;
+----
+2000	1	OBJECT(\x00c, a\x00b)	1999000	10890
+
+query III
+SELECT len(k), k[1]::BLOB, k[2]::BLOB FROM (SELECT variant_keys(v) AS k FROM shredded WHERE id = 7);
+----
+2	\x00c	a\x00b
+
+query III
+SELECT count(*) FILTER (WHERE variant_exists(v, 'a' || chr(0) || 'b')), count(*) FILTER (WHERE variant_exists(v, 'a')), count(*) FILTER (WHERE variant_exists(v, 'a' || chr(0))) FROM shredded;
+----
+2000	0	0
+
+query I
+SELECT v::JSON FROM shredded WHERE id = 7;
+----
+{"\u0000c":"x\u00007","a\u0000b":7}
+
+# a Parquet file names its shredded fields by the keys
+
+statement ok
+COPY shredded TO '{TEST_DIR}/variant_nul_bytes_shredded.parquet';
+
+query I
+SELECT name::BLOB FROM parquet_schema('{TEST_DIR}/variant_nul_bytes_shredded.parquet') WHERE contains(name, chr(0)) ORDER BY name;
+----
+\x00c
+a\x00b
+
+query IIII
+SELECT count(*), min(variant_typeof(v))::BLOB, sum(variant_extract(v, 'a' || chr(0) || 'b')::BIGINT), sum(strlen(variant_extract(v, chr(0) || 'c')::VARCHAR)) FROM '{TEST_DIR}/variant_nul_bytes_shredded.parquet';
+----
+2000	OBJECT(\x00c, a\x00b)	1999000	10890
