@@ -226,7 +226,8 @@ static void EnumerateScopedRefExpressions(TableRef &ref, const identifier_set_t 
 		break;
 	}
 	case TableReferenceType::SUBQUERY:
-		EnumerateScopedNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, declared_above, callback);
+		// a derived table sees its FROM siblings, with or without LATERAL
+		EnumerateScopedNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, declared, callback);
 		break;
 	default:
 		ParsedExpressionIterator::EnumerateTableRefChildren(ref, visit);
@@ -234,8 +235,7 @@ static void EnumerateScopedRefExpressions(TableRef &ref, const identifier_set_t 
 	}
 }
 
-// Each select node's expressions see the tables of its own FROM clause and of the query levels around it, not those
-// inside its derived tables, its CTE bodies or other set operation branches.
+// A select node sees its FROM clause and the levels around it, not its CTE bodies or other set operation branches.
 static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set_t &declared_above,
                                            const scoped_expression_callback_t &callback) {
 	switch (node.type) {
@@ -292,7 +292,7 @@ static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set
 	}
 }
 
-// The qualifier resolves the receiver of a dot call x.f() or x.v.f() against the tables before lambda parameters.
+// The qualifier resolves a dot call's receiver against tables first; reads inside a subquery never move, so skip them.
 static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &column_ref = expr.Cast<ColumnRefExpression>();
@@ -305,15 +305,6 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 		}
 	}
 	bool found = false;
-	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		// x.v where a select node of the subquery declares a table x reads that table
-		EnumerateScopedNodeExpressions(*expr.Cast<SubqueryExpression>().Subquery()->node, identifier_set_t(),
-		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
-			                               if (!declared.count(name)) {
-				                               found = found || HasQualifiedReference(*child, name);
-			                               }
-		                               });
-	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || HasQualifiedReference(*child, name); });
 	return found;
@@ -713,14 +704,24 @@ private:
 	// The binder names a parameter by its alias, so a declaration takes none; an inner one keeps shadowing.
 	void RenameDeclaration(LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters,
 	                       const identifier_map_t<Identifier> &renames) {
+		identifier_map_t<Identifier> own;
 		for (auto &parameter : parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
 			auto entry = renames.find(name);
 			if (entry != renames.end()) {
+				own.emplace(name, entry->second);
 				name = entry->second;
 			}
 		}
-		RenameReferences(lambda_expr.RightMutable(), renames);
+		if (subquery_depth == 0) {
+			RenameReferences(lambda_expr.RightMutable(), renames);
+			return;
+		}
+		// in a subquery only this lambda's own parameters are renamed in its body
+		auto depth = subquery_depth;
+		subquery_depth = 0;
+		RenameReferences(lambda_expr.RightMutable(), own);
+		subquery_depth = depth;
 	}
 
 	void RenameReferences(unique_ptr<ParsedExpression> &expr, const identifier_map_t<Identifier> &renames) {
@@ -729,7 +730,8 @@ private:
 			auto &column_ref = expr->Cast<ColumnRefExpression>();
 			auto &leading_name = column_ref.ColumnNamesMutable()[0];
 			auto entry = renames.find(leading_name);
-			if (entry == renames.end()) {
+			// a reference in a subquery inside a lambda never binds that lambda's parameter
+			if (entry == renames.end() || subquery_depth > 0) {
 				return;
 			}
 			// struct_pack(x) names its field after the reference
@@ -740,10 +742,11 @@ private:
 			return;
 		}
 		case ExpressionClass::LAMBDA: {
-			// without an alias the left side names the new name whether the binder reads a column or a declaration
+			// without an alias the left side names the new name whether the binder reads a column or a declaration;
+			// inside a subquery an arrow off a lambda position is the JSON operator over a column there
 			auto &lambda_expr = expr->Cast<LambdaExpression>();
 			vector<reference<ColumnRefExpression>> parameters;
-			if (!GetLambdaParameters(lambda_expr, parameters)) {
+			if (subquery_depth > 0 || !GetLambdaParameters(lambda_expr, parameters)) {
 				break;
 			}
 			RenameDeclaration(lambda_expr, parameters, renames);
@@ -752,7 +755,8 @@ private:
 		case ExpressionClass::FUNCTION: {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto &path = function.GetQualifiedName().Path();
-			if (path.size() >= 2 && renames.find(path[0]) != renames.end() && IsDotCall(function, QualifyingBinder())) {
+			if (subquery_depth == 0 && path.size() >= 2 && renames.find(path[0]) != renames.end() &&
+			    IsDotCall(function, QualifyingBinder())) {
 				// rewritten as the qualifier would, so that the receiver is a reference renamed below with its alias
 				auto qualified_name = function.GetQualifiedName();
 				auto receiver = qualified_name.Catalog().empty()
@@ -774,10 +778,12 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
-			// a subquery in an aggregate argument binds, and there its own tables win over the parameter
+			// a reference in a subquery binds the lambda's parameter only where typeof folds it, so only lambdas move
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
+			subquery_depth++;
+			// a lambda beside a table of its name reads x.v as that table, as without the macro
 			EnumerateScopedNodeExpressions(*sq->node, identifier_set_t(),
 			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
 				                               identifier_map_t<Identifier> scope_renames;
@@ -788,6 +794,7 @@ private:
 				                               }
 				                               RenameReferences(child, scope_renames);
 			                               });
+			subquery_depth--;
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}
@@ -833,6 +840,7 @@ private:
 	optional_ptr<ParsedExpression> caller_window;
 	optional_ptr<QueryNode> body_node;
 	vector<LambdaScope> scopes;
+	idx_t subquery_depth = 0;
 	unordered_map<column_t, identifier_set_t> argument_names;
 	unique_ptr<identifier_set_t> caller_window_names;
 	unique_ptr<identifier_set_t> used_names;
