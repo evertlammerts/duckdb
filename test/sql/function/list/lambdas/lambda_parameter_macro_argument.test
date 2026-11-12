@@ -1370,3 +1370,202 @@ query I
 SELECT aggregate_type() FROM xe AS x;
 ----
 ['1:INTEGER']
+
+# a call that keeps its subquery, under an aggregate, binds the subquery's own columns there
+
+statement ok
+CREATE MACRO kc(a) AS list_transform([1], lambda x: a + first(cast_to_type((SELECT x FROM (VALUES (7)) AS t(x)), 0)));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first(cast_to_type((SELECT x FROM (VALUES (7)) AS t(x)), 0)));
+----
+[10]
+
+query I
+SELECT kc(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[10]
+
+query II
+SELECT 3 AS x, kc(x);
+----
+3	[10]
+
+statement ok
+CREATE MACRO kcm(a) AS list_transform([1], lambda x: a + first(map_contains(MAP {7: 1}, (SELECT x FROM (VALUES (7)) AS t(x)))::INT));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first(map_contains(MAP {7: 1}, (SELECT x FROM (VALUES (7)) AS t(x)))::INT));
+----
+[4]
+
+query I
+SELECT kcm(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[4]
+
+statement ok
+CREATE MACRO kcd(a) AS list_transform([1], lambda x: a + first(map_contains(MAP {7: 1}, (SELECT x.abs() FROM (VALUES (-7)) AS t(x)))::INT));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first(map_contains(MAP {7: 1}, (SELECT x.abs() FROM (VALUES (-7)) AS t(x)))::INT));
+----
+[4]
+
+query I
+SELECT kcd(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[4]
+
+statement ok
+CREATE MACRO kept_subquery(a) AS list_transform([1], lambda x: a + first(cast_to_type((SELECT list_transform([-1], lambda x: x.abs())[1] FROM (VALUES (-7)) AS t(x)), 0)));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first(cast_to_type((SELECT list_transform([-1], lambda x: x.abs())[1] FROM (VALUES (-7)) AS t(x)), 0)));
+----
+[10]
+
+query I
+SELECT kept_subquery(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[10]
+
+# typeof, get_type and can_cast_implicitly fold their argument: a subquery anywhere in it without a table of its
+# own is renamed with the lambda, one with a table keeps its own columns
+
+statement ok
+CREATE MACRO tcol(a) AS list_transform([1], lambda x: typeof((SELECT x FROM (SELECT 'str' AS x) AS t)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x FROM (SELECT 'str' AS x) AS t)) || '!');
+----
+[VARCHAR!]
+
+query I
+SELECT tcol(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[VARCHAR!]
+
+statement ok
+CREATE MACRO tdc(a) AS list_transform([-1.5], lambda x: typeof((SELECT x.abs() FROM (VALUES (-7)) AS t(x))) || a);
+
+query I
+SELECT list_transform([-1.5], lambda x: typeof((SELECT x.abs() FROM (VALUES (-7)) AS t(x))) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT tdc(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO nt1(a) AS list_transform([1], lambda x: typeof((SELECT x) + 1) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT x) + 1) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT nt1(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO nt2(a) AS list_transform([1], lambda x: typeof([(SELECT x)]) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof([(SELECT x)]) || '!');
+----
+['INTEGER[]!']
+
+query I
+SELECT nt2(x.z) FROM (VALUES ('!')) AS x(z);
+----
+['INTEGER[]!']
+
+statement ok
+CREATE MACRO nt3(a) AS list_transform([1], lambda x: typeof(coalesce((SELECT x), 0)) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof(coalesce((SELECT x), 0)) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT nt3(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO nt4(a) AS list_transform([1], lambda x: typeof((SELECT (SELECT x))) || a);
+
+query I
+SELECT list_transform([1], lambda x: typeof((SELECT (SELECT x))) || '!');
+----
+[INTEGER!]
+
+query I
+SELECT nt4(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+statement ok
+CREATE MACRO gt(a) AS list_transform([1], lambda x: get_type((SELECT x))::VARCHAR || a);
+
+query I
+SELECT list_transform([1], lambda x: get_type((SELECT x))::VARCHAR || '!');
+----
+[INTEGER!]
+
+query I
+SELECT gt(x.z) FROM (VALUES ('!')) AS x(z);
+----
+[INTEGER!]
+
+# a lambda in a subquery whose own parameters shadow the macro parameter holds no argument and keeps its name
+
+statement ok
+CREATE MACRO shadowed_index(i) AS list_transform([1], lambda x: i + first((SELECT list_transform([-1], lambda x, i: x.abs() + i)[1] FROM (VALUES (-7)) AS t(x))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], lambda x, i: x.abs() + i)[1] FROM (VALUES (-7)) AS t(x))));
+----
+[11]
+
+query I
+SELECT shadowed_index(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[11]
+
+query II
+SELECT 3 AS x, shadowed_index(x);
+----
+3	[11]
+
+statement ok
+CREATE MACRO shadowed_name(a) AS list_transform([1], lambda x: a + first((SELECT list_transform([-1], lambda x: list_transform([1], lambda a: x.abs() + a)[1])[1] FROM (VALUES (-7)) AS t(x))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([-1], lambda x: list_transform([1], lambda a: x.abs() + a)[1])[1] FROM (VALUES (-7)) AS t(x))));
+----
+[11]
+
+query II
+SELECT 3 AS x, shadowed_name(x);
+----
+3	[11]
+
+statement ok
+CREATE MACRO field_type() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d)));
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d)));
+----
+[VARCHAR]
+
+query I
+SELECT field_type();
+----
+[VARCHAR]
