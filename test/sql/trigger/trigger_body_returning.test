@@ -729,6 +729,11 @@ CREATE TRIGGER e_seq_before BEFORE INSERT ON est_src FOR EACH STATEMENT UPDATE e
 Binder Error: RETURNING is not allowed in a trigger body (trigger "e_seq_before" on table "est_src")
 
 statement error
+CREATE TRIGGER e_err_before BEFORE INSERT ON est_src FOR EACH STATEMENT INSERT INTO elog VALUES (0) RETURNING error('boom');
+----
+Binder Error: RETURNING is not allowed in a trigger body (trigger "e_err_before" on table "est_src")
+
+statement error
 CREATE TRIGGER e_err_st AFTER INSERT ON est_src FOR EACH STATEMENT INSERT INTO elog VALUES (0) RETURNING error('boom');
 ----
 Binder Error: RETURNING is not allowed in a trigger body (trigger "e_err_st" on table "est_src")
