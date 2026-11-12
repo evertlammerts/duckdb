@@ -315,7 +315,7 @@ chooses its overload by argument type
 # The expansion is the binder's step for a macro call: the result is cast to a declared return type, and the read of
 # the macro is recorded, so that a prepared statement is bound again once the macro is replaced
 statement ok
-CREATE MACRO as_text(xs, f) RETURNS VARCHAR AS list_transform(xs || xs, f)
+CREATE TEMP MACRO as_text(xs, f) RETURNS VARCHAR AS list_transform(xs || xs, f)
 
 query I
 SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES typeof(as_text([{'x': 1}], A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
@@ -331,22 +331,78 @@ statement ok
 CREATE MACRO mr_db.main.doubled_in(xs, f) AS list_transform(xs || xs, f)
 
 statement ok
-CREATE MACRO memory.main.doubled_here(xs, f) AS list_transform(xs || xs, f)
-
-statement ok
 CREATE TEMP MACRO doubled_temp(xs, f) AS list_transform(xs || xs, f)
 
-query III
-SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'x': 1}], A -> A.x) AS a, memory.doubled_here([{'x': 1}], A -> A.x) AS b, temp.doubled_temp([{'x': 1}], A -> A.x) AS c PATTERN (A B) DEFINE B AS true);
+query II
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'x': 1}], A -> A.x) AS a, temp.doubled_temp([{'x': 1}], A -> A.x) AS c PATTERN (A B) DEFINE B AS true);
 ----
-[1, 1]	[1, 1]	[1, 1]
-[1, 1]	[1, 1]	[1, 1]
+[1, 1]	[1, 1]
+[1, 1]	[1, 1]
 
 query I
 SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([[{'x': 1}]], lambda v: v.map_one(A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
 ----
 [[1]]
 [[1]]
+
+# a macro's arguments are read where the clause's references are, so a column of the input is the input's
+statement ok
+CREATE MACRO typed_list(n INTEGER, xs, f) AS list_transform(xs || [], f)[1] + n
+
+statement ok
+CREATE TABLE typed_input AS SELECT * FROM (VALUES (1, '17', [11])) t(i, s, xs);
+
+statement error
+SELECT * FROM typed_input MATCH_RECOGNIZE (ORDER BY i MEASURES typed_list(s, xs, x -> x) AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM typed_input MATCH_RECOGNIZE (ORDER BY i MEASURES typed_list(s, xs, lambda x: x) AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement ok
+RESET lambda_syntax
+
+# with the arrow the JSON operator, a typed member reads a column of the input, which hides one of an enclosing
+# query, and refuses one of the wrong type, as the binder does
+statement ok
+CREATE MACRO keep_int(n INTEGER, f) AS n
+
+query I
+SELECT (SELECT m FROM (VALUES (1, 42)) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true)) FROM (VALUES ('outer')) o(n);
+----
+42
+
+statement error
+SELECT (SELECT m FROM (VALUES (1, '17')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true)) FROM (VALUES (5)) o(n);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM (VALUES (1, '17')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES keep_int(n, '1'::JSON -> '$') AS m PATTERN (A) DEFINE A AS true);
+----
+does not support the supplied arguments
+
+statement error
+SELECT * FROM (VALUES (1, '17'), (2, '18')) t(i, n) MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A+) DEFINE A AS keep_int(n, '1'::JSON -> '$') > 0);
+----
+does not support the supplied arguments
+
+# where an arrow cannot bind as a lambda it is the JSON operator in every member, so the binder chooses the member
+query I
+SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
+----
+2
+
+statement ok
+SET lambda_syntax = 'DISABLE_SINGLE_ARROW'
+
+query I
+SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
+----
+2
 
 statement ok
 RESET lambda_syntax
@@ -384,7 +440,7 @@ SELECT * FROM (SELECT 1 AS i, '{"a": 5}'::JSON AS j) MATCH_RECOGNIZE (ORDER BY i
 5
 
 statement ok
-CREATE MACRO as_int(f) RETURNS INTEGER AS f
+CREATE TEMP MACRO as_int(f) RETURNS INTEGER AS f
 
 query II
 SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(as_int(A -> A.pos)) / 4 AS m, typeof(FIRST(as_int(A -> A.pos))) AS t PATTERN (A) DEFINE A AS true);
@@ -392,7 +448,7 @@ SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(as_int(A -> A.pos)) 
 2.5	INTEGER
 
 statement ok
-CREATE MACRO as_small(f) RETURNS SMALLINT AS f::INTEGER * 100000
+CREATE TEMP MACRO as_small(f) RETURNS SMALLINT AS f::INTEGER * 100000
 
 statement error
 SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A) DEFINE A AS as_small(A -> A.pos) > 0);

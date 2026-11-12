@@ -112,10 +112,12 @@ public:
 	void Expand(FunctionExpression &call, ScalarMacroCatalogEntry &macro, unique_ptr<ParsedExpression> &expr) {
 		RegisterMacroRead(macro);
 		auto saved_lambda_bindings = binder.lambda_bindings;
+		const auto location = call.GetQueryLocation();
 		try {
 			auto &member = UnfoldMacroExpression(call, macro, expr, 0);
 			if (member.return_type.id() != LogicalTypeId::UNKNOWN) {
 				expr = make_uniq<CastExpression>(member.return_type, std::move(expr));
+				expr->SetQueryLocation(location);
 			}
 		} catch (...) {
 			binder.lambda_bindings = saved_lambda_bindings;
@@ -158,10 +160,10 @@ static bool MacroTakesArguments(const MacroFunction &member, const FunctionExpre
 //! of its own. Computing rather than rewriting is what keeps two tables' columns of the same name
 //! apart, and a struct field behind a qualifier from reading as a column.
 struct HoistedInputRefs {
-	HoistedInputRefs(Binder &binder_p, GeneratedNames &names_p, const case_insensitive_set_t &input_columns_p,
-	                 const case_insensitive_set_t &input_tables_p)
-	    : binder(binder_p), arrows(binder_p), names(names_p), input_columns(input_columns_p),
-	      input_tables(input_tables_p) {
+	HoistedInputRefs(Binder &binder_p, Binder &input_binder_p, GeneratedNames &names_p,
+	                 const case_insensitive_set_t &input_columns_p, const case_insensitive_set_t &input_tables_p)
+	    : binder(binder_p), input_binder(input_binder_p), arrows(binder_p), names(names_p),
+	      input_columns(input_columns_p), input_tables(input_tables_p) {
 	}
 
 	//! The subquery column standing for this reference, allocated on first use. Behind a pattern
@@ -231,6 +233,19 @@ struct HoistedInputRefs {
 			return false;
 		}
 		if (members > 1 && typed) {
+			// Unless an arrow can bind as a lambda, it is the JSON operator in every member, as it is outside a call
+			// the clause expands, and the binder chooses the member once the arguments are bound.
+			bool lambda_possible =
+			    Settings::Get<LambdaSyntaxSetting>(binder.context) == LambdaSyntax::ENABLE_SINGLE_ARROW;
+			for (auto &argument : call.GetArguments()) {
+				auto &value = argument.GetExpression();
+				lambda_possible = lambda_possible || (value.GetExpressionClass() == ExpressionClass::LAMBDA &&
+				                                      value.Cast<LambdaExpression>().GetLambdaSyntaxType() ==
+				                                          LambdaSyntaxType::SINGLE_ARROW_STORAGE);
+			}
+			if (!lambda_possible) {
+				return false;
+			}
 			throw BinderException(call,
 			                      "MATCH_RECOGNIZE cannot pass an arrow lambda to %s(), which chooses its overload by "
 			                      "argument type: write the lambda with the lambda keyword",
@@ -251,12 +266,14 @@ struct HoistedInputRefs {
 			receiver->SetQueryLocation(call.GetQueryLocation());
 			ColumnQualifier::MakePlainCall(call, std::move(receiver));
 		}
-		MatchRecognizeMacroExpander(binder).Expand(call, macro, expr);
+		MatchRecognizeMacroExpander(input_binder).Expand(call, macro, expr);
 		expr->SetAlias(std::move(alias));
 		return true;
 	}
 
 	Binder &binder;
+	//! The input's scope, where the clause's references are bound, and so where a macro's arguments are read
+	Binder &input_binder;
 	const MatchRecognizeArrowScope arrows;
 	//! How many macro expansions the hoisting is inside of
 	idx_t macro_depth = 0;
@@ -1185,6 +1202,8 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	}
 	// a correlated reference is the surrounding query's to resolve, so it is carried out to it
 	MoveCorrelatedExpressions(*input_binder);
+	// the wrapper owns the input's binder from here on, and outlives the clause's references being hoisted
+	auto &input_scope = *input_binder;
 	auto input_ref = make_uniq<BoundRefWrapper>(std::move(bound_input), std::move(input_binder));
 
 	// The matcher's state travels between the select nodes below in a column of its own. Every generated
@@ -1196,7 +1215,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	GeneratedNames names(std::move(input_names));
 	const string state_column = names.Reserve("__pattern_window");
 	const string spans_column = names.Reserve(state_column + "_spans");
-	HoistedInputRefs input_refs(*this, names, input_column_names, input_tables);
+	HoistedInputRefs input_refs(*this, input_scope, names, input_column_names, input_tables);
 
 	const auto symbols = CollectSymbols(*ref.config);
 	// {- -} only decides which of a match's rows reach the output, so it is also read again below
