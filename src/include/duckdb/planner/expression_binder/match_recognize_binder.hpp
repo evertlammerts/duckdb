@@ -85,8 +85,10 @@ struct MatchRecognizeConditionInputs {
 
 //! Where the arrow form is a lambda rather than the JSON operator: in the lambda slot of a function that takes one
 //! (ExpressionBinder::GetLambdaArgumentIndex), with a method call's receiver counted as the first argument. The
-//! binder binds a lambda there under every setting and only then refuses a written arrow under the default one; a
-//! lambda bind that fails and falls back to the JSON operator is not seen here, and fails there too.
+//! binder binds a lambda there under every setting and only then refuses a written arrow unless the setting enables
+//! it; a lambda bind that fails and falls back to the JSON operator is not seen here, and fails there too. A macro
+//! call with an arrow argument reaches the clause expanded the way the binder expands it, so the arrow sits where the
+//! body puts it.
 class MatchRecognizeArrowScope {
 public:
 	explicit MatchRecognizeArrowScope(Binder &binder);
@@ -95,17 +97,14 @@ public:
 	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
 
 private:
-	//! Whether the call takes a lambda at this argument, through the body of a macro it expands to as well
-	bool TakesLambda(const FunctionExpression &call, idx_t index, idx_t depth) const;
-	//! Whether a macro body passes the parameter, as it is, to a call that takes a lambda there
-	bool PlacesInLambdaSlot(const ParsedExpression &body, const Identifier &parameter, idx_t depth) const;
-
 	Binder &binder;
 };
 
-//! Whether the binder reads this call as a method call on the column path in front of its name: no function in the
-//! catalog has the qualified name, and one has the bare name
+//! Whether the binder reads this call as a method call on the names in front of its name: no function in the catalog
+//! has the qualified name, and one has the bare name or the bare name is one of this clause's navigations.
 bool MatchRecognizeIsMethodCall(Binder &binder, const FunctionExpression &call);
+//! Whether the name is one of this clause's navigations, PREV, NEXT, FIRST, LAST or CLASSIFIER
+bool MatchRecognizeIsNavigationName(const Identifier &name);
 
 //! Where the value being bound is evaluated, which is what decides whether it may read the state the
 //! matcher holds while it assembles a match.

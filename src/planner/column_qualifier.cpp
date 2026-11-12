@@ -267,7 +267,11 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 
 	EntryLookupInfo function_lookup(CatalogType::SCALAR_FUNCTION_ENTRY, QualifiedName(function.FunctionName()),
 	                                error_context);
-	auto func = FindFunction(binder, function);
+	// resolve the qualification: this decides whether a leading component (e.g. "s1" in "s1.s2.my_macro()") is a
+	// catalog or the outermost schema of a nested schema path. The name as written is left alone - the dot-call
+	// rewrite below turns the qualification into a column reference and needs it unresolved.
+	auto bound_name = Binder::BindTableName(binder.EntryRetriever(), function.GetQualifiedName());
+	auto func = binder.GetCatalogEntry(EntryLookupInfo(function_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
 	if (func) {
 		// found the function - we are done
 		return func;
@@ -287,13 +291,7 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	}
 	// the function exists in the system catalog - turn this into a dot call
 	ErrorData error;
-	unique_ptr<ColumnRefExpression> colref;
-	if (function.GetQualifiedName().Catalog().empty()) {
-		colref = make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema());
-	} else {
-		colref =
-		    make_uniq<ColumnRefExpression>(function.GetQualifiedName().Schema(), function.GetQualifiedName().Catalog());
-	}
+	auto colref = CreateDotCallReceiver(function.GetQualifiedName());
 	auto new_colref = QualifyColumnName(*colref, error);
 	if (!new_colref) {
 		new_colref = std::move(colref);
@@ -301,20 +299,20 @@ optional_ptr<CatalogEntry> ColumnQualifier::QualifyFunction(FunctionExpression &
 	new_colref->ClearAlias();
 	// we can! transform this into a function call on the column
 	// i.e. "x.lower()" becomes "lower(x)"
-	function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(new_colref));
-	function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+	MakePlainCall(function, std::move(new_colref));
 	return func;
 }
 
-optional_ptr<CatalogEntry> ColumnQualifier::FindFunction(Binder &binder, const FunctionExpression &function) {
-	QueryErrorContext error_context(function.GetQueryLocation());
-	EntryLookupInfo function_lookup(CatalogType::SCALAR_FUNCTION_ENTRY, QualifiedName(function.FunctionName()),
-	                                error_context);
-	// resolve the qualification: this decides whether a leading component (e.g. "s1" in "s1.s2.my_macro()") is a
-	// catalog or the outermost schema of a nested schema path. The name as written is left alone - the dot-call
-	// rewrite in QualifyFunction turns the qualification into a column reference and needs it unresolved.
-	auto bound_name = Binder::BindTableName(binder.EntryRetriever(), function.GetQualifiedName());
-	return binder.GetCatalogEntry(EntryLookupInfo(function_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
+void ColumnQualifier::MakePlainCall(FunctionExpression &function, unique_ptr<ParsedExpression> receiver) {
+	function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(receiver));
+	function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+}
+
+unique_ptr<ColumnRefExpression> ColumnQualifier::CreateDotCallReceiver(const QualifiedName &name) {
+	if (name.Catalog().empty()) {
+		return make_uniq<ColumnRefExpression>(name.Schema());
+	}
+	return make_uniq<ColumnRefExpression>(name.Schema(), name.Catalog());
 }
 
 void ColumnQualifier::QualifyColumnNamesInLambda(FunctionExpression &function,

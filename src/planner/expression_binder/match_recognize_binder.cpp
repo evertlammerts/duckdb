@@ -5,8 +5,6 @@
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
-#include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -220,13 +218,26 @@ bool MatchRecognizeLambdaParameters(const ParsedExpression &expr, identifier_set
 	return lambda.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD && LambdaParameterNames(lambda, parameters);
 }
 
+bool MatchRecognizeIsNavigationName(const Identifier &name) {
+	for (auto navigation : {"PREV", "NEXT", "FIRST", "LAST", "CLASSIFIER"}) {
+		if (StringUtil::CIEquals(name.GetIdentifierName(), navigation)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool MatchRecognizeIsMethodCall(Binder &binder, const FunctionExpression &call) {
 	if (call.GetQualifiedName().Path().size() < 2 || ExpressionBinder::IsUnnestFunction(call.FunctionName())) {
 		return false;
 	}
 	FunctionExpression probe(call.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
-	ColumnQualifier(binder).QualifyFunction(probe);
-	return probe.GetQualifiedName().Path().size() == 1;
+	auto entry = ColumnQualifier(binder).QualifyFunction(probe);
+	if (probe.GetQualifiedName().Path().size() == 1) {
+		return true;
+	}
+	// the navigations are this clause's own functions, which the catalog does not know
+	return !entry && MatchRecognizeIsNavigationName(call.FunctionName());
 }
 
 MatchRecognizeArrowScope::MatchRecognizeArrowScope(Binder &binder_p) : binder(binder_p) {
@@ -235,82 +246,30 @@ MatchRecognizeArrowScope::MatchRecognizeArrowScope(Binder &binder_p) : binder(bi
 bool MatchRecognizeArrowScope::IsLambda(const FunctionExpression &call, const ParsedExpression &argument,
                                         identifier_set_t &parameters) const {
 	if (argument.GetExpressionClass() != ExpressionClass::LAMBDA ||
-	    argument.Cast<LambdaExpression>().GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD) {
+	    argument.Cast<LambdaExpression>().GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD ||
+	    ExpressionBinder::IsUnnestFunction(call.FunctionName())) {
 		return false;
 	}
+	optional_idx index;
 	auto &arguments = call.GetArguments();
 	for (idx_t i = 0; i < arguments.size(); i++) {
 		if (&arguments[i].GetExpression() == &argument) {
-			return TakesLambda(call, i, 0) && LambdaParameterNames(argument.Cast<LambdaExpression>(), parameters);
+			index = i;
 		}
 	}
-	return false;
-}
-
-bool MatchRecognizeArrowScope::TakesLambda(const FunctionExpression &call, idx_t index, idx_t depth) const {
-	// a macro that expands into itself is refused by the binder, which this only has to stop short of
-	static constexpr idx_t MAXIMUM_MACRO_DEPTH = 64;
-	if (depth > MAXIMUM_MACRO_DEPTH || ExpressionBinder::IsUnnestFunction(call.FunctionName())) {
+	if (!index.IsValid()) {
 		return false;
 	}
 	// The call as the binder will qualify it: a method call's receiver becomes its first argument.
 	FunctionExpression probe(call.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
 	auto entry = ColumnQualifier(binder).QualifyFunction(probe);
-	if (!entry) {
+	if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
 		return false;
 	}
 	const auto method_call = call.GetQualifiedName().Path().size() >= 2 && probe.GetQualifiedName().Path().size() == 1;
-	const auto position = index + (method_call ? 1 : 0);
-	if (entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(entry->Cast<ScalarFunctionCatalogEntry>());
-		return lambda_index.IsValid() && lambda_index.GetIndex() == position;
-	}
-	if (entry->type != CatalogType::MACRO_ENTRY) {
-		return false;
-	}
-	// the binder expands a macro before it binds the arguments, so the argument goes where the body puts it
-	auto &argument = call.GetArguments()[index];
-	for (auto &macro : entry->Cast<ScalarMacroCatalogEntry>().macros) {
-		Identifier parameter;
-		if (argument.HasName()) {
-			parameter = argument.GetName();
-		} else if (position < macro->parameters.size()) {
-			parameter = macro->parameters[position]->Cast<ColumnRefExpression>().GetColumnName();
-		} else {
-			continue;
-		}
-		if (PlacesInLambdaSlot(*macro->Cast<ScalarMacroFunction>().expression, parameter, depth + 1)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool MatchRecognizeArrowScope::PlacesInLambdaSlot(const ParsedExpression &body, const Identifier &parameter,
-                                                  idx_t depth) const {
-	if (body.GetExpressionClass() == ExpressionClass::LAMBDA) {
-		identifier_set_t parameters;
-		if (MatchRecognizeLambdaParameters(body, parameters) &&
-		    LambdaExpression::IsLambdaParameter({parameters}, parameter)) {
-			return false;
-		}
-	}
-	if (body.GetExpressionClass() == ExpressionClass::FUNCTION) {
-		auto &call = body.Cast<FunctionExpression>();
-		auto &arguments = call.GetArguments();
-		for (idx_t i = 0; i < arguments.size(); i++) {
-			auto &argument = arguments[i].GetExpression();
-			if (argument.GetExpressionType() == ExpressionType::COLUMN_REF &&
-			    argument.Cast<ColumnRefExpression>().ColumnNames().size() == 1 &&
-			    argument.Cast<ColumnRefExpression>().GetColumnName() == parameter && TakesLambda(call, i, depth)) {
-				return true;
-			}
-		}
-	}
-	bool found = false;
-	ParsedExpressionIterator::EnumerateChildren(
-	    body, [&](const ParsedExpression &child) { found = found || PlacesInLambdaSlot(child, parameter, depth); });
-	return found;
+	auto lambda_index = ExpressionBinder::GetLambdaArgumentIndex(entry->Cast<ScalarFunctionCatalogEntry>());
+	return lambda_index.IsValid() && lambda_index.GetIndex() == index.GetIndex() + (method_call ? 1 : 0) &&
+	       LambdaParameterNames(argument.Cast<LambdaExpression>(), parameters);
 }
 
 //! What a value that is not the candidate row is being computed for, for the message that says so

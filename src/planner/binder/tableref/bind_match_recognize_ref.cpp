@@ -1,10 +1,12 @@
-
 #include "duckdb/function/match_recognize.hpp"
 
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_match_recognize.hpp"
 
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -100,6 +102,19 @@ static unique_ptr<MatchRecognizePattern> BuildPattern(const ParsedExpression &ex
 	}
 }
 
+//! Expands a macro call the way the binder does, so that the clause reads an arrow argument where the body puts it
+class MatchRecognizeMacroExpander : public ExpressionBinder {
+public:
+	explicit MatchRecognizeMacroExpander(Binder &binder) : ExpressionBinder(binder, binder.context) {
+	}
+
+	void Expand(FunctionExpression &call, ScalarMacroCatalogEntry &macro, unique_ptr<ParsedExpression> &expr) {
+		auto saved_lambda_bindings = binder.lambda_bindings;
+		UnfoldMacroExpression(call, macro, expr, 0);
+		binder.lambda_bindings = saved_lambda_bindings;
+	}
+};
+
 //! A reference into the input only resolves where the input still is one, and every clause here is
 //! evaluated above a subquery of it - so it is computed down there verbatim and read back under a name
 //! of its own. Computing rather than rewriting is what keeps two tables' columns of the same name
@@ -139,8 +154,67 @@ struct HoistedInputRefs {
 		return columns.emplace(std::move(key), std::move(column)).first->second;
 	}
 
+	//! Replace a call to a macro that is passed an arrow by the macro's expansion, as the binder will expand it
+	bool ExpandArrowMacro(unique_ptr<ParsedExpression> &expr) {
+		auto &call = expr->Cast<FunctionExpression>();
+		bool passes_arrow = false;
+		for (auto &argument : call.GetArguments()) {
+			auto &value = argument.GetExpression();
+			passes_arrow = passes_arrow ||
+			               (value.GetExpressionClass() == ExpressionClass::LAMBDA &&
+			                value.Cast<LambdaExpression>().GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD);
+		}
+		if (!passes_arrow || ExpressionBinder::IsUnnestFunction(call.FunctionName()) || call.Distinct() ||
+		    call.Filter() || (call.OrderBy() && !call.OrderBy()->orders.empty())) {
+			return false;
+		}
+		FunctionExpression probe(call.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
+		auto entry = ColumnQualifier(binder).QualifyFunction(probe);
+		// a method call left to the binder has its receiver outside the arguments the expansion would read
+		if (!entry || entry->type != CatalogType::MACRO_ENTRY ||
+		    probe.GetQualifiedName().Path().size() != call.GetQualifiedName().Path().size()) {
+			return false;
+		}
+		// A body with a typed parameter is bound when the macro is created, so it cannot pass a parameter on to a
+		// lambda slot, and the arrow stays the JSON operator there. Where only some overloads are typed, which body
+		// the binder expands depends on argument types that are known only once bound.
+		auto &macro = entry->Cast<ScalarMacroCatalogEntry>();
+		idx_t typed_overloads = 0;
+		for (auto &overload : macro.macros) {
+			for (auto &type : overload->types) {
+				if (type.id() != LogicalTypeId::UNKNOWN) {
+					typed_overloads++;
+					break;
+				}
+			}
+		}
+		if (typed_overloads == macro.macros.size()) {
+			return false;
+		}
+		if (typed_overloads > 0) {
+			throw BinderException(call,
+			                      "MATCH_RECOGNIZE cannot pass an arrow lambda to %s(), which chooses its overload by "
+			                      "argument type: write the lambda with the lambda keyword",
+			                      call.FunctionName().GetIdentifierName());
+		}
+		const auto max_expression_depth = Settings::Get<MaxExpressionDepthSetting>(binder.context);
+		if (++macro_depth >= max_expression_depth) {
+			throw BinderException("Max expression depth limit of %lld exceeded. Use \"SET max_expression_depth TO "
+			                      "x\" to increase the maximum expression depth.",
+			                      max_expression_depth);
+		}
+		binder.context.InterruptCheck();
+		// the call may be a whole measure or condition, whose alias names it
+		auto alias = expr->GetAlias();
+		MatchRecognizeMacroExpander(binder).Expand(call, macro, expr);
+		expr->SetAlias(std::move(alias));
+		return true;
+	}
+
 	Binder &binder;
 	const MatchRecognizeArrowScope arrows;
+	//! How many macro expansions the hoisting is inside of
+	idx_t macro_depth = 0;
 	GeneratedNames &names;
 	const case_insensitive_set_t &input_columns;
 	const case_insensitive_set_t &input_tables;
@@ -170,17 +244,23 @@ static void HoistInputReferences(unique_ptr<ParsedExpression> &expr, const case_
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
-		auto &path = function.GetQualifiedName().Path();
+		auto &name = function.GetQualifiedName();
 		// The parser keeps the receiver of c.f() and X.c.f() in the function's name, and the engine reads it as a
-		// method call when no catalog function has that name. Turned into the call on the column path here, the
-		// receiver is resolved below like any other reference: an input column, a variable's column, a lambda
-		// parameter's field.
-		if (MatchRecognizeIsMethodCall(refs.binder, function)) {
-			unique_ptr<ParsedExpression> receiver =
-			    make_uniq<ColumnRefExpression>(vector<Identifier>(path.begin(), path.end() - 1));
+		// method call when no catalog function has that name. Turned into that call here, with the receiver the
+		// engine builds, the receiver is resolved below like any other reference. One led by a lambda parameter is
+		// left to the engine, which reads it with the lambda's scope of its own, unless the call is one of this
+		// clause's navigations, which the engine does not know.
+		if (MatchRecognizeIsMethodCall(refs.binder, function) &&
+		    (MatchRecognizeIsNavigationName(name.Name()) ||
+		     !LambdaExpression::IsLambdaParameter(lambda_parameters, name.Path()[0]))) {
+			auto receiver = ColumnQualifier::CreateDotCallReceiver(name);
 			receiver->SetQueryLocation(function.GetQueryLocation());
-			function.GetArgumentsMutable().insert(function.GetArgumentsMutable().begin(), std::move(receiver));
-			function.SetQualifiedName(QualifiedName(function.GetQualifiedName().Name()));
+			ColumnQualifier::MakePlainCall(function, std::move(receiver));
+		}
+		if (refs.ExpandArrowMacro(expr)) {
+			HoistInputReferences(expr, symbols, aliases, refs, lambda_parameters);
+			refs.macro_depth--;
+			return;
 		}
 	}
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {

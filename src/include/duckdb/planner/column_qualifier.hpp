@@ -44,8 +44,10 @@ public:
 	                        const bool within_function_expression = false);
 
 	optional_ptr<CatalogEntry> QualifyFunction(FunctionExpression &function);
-	//! The function a call names in the catalog, as it is written, or nothing
-	static optional_ptr<CatalogEntry> FindFunction(Binder &binder, const FunctionExpression &function);
+	//! The receiver the qualified call "x.y.lower()" has if it is a dot call
+	static unique_ptr<ColumnRefExpression> CreateDotCallReceiver(const QualifiedName &name);
+	//! Rewrites the dot call "x.lower()" into "lower(x)", with receiver as x
+	static void MakePlainCall(FunctionExpression &function, unique_ptr<ParsedExpression> receiver);
 
 private:
 	Binder &binder;
