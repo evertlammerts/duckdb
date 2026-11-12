@@ -390,6 +390,82 @@ CREATE TRIGGER own_insert AFTER INSERT ON own FOR EACH STATEMENT INSERT INTO src
 statement ok
 CREATE TRIGGER own_delete AFTER DELETE ON own FOR EACH ROW INSERT INTO src.log SELECT 'deleted ' || OLD.id || ' beside ' || src.main.other.id FROM src.other;
 
+# PIVOT, UNPIVOT and MATCH_RECOGNIZE over a table named with its own catalog, in trigger bodies and in a view
+statement ok
+CREATE TABLE p(kind VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO p VALUES ('a', 5), ('a', 7);
+
+statement ok
+CREATE VIEW pivoted AS SELECT * FROM src.main.p PIVOT (sum(v) FOR kind IN ('a'));
+
+statement ok
+CREATE TABLE shaped(id INTEGER);
+
+statement ok
+CREATE TRIGGER shaped_pivot AFTER INSERT ON shaped FOR EACH STATEMENT INSERT INTO log SELECT 'pivot ' || a FROM src.main.p PIVOT (sum(v) FOR kind IN ('a'));
+
+statement ok
+CREATE TRIGGER shaped_match AFTER UPDATE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT 'match ' || n FROM src.main.p MATCH_RECOGNIZE (ORDER BY v MEASURES count(*) AS n PATTERN (A+) DEFINE A AS v > 0);
+
+statement ok
+CREATE TRIGGER shaped_unpivot AFTER DELETE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT 'unpivot ' || val FROM src.p UNPIVOT (val FOR col IN (v));
+
+# a leading name spelled like the catalog that the binder reads as a table or as a struct column keeps its place
+statement ok
+CREATE TABLE src(c STRUCT(f INTEGER));
+
+statement ok
+CREATE TABLE x(c STRUCT(f INTEGER));
+
+statement ok
+INSERT INTO src VALUES ({'f': 1});
+
+statement ok
+INSERT INTO x VALUES ({'f': 2});
+
+statement ok
+CREATE TABLE payload(src STRUCT(a STRUCT(v INTEGER)), a STRUCT(v INTEGER));
+
+statement ok
+INSERT INTO payload VALUES ({'a': {'v': 1}}, {'v': 2});
+
+statement ok
+CREATE TABLE spelled(id INTEGER);
+
+statement ok
+CREATE TRIGGER spelled_table AFTER INSERT ON spelled FOR EACH STATEMENT INSERT INTO log SELECT 'table ' || src.c.f FROM src, x;
+
+statement ok
+CREATE TRIGGER spelled_struct AFTER DELETE ON spelled FOR EACH STATEMENT INSERT INTO log SELECT 'struct ' || src.a.v FROM payload;
+
+# fired once in the source, so the exported log holds the rows the source writes
+statement ok
+INSERT INTO shaped VALUES (1);
+
+statement ok
+UPDATE shaped SET id = 2;
+
+statement ok
+DELETE FROM shaped;
+
+statement ok
+INSERT INTO spelled VALUES (1);
+
+statement ok
+DELETE FROM spelled;
+
+query T rowsort
+SELECT msg FROM src.log;
+----
+match 2
+pivot 12
+struct 1
+table 1
+unpivot 5
+unpivot 7
+
 statement ok
 EXPORT DATABASE src TO '{TEST_DIR}/export_triggers_catalog';
 
@@ -400,6 +476,11 @@ CREATE TRIGGER own_delete AFTER DELETE ON own FOR EACH ROW INSERT INTO log SELEC
 CREATE TRIGGER own_insert AFTER INSERT ON own FOR EACH STATEMENT INSERT INTO main.log SELECT ('own ' || count_star()) FROM main.other;
 CREATE TRIGGER same_name AFTER INSERT ON base FOR EACH STATEMENT INSERT INTO log (VALUES ('base'));
 CREATE TRIGGER same_name AFTER INSERT ON other FOR EACH STATEMENT INSERT INTO log (VALUES ('other'));
+CREATE TRIGGER shaped_match AFTER UPDATE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('match ' || n) FROM main.p MATCH_RECOGNIZE(ORDER BY v MEASURES count_star() AS n PATTERN (A+) DEFINE A AS (v > 0));
+CREATE TRIGGER shaped_pivot AFTER INSERT ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('pivot ' || a) FROM main.p PIVOT (sum(v) FOR (kind) IN ('a'));
+CREATE TRIGGER shaped_unpivot AFTER DELETE ON shaped FOR EACH STATEMENT INSERT INTO log SELECT ('unpivot ' || val) FROM p UNPIVOT (val FOR col IN (v));
+CREATE TRIGGER spelled_struct AFTER DELETE ON spelled FOR EACH STATEMENT INSERT INTO log SELECT ('struct ' || src.a.v) FROM payload;
+CREATE TRIGGER spelled_table AFTER INSERT ON spelled FOR EACH STATEMENT INSERT INTO log SELECT ('table ' || src.c.f) FROM src , x;
 
 statement ok
 ATTACH ':memory:' AS dst;
@@ -422,13 +503,45 @@ INSERT INTO own VALUES (3);
 statement ok
 DELETE FROM own;
 
+statement ok
+INSERT INTO shaped VALUES (1);
+
+statement ok
+UPDATE shaped SET id = 2;
+
+statement ok
+DELETE FROM shaped;
+
+statement ok
+INSERT INTO spelled VALUES (1);
+
+statement ok
+DELETE FROM spelled;
+
 query T rowsort
 SELECT msg FROM dst.log;
 ----
 base
 deleted 3 beside 2
+match 2
+match 2
 other
 own 1
+pivot 12
+pivot 12
+struct 1
+struct 1
+table 1
+table 1
+unpivot 5
+unpivot 5
+unpivot 7
+unpivot 7
+
+query I
+SELECT * FROM dst.pivoted;
+----
+12
 
 query TT
 SELECT database_name, table_name FROM duckdb_triggers() WHERE trigger_name = 'same_name' ORDER BY ALL;

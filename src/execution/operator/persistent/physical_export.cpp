@@ -37,7 +37,7 @@ static void WriteCatalogEntry(stringstream &ss, CatalogEntry &entry) {
 	auto create_info = entry.GetInfo();
 	try {
 		if (create_info->type == CatalogType::TRIGGER_ENTRY) {
-			// CREATE VIEW drops its own catalog from its body, CREATE TRIGGER keeps the body as written
+			// CREATE TRIGGER stores the body as written, so it may name the exported catalog
 			RemotePushdownOptimizer::StripCatalogName(*create_info->Cast<CreateTriggerInfo>().trigger_action,
 			                                          create_info->GetQualifiedName().Catalog());
 		}

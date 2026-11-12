@@ -46,6 +46,52 @@ CREATE VIEW db1.s1.v_schema AS SELECT * FROM db1.s1.t;
 statement ok
 CREATE VIEW db1.v_deferred WITH (DEFER_BINDING) AS SELECT * FROM db1.t;
 
+# the source of a PIVOT, UNPIVOT or MATCH_RECOGNIZE
+statement ok
+CREATE TABLE db1.p(kind VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO db1.p VALUES ('a', 5), ('a', 7);
+
+statement ok
+CREATE VIEW db1.v_pivot AS SELECT * FROM db1.main.p PIVOT (sum(v) FOR kind IN ('a'));
+
+statement ok
+CREATE VIEW db1.v_unpivot AS SELECT col, val FROM db1.p UNPIVOT (val FOR col IN (v)) ORDER BY val;
+
+statement ok
+CREATE VIEW db1.v_match AS SELECT n FROM db1.main.p MATCH_RECOGNIZE (ORDER BY v MEASURES count(*) AS n PATTERN (A+) DEFINE A AS v > 0);
+
+# a leading name spelled like the catalog that the binder reads as a struct column or as a table keeps its place
+statement ok
+CREATE TABLE db1.payload(db1 STRUCT(a STRUCT(v INTEGER)), a STRUCT(v INTEGER));
+
+statement ok
+INSERT INTO db1.payload VALUES ({'a': {'v': 1}}, {'v': 2});
+
+statement ok
+CREATE VIEW db1.v_struct AS SELECT db1.a.v AS x FROM db1.payload;
+
+statement ok
+CREATE TABLE db1.db1(c STRUCT(f INTEGER));
+
+statement ok
+CREATE TABLE db1.x(c STRUCT(f INTEGER));
+
+statement ok
+INSERT INTO db1.db1 VALUES ({'f': 1});
+
+statement ok
+INSERT INTO db1.x VALUES ({'f': 2});
+
+statement ok
+CREATE VIEW db1.v_table_like AS SELECT db1.c.f AS x FROM db1.db1, db1.x;
+
+query II
+SELECT (SELECT db1.a.v FROM db1.payload), (SELECT db1.c.f FROM db1.db1, db1.x);
+----
+1	1
+
 # the catalog qualifier is dropped from the stored SQL
 query II
 SELECT view_name, trim(sql, chr(10)) FROM duckdb_views() WHERE database_name='db1' ORDER BY view_name;
@@ -55,8 +101,13 @@ v_colref	CREATE VIEW v_colref AS SELECT t.i FROM t;
 v_cte	CREATE VIEW v_cte AS WITH c AS (SELECT * FROM t) SELECT * FROM c;
 v_deferred	CREATE VIEW v_deferred AS SELECT * FROM t;
 v_full	CREATE VIEW v_full AS SELECT * FROM main.t;
+v_match	CREATE VIEW v_match AS SELECT n FROM main.p MATCH_RECOGNIZE(ORDER BY v MEASURES count_star() AS n PATTERN (A+) DEFINE A AS (v > 0));
+v_pivot	CREATE VIEW v_pivot AS SELECT * FROM main.p PIVOT (sum(v) FOR (kind) IN ('a'));
 v_schema	CREATE VIEW s1.v_schema AS SELECT * FROM s1.t;
+v_struct	CREATE VIEW v_struct AS SELECT db1.a.v AS x FROM payload;
 v_subquery	CREATE VIEW v_subquery AS SELECT (SELECT max(i) FROM t) AS i;
+v_table_like	CREATE VIEW v_table_like AS SELECT db1.c.f AS x FROM db1 , x;
+v_unpivot	CREATE VIEW v_unpivot AS SELECT col, val FROM p UNPIVOT (val FOR col IN (v)) ORDER BY val;
 
 statement ok
 DETACH db1;
@@ -98,6 +149,32 @@ query I
 SELECT * FROM db2.v_deferred;
 ----
 42
+
+query I
+SELECT * FROM db2.v_pivot;
+----
+12
+
+query TI rowsort
+SELECT * FROM db2.v_unpivot;
+----
+v	5
+v	7
+
+query I
+SELECT * FROM db2.v_match;
+----
+2
+
+query I
+SELECT * FROM db2.v_struct;
+----
+1
+
+query I
+SELECT * FROM db2.v_table_like;
+----
+1
 
 # views referencing another catalog keep their qualification
 statement ok

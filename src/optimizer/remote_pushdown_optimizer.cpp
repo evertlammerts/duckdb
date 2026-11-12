@@ -40,6 +40,8 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/match_recognize_ref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -1300,6 +1302,87 @@ unique_ptr<TableRef> RemotePushdownOptimizer::CreateRemoteFunctionRef(CatalogPus
 	return result.catalog->RemoteExecute(binder.context, std::move(node));
 }
 
+namespace {
+
+//! The bindings of one query node that the strip has visited so far
+struct CatalogStripScope {
+	//! tables read without an alias, so a column reference can name them as catalog.table.column
+	identifier_set_t table_names;
+	identifier_set_t cte_names;
+	//! a column reference whose first name is the catalog's may then start with this binding instead
+	bool binding_named_like_catalog = false;
+};
+
+struct CatalogStripContext {
+	explicit CatalogStripContext(const Identifier &catalog_name) : catalog_name(catalog_name), scopes(1) {
+	}
+
+	const Identifier &catalog_name;
+	//! the scopes a column reference sees: its own query node's and those of the nodes around it
+	vector<CatalogStripScope> scopes;
+
+	void AddBinding(const Identifier &alias) {
+		if (alias == catalog_name) {
+			scopes.back().binding_named_like_catalog = true;
+		}
+	}
+
+	void AddTable(const QualifiedName &name, const Identifier &alias) {
+		if (!alias.empty()) {
+			AddBinding(alias);
+			return;
+		}
+		AddBinding(name.Name());
+		bool is_cte = false;
+		for (auto &scope : scopes) {
+			is_cte = is_cte || scope.cte_names.count(name.Name()) > 0;
+		}
+		if (name.Catalog().empty() && (!is_cte || !name.Schema().empty())) {
+			scopes.back().table_names.insert(name.Name());
+		}
+	}
+
+	//! The binder reads a leading name as the catalog only when no binding in scope carries that name and a later
+	//! name is a table in scope; otherwise the leading name is a table or a struct column spelled like the catalog
+	bool ReadsAsCatalog(const vector<Identifier> &names) const {
+		for (auto &scope : scopes) {
+			if (scope.binding_named_like_catalog) {
+				return false;
+			}
+		}
+		for (idx_t table_index = 1; table_index + 1 < names.size(); table_index++) {
+			for (auto &scope : scopes) {
+				if (scope.table_names.count(names[table_index]) > 0) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+};
+
+class CatalogStripScopeGuard {
+public:
+	CatalogStripScopeGuard(CatalogStripContext &context, const CommonTableExpressionMap &cte_map) : context(context) {
+		context.scopes.emplace_back();
+		for (auto &cte : cte_map.map) {
+			context.scopes.back().cte_names.insert(cte.first);
+		}
+	}
+	~CatalogStripScopeGuard() {
+		context.scopes.pop_back();
+	}
+
+private:
+	CatalogStripContext &context;
+};
+
+} // namespace
+
+static void StripCatalog(TableRef &ref, CatalogStripContext &context);
+static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context);
+static void StripCatalog(QueryNode &node, CatalogStripContext &context);
+
 //! Drop the catalog qualifier from a name. A two-part name (e.g. "rpc.t") parses as schema.name, so the
 //! catalog being pushed to can sit in either slot
 static void StripCatalogFromName(QualifiedName &name, const Identifier &catalog_name) {
@@ -1310,33 +1393,37 @@ static void StripCatalogFromName(QualifiedName &name, const Identifier &catalog_
 	}
 }
 
-void RemotePushdownOptimizer::StripCatalogName(TableRef &ref, const Identifier &catalog_name) {
+static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	switch (ref.type) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base = ref.Cast<BaseTableRef>();
 		auto name = base.GetQualifiedName();
-		StripCatalogFromName(name, catalog_name);
+		StripCatalogFromName(name, context.catalog_name);
+		context.AddTable(name, base.alias);
 		base.SetQualifiedName(std::move(name));
-		break;
+		return;
 	}
 	case TableReferenceType::JOIN: {
 		auto &join = ref.Cast<JoinRef>();
-		StripCatalogName(*join.left, catalog_name);
-		StripCatalogName(*join.right, catalog_name);
+		StripCatalog(*join.left, context);
+		StripCatalog(*join.right, context);
 		if (join.condition) {
-			StripCatalogName(*join.condition, catalog_name);
+			StripCatalog(*join.condition, context);
 		}
 		break;
 	}
 	case TableReferenceType::SUBQUERY: {
 		auto &sq = ref.Cast<SubqueryRef>();
-		StripCatalogName(*sq.subquery->node, catalog_name);
+		StripCatalog(*sq.subquery->node, context);
 		break;
 	}
 	case TableReferenceType::TABLE_FUNCTION: {
 		auto &tf = ref.Cast<TableFunctionRef>();
 		if (tf.function) {
-			StripCatalogName(*tf.function, catalog_name);
+			StripCatalog(*tf.function, context);
+			if (tf.alias.empty() && tf.function->GetExpressionType() == ExpressionType::FUNCTION) {
+				context.AddBinding(tf.function->Cast<FunctionExpression>().FunctionName());
+			}
 		}
 		break;
 	}
@@ -1344,17 +1431,63 @@ void RemotePushdownOptimizer::StripCatalogName(TableRef &ref, const Identifier &
 		auto &el = ref.Cast<ExpressionListRef>();
 		for (auto &row : el.values) {
 			for (auto &expr : row) {
-				StripCatalogName(*expr, catalog_name);
+				StripCatalog(*expr, context);
 			}
+		}
+		break;
+	}
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref.Cast<PivotRef>();
+		// the bindings of the source are not visible outside the pivot
+		CatalogStripScopeGuard source_scope(context, CommonTableExpressionMap());
+		StripCatalog(*pivot.source, context);
+		for (auto &aggregate : pivot.aggregates) {
+			StripCatalog(*aggregate, context);
+		}
+		for (auto &pivot_column : pivot.pivots) {
+			for (auto &expr : pivot_column.pivot_expressions) {
+				StripCatalog(*expr, context);
+			}
+			for (auto &entry : pivot_column.entries) {
+				if (entry.expr) {
+					StripCatalog(*entry.expr, context);
+				}
+			}
+			if (pivot_column.subquery) {
+				StripCatalog(*pivot_column.subquery, context);
+			}
+		}
+		break;
+	}
+	case TableReferenceType::MATCH_RECOGNIZE: {
+		auto &match = ref.Cast<MatchRecognizeRef>();
+		// the bindings of the input are not visible outside the match
+		CatalogStripScopeGuard input_scope(context, CommonTableExpressionMap());
+		if (match.input) {
+			StripCatalog(*match.input, context);
+		}
+		auto &config = *match.config;
+		for (auto &expr : config.partition_expressions) {
+			StripCatalog(*expr, context);
+		}
+		for (auto &order : config.order_by_expressions) {
+			StripCatalog(*order.expression, context);
+		}
+		for (auto &expr : config.measures_expression_list) {
+			StripCatalog(*expr, context);
+		}
+		for (auto &expr : config.defines_expression_list) {
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
 	default:
 		break;
 	}
+	context.AddBinding(ref.alias);
 }
 
-void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name) {
+static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
 		// Strip the catalog prefix from qualified column references, keeping everything after it.
@@ -1364,7 +1497,8 @@ void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Ide
 		// For 4-part  catalog.schema.table.col → schema.table.col
 		// Only the catalog is dropped: the parser keeps arbitrarily deep refs in a single ColumnRef, so trailing
 		// names may be struct fields (catalog.table.s.a.b → table.s.a.b) and must be preserved.
-		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == catalog_name) {
+		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == context.catalog_name &&
+		    context.ReadsAsCatalog(col_ref.ColumnNames())) {
 			auto &names = col_ref.ColumnNamesMutable();
 			names.erase(names.begin());
 		}
@@ -1372,9 +1506,9 @@ void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Ide
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		auto &subq = expr.Cast<SubqueryExpression>();
-		StripCatalogName(*subq.SubqueryMutable()->node, catalog_name);
+		StripCatalog(*subq.SubqueryMutable()->node, context);
 		if (subq.GetChild()) {
-			StripCatalogName(*subq.GetChildMutable(), catalog_name);
+			StripCatalog(*subq.GetChildMutable(), context);
 		}
 		return;
 	}
@@ -1383,19 +1517,21 @@ void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Ide
 	// (e.g. "rpc.my_func()" parsed as schema="rpc", catalog="").
 	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &func = expr.Cast<FunctionExpression>();
-		if (func.GetQualifiedName().Catalog() == catalog_name) {
+		if (func.GetQualifiedName().Catalog() == context.catalog_name) {
 			// keep the whole schema path, which a nested schema makes longer than one schema
 			func.SetQualifiedName(func.GetQualifiedName().WithCatalog(Identifier()));
-		} else if (func.GetQualifiedName().Catalog().empty() && func.GetQualifiedName().Schema() == catalog_name) {
+		} else if (func.GetQualifiedName().Catalog().empty() &&
+		           func.GetQualifiedName().Schema() == context.catalog_name) {
 			func.SetQualifiedName(
 			    QualifiedName(func.GetQualifiedName().Catalog(), Identifier(), func.GetQualifiedName().Name()));
 		}
 		// Fall through to EnumerateChildren to also strip catalog refs inside arguments
 	} else if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
 		auto &win = expr.Cast<WindowExpression>();
-		if (win.GetQualifiedName().Catalog() == catalog_name) {
+		if (win.GetQualifiedName().Catalog() == context.catalog_name) {
 			win.SetQualifiedName(win.GetQualifiedName().WithCatalog(Identifier()));
-		} else if (win.GetQualifiedName().Catalog().empty() && win.GetQualifiedName().Schema() == catalog_name) {
+		} else if (win.GetQualifiedName().Catalog().empty() &&
+		           win.GetQualifiedName().Schema() == context.catalog_name) {
 			win.SetQualifiedName(
 			    QualifiedName(win.GetQualifiedName().Catalog(), Identifier(), win.GetQualifiedName().Name()));
 		}
@@ -1404,76 +1540,76 @@ void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Ide
 		// The cast target is not an expression child, so EnumerateChildren only visits the value being cast -
 		// strip the catalog from the target type expression separately.
 		auto &cast_expr = expr.Cast<CastExpression>();
-		StripCatalogName(cast_expr.TargetTypeMutable(), catalog_name);
+		StripCatalog(cast_expr.TargetTypeMutable(), context);
 		// Fall through to EnumerateChildren to strip catalog refs inside the cast argument
 	} else if (expr.GetExpressionClass() == ExpressionClass::TYPE) {
 		// TypeExpression (used as a type argument) may carry catalog/schema qualifiers.
 		auto &type_expr = expr.Cast<TypeExpression>();
-		if (type_expr.GetCatalog() == catalog_name) {
+		if (type_expr.GetCatalog() == context.catalog_name) {
 			type_expr.SetCatalog("");
-		} else if (type_expr.GetCatalog().empty() && type_expr.GetSchema() == catalog_name) {
+		} else if (type_expr.GetCatalog().empty() && type_expr.GetSchema() == context.catalog_name) {
 			type_expr.SetSchema("");
 		}
 		// Fall through to EnumerateChildren to strip catalog refs inside type parameters
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](ParsedExpression &child) { StripCatalogName(child, catalog_name); });
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { StripCatalog(child, context); });
 }
 
-void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier &catalog_name) {
+static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
+	CatalogStripScopeGuard scope(context, node.cte_map);
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
 		auto &select = node.Cast<SelectNode>();
 		// Strip within CTE definitions so the remote receives catalog-free SQL
 		for (auto &cte_pair : select.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		if (select.from_table) {
-			StripCatalogName(*select.from_table, catalog_name);
+			StripCatalog(*select.from_table, context);
 		}
 		for (auto &expr : select.select_list) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		if (select.where_clause) {
-			StripCatalogName(*select.where_clause, catalog_name);
+			StripCatalog(*select.where_clause, context);
 		}
 		for (auto &expr : select.groups.group_expressions) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		if (select.having) {
-			StripCatalogName(*select.having, catalog_name);
+			StripCatalog(*select.having, context);
 		}
 		if (select.qualify) {
-			StripCatalogName(*select.qualify, catalog_name);
+			StripCatalog(*select.qualify, context);
 		}
 		for (auto &modifier : select.modifiers) {
 			switch (modifier->type) {
 			case ResultModifierType::ORDER_MODIFIER: {
 				auto &order_mod = modifier->Cast<OrderModifier>();
 				for (auto &order : order_mod.orders) {
-					StripCatalogName(*order.expression, catalog_name);
+					StripCatalog(*order.expression, context);
 				}
 				break;
 			}
 			case ResultModifierType::LIMIT_MODIFIER: {
 				auto &limit_mod = modifier->Cast<LimitModifier>();
 				if (limit_mod.limit) {
-					StripCatalogName(*limit_mod.limit, catalog_name);
+					StripCatalog(*limit_mod.limit, context);
 				}
 				if (limit_mod.offset) {
-					StripCatalogName(*limit_mod.offset, catalog_name);
+					StripCatalog(*limit_mod.offset, context);
 				}
 				break;
 			}
 			case ResultModifierType::DISTINCT_MODIFIER: {
 				auto &distinct_mod = modifier->Cast<DistinctModifier>();
 				for (auto &expr : distinct_mod.distinct_on_targets) {
-					StripCatalogName(*expr, catalog_name);
+					StripCatalog(*expr, context);
 				}
 				break;
 			}
@@ -1487,32 +1623,34 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &insert = node.Cast<InsertQueryNode>();
 		for (auto &cte_pair : insert.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		// Strip from the target table's catalog/schema fields (these are what ToString() serializes)
-		StripCatalogFromName(insert.qualified_name, catalog_name);
+		StripCatalogFromName(insert.qualified_name, context.catalog_name);
 		if (insert.select_statement) {
-			StripCatalogName(*insert.select_statement->node, catalog_name);
+			StripCatalog(*insert.select_statement->node, context);
 		}
+		// the target is a binding of ON CONFLICT and RETURNING only, not of the inserted query
+		context.AddTable(insert.qualified_name, insert.table_ref ? insert.table_ref->alias : Identifier());
 		if (insert.on_conflict_info) {
 			if (insert.on_conflict_info->condition) {
-				StripCatalogName(*insert.on_conflict_info->condition, catalog_name);
+				StripCatalog(*insert.on_conflict_info->condition, context);
 			}
 			if (insert.on_conflict_info->set_info) {
 				if (insert.on_conflict_info->set_info->condition) {
-					StripCatalogName(*insert.on_conflict_info->set_info->condition, catalog_name);
+					StripCatalog(*insert.on_conflict_info->set_info->condition, context);
 				}
 				for (auto &expr : insert.on_conflict_info->set_info->expressions) {
-					StripCatalogName(*expr, catalog_name);
+					StripCatalog(*expr, context);
 				}
 			}
 		}
 		for (auto &expr : insert.returning_list) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
@@ -1520,23 +1658,23 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &del = node.Cast<DeleteQueryNode>();
 		for (auto &cte_pair : del.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		if (del.table) {
-			StripCatalogName(*del.table, catalog_name);
-		}
-		if (del.condition) {
-			StripCatalogName(*del.condition, catalog_name);
+			StripCatalog(*del.table, context);
 		}
 		for (auto &clause : del.using_clauses) {
-			StripCatalogName(*clause, catalog_name);
+			StripCatalog(*clause, context);
+		}
+		if (del.condition) {
+			StripCatalog(*del.condition, context);
 		}
 		for (auto &expr : del.returning_list) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
@@ -1544,28 +1682,28 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &upd = node.Cast<UpdateQueryNode>();
 		for (auto &cte_pair : upd.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		if (upd.table) {
-			StripCatalogName(*upd.table, catalog_name);
+			StripCatalog(*upd.table, context);
 		}
 		if (upd.from_table) {
-			StripCatalogName(*upd.from_table, catalog_name);
+			StripCatalog(*upd.from_table, context);
 		}
 		if (upd.set_info) {
 			if (upd.set_info->condition) {
-				StripCatalogName(*upd.set_info->condition, catalog_name);
+				StripCatalog(*upd.set_info->condition, context);
 			}
 			for (auto &expr : upd.set_info->expressions) {
-				StripCatalogName(*expr, catalog_name);
+				StripCatalog(*expr, context);
 			}
 		}
 		for (auto &expr : upd.returning_list) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
@@ -1573,41 +1711,41 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &merge = node.Cast<MergeQueryNode>();
 		for (auto &cte_pair : merge.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		if (merge.target) {
-			StripCatalogName(*merge.target, catalog_name);
+			StripCatalog(*merge.target, context);
 		}
 		if (merge.source) {
-			StripCatalogName(*merge.source, catalog_name);
+			StripCatalog(*merge.source, context);
 		}
 		if (merge.join_condition) {
-			StripCatalogName(*merge.join_condition, catalog_name);
+			StripCatalog(*merge.join_condition, context);
 		}
 		for (auto &entry : merge.actions) {
 			for (auto &action : entry.second) {
 				if (action->condition) {
-					StripCatalogName(*action->condition, catalog_name);
+					StripCatalog(*action->condition, context);
 				}
 				if (action->update_info) {
 					if (action->update_info->condition) {
-						StripCatalogName(*action->update_info->condition, catalog_name);
+						StripCatalog(*action->update_info->condition, context);
 					}
 					for (auto &expr : action->update_info->expressions) {
-						StripCatalogName(*expr, catalog_name);
+						StripCatalog(*expr, context);
 					}
 				}
 				for (auto &expr : action->expressions) {
-					StripCatalogName(*expr, catalog_name);
+					StripCatalog(*expr, context);
 				}
 			}
 		}
 		for (auto &expr : merge.returning_list) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
@@ -1615,38 +1753,38 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &setop = node.Cast<SetOperationNode>();
 		for (auto &cte_pair : setop.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		for (auto &child : setop.children) {
-			StripCatalogName(*child, catalog_name);
+			StripCatalog(*child, context);
 		}
 		for (auto &modifier : setop.modifiers) {
 			switch (modifier->type) {
 			case ResultModifierType::ORDER_MODIFIER: {
 				auto &order_mod = modifier->Cast<OrderModifier>();
 				for (auto &order : order_mod.orders) {
-					StripCatalogName(*order.expression, catalog_name);
+					StripCatalog(*order.expression, context);
 				}
 				break;
 			}
 			case ResultModifierType::LIMIT_MODIFIER: {
 				auto &limit_mod = modifier->Cast<LimitModifier>();
 				if (limit_mod.limit) {
-					StripCatalogName(*limit_mod.limit, catalog_name);
+					StripCatalog(*limit_mod.limit, context);
 				}
 				if (limit_mod.offset) {
-					StripCatalogName(*limit_mod.offset, catalog_name);
+					StripCatalog(*limit_mod.offset, context);
 				}
 				break;
 			}
 			case ResultModifierType::DISTINCT_MODIFIER: {
 				auto &distinct_mod = modifier->Cast<DistinctModifier>();
 				for (auto &expr : distinct_mod.distinct_on_targets) {
-					StripCatalogName(*expr, catalog_name);
+					StripCatalog(*expr, context);
 				}
 				break;
 			}
@@ -1660,38 +1798,38 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 		auto &rec = node.Cast<RecursiveCTENode>();
 		for (auto &cte_pair : rec.cte_map.map) {
 			if (cte_pair.second->query_node) {
-				StripCatalogName(*cte_pair.second->query_node, catalog_name);
+				StripCatalog(*cte_pair.second->query_node, context);
 			}
 			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalogName(*key, catalog_name);
+				StripCatalog(*key, context);
 			}
 		}
 		for (auto &key : rec.key_targets) {
-			StripCatalogName(*key, catalog_name);
+			StripCatalog(*key, context);
 		}
 		for (auto &modifier : rec.modifiers) {
 			switch (modifier->type) {
 			case ResultModifierType::ORDER_MODIFIER: {
 				auto &order_mod = modifier->Cast<OrderModifier>();
 				for (auto &order : order_mod.orders) {
-					StripCatalogName(*order.expression, catalog_name);
+					StripCatalog(*order.expression, context);
 				}
 				break;
 			}
 			case ResultModifierType::LIMIT_MODIFIER: {
 				auto &limit_mod = modifier->Cast<LimitModifier>();
 				if (limit_mod.limit) {
-					StripCatalogName(*limit_mod.limit, catalog_name);
+					StripCatalog(*limit_mod.limit, context);
 				}
 				if (limit_mod.offset) {
-					StripCatalogName(*limit_mod.offset, catalog_name);
+					StripCatalog(*limit_mod.offset, context);
 				}
 				break;
 			}
 			case ResultModifierType::DISTINCT_MODIFIER: {
 				auto &distinct_mod = modifier->Cast<DistinctModifier>();
 				for (auto &expr : distinct_mod.distinct_on_targets) {
-					StripCatalogName(*expr, catalog_name);
+					StripCatalog(*expr, context);
 				}
 				break;
 			}
@@ -1700,10 +1838,10 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 			}
 		}
 		if (rec.left) {
-			StripCatalogName(*rec.left, catalog_name);
+			StripCatalog(*rec.left, context);
 		}
 		if (rec.right) {
-			StripCatalogName(*rec.right, catalog_name);
+			StripCatalog(*rec.right, context);
 		}
 		break;
 	}
@@ -1712,48 +1850,48 @@ void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier
 	}
 }
 
-void RemotePushdownOptimizer::StripCatalogName(CreateInfo &info, const Identifier &catalog_name) {
+static void StripCatalog(CreateInfo &info, CatalogStripContext &context) {
 	if (info.type == CatalogType::SCHEMA_ENTRY) {
 		// the name is [catalog, parent schemas..., new schema, <empty name>] - the catalog is only ever
 		// the leading component, so the two-part fallback below must not be applied
-		if (info.Cast<CreateSchemaInfo>().SchemaCatalog() == catalog_name) {
+		if (info.Cast<CreateSchemaInfo>().SchemaCatalog() == context.catalog_name) {
 			info.StripCatalogQualification();
 		}
 		return;
 	}
 	auto name = info.GetQualifiedName();
-	StripCatalogFromName(name, catalog_name);
+	StripCatalogFromName(name, context.catalog_name);
 	info.SetQualifiedName(std::move(name));
 	// a definition body is shipped verbatim, so any catalog qualifier the user wrote in it still has to go
 	switch (info.type) {
 	case CatalogType::TABLE_ENTRY: {
 		auto &table_info = info.Cast<CreateTableInfo>();
 		if (table_info.query) {
-			StripCatalogName(*table_info.query->node, catalog_name);
+			StripCatalog(*table_info.query->node, context);
 		}
 		break;
 	}
 	case CatalogType::VIEW_ENTRY: {
 		auto &view_info = info.Cast<CreateViewInfo>();
 		if (view_info.query) {
-			StripCatalogName(*view_info.query->node, catalog_name);
+			StripCatalog(*view_info.query->node, context);
 		}
 		break;
 	}
 	case CatalogType::TYPE_ENTRY: {
 		auto &type_info = info.Cast<CreateTypeInfo>();
 		if (type_info.query && type_info.query->type == StatementType::SELECT_STATEMENT) {
-			StripCatalogName(*type_info.query->Cast<SelectStatement>().node, catalog_name);
+			StripCatalog(*type_info.query->Cast<SelectStatement>().node, context);
 		}
 		break;
 	}
 	case CatalogType::INDEX_ENTRY: {
 		auto &index_info = info.Cast<CreateIndexInfo>();
 		for (auto &expr : index_info.parsed_expressions) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		for (auto &expr : index_info.expressions) {
-			StripCatalogName(*expr, catalog_name);
+			StripCatalog(*expr, context);
 		}
 		break;
 	}
@@ -1762,12 +1900,12 @@ void RemotePushdownOptimizer::StripCatalogName(CreateInfo &info, const Identifie
 		auto &macro_info = info.Cast<CreateMacroInfo>();
 		for (auto &macro : macro_info.macros) {
 			for (auto &default_param : macro->default_parameters) {
-				StripCatalogName(*default_param.second, catalog_name);
+				StripCatalog(*default_param.second, context);
 			}
 			if (macro->type == MacroType::SCALAR_MACRO) {
-				StripCatalogName(*macro->Cast<ScalarMacroFunction>().expression, catalog_name);
+				StripCatalog(*macro->Cast<ScalarMacroFunction>().expression, context);
 			} else if (macro->type == MacroType::TABLE_MACRO) {
-				StripCatalogName(*macro->Cast<TableMacroFunction>().query_node, catalog_name);
+				StripCatalog(*macro->Cast<TableMacroFunction>().query_node, context);
 			}
 		}
 		break;
@@ -1777,45 +1915,75 @@ void RemotePushdownOptimizer::StripCatalogName(CreateInfo &info, const Identifie
 	}
 }
 
-void RemotePushdownOptimizer::StripCatalogName(AlterInfo &info, const Identifier &catalog_name) {
+static void StripCatalog(AlterInfo &info, CatalogStripContext &context) {
 	auto name = info.GetQualifiedName();
-	StripCatalogFromName(name, catalog_name);
+	StripCatalogFromName(name, context.catalog_name);
 	info.SetQualifiedName(std::move(name));
 }
 
-void RemotePushdownOptimizer::StripCatalogName(SQLStatement &statement, const Identifier &catalog_name) {
+static void StripCatalog(SQLStatement &statement, CatalogStripContext &context) {
 	switch (statement.type) {
 	case StatementType::SELECT_STATEMENT:
-		StripCatalogName(*statement.Cast<SelectStatement>().node, catalog_name);
+		StripCatalog(*statement.Cast<SelectStatement>().node, context);
 		break;
 	case StatementType::INSERT_STATEMENT:
-		StripCatalogName(*statement.Cast<InsertStatement>().node, catalog_name);
+		StripCatalog(*statement.Cast<InsertStatement>().node, context);
 		break;
 	case StatementType::DELETE_STATEMENT:
-		StripCatalogName(*statement.Cast<DeleteStatement>().node, catalog_name);
+		StripCatalog(*statement.Cast<DeleteStatement>().node, context);
 		break;
 	case StatementType::UPDATE_STATEMENT:
-		StripCatalogName(*statement.Cast<UpdateStatement>().node, catalog_name);
+		StripCatalog(*statement.Cast<UpdateStatement>().node, context);
 		break;
 	case StatementType::MERGE_INTO_STATEMENT:
-		StripCatalogName(*statement.Cast<MergeIntoStatement>().node, catalog_name);
+		StripCatalog(*statement.Cast<MergeIntoStatement>().node, context);
 		break;
 	case StatementType::CREATE_STATEMENT:
-		StripCatalogName(*statement.Cast<CreateStatement>().info, catalog_name);
+		StripCatalog(*statement.Cast<CreateStatement>().info, context);
 		break;
 	case StatementType::DROP_STATEMENT: {
 		auto &info = *statement.Cast<DropStatement>().info;
 		auto name = info.GetQualifiedName();
-		StripCatalogFromName(name, catalog_name);
+		StripCatalogFromName(name, context.catalog_name);
 		info.SetQualifiedName(std::move(name));
 		break;
 	}
 	case StatementType::ALTER_STATEMENT:
-		StripCatalogName(*statement.Cast<AlterStatement>().info, catalog_name);
+		StripCatalog(*statement.Cast<AlterStatement>().info, context);
 		break;
 	default:
 		break;
 	}
+}
+
+void RemotePushdownOptimizer::StripCatalogName(TableRef &ref, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(ref, context);
+}
+
+void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(expr, context);
+}
+
+void RemotePushdownOptimizer::StripCatalogName(QueryNode &node, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(node, context);
+}
+
+void RemotePushdownOptimizer::StripCatalogName(CreateInfo &info, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(info, context);
+}
+
+void RemotePushdownOptimizer::StripCatalogName(AlterInfo &info, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(info, context);
+}
+
+void RemotePushdownOptimizer::StripCatalogName(SQLStatement &statement, const Identifier &catalog_name) {
+	CatalogStripContext context(catalog_name);
+	StripCatalog(statement, context);
 }
 
 unique_ptr<QueryNode> GetNodeFromStatement(SQLStatement &statement) {
