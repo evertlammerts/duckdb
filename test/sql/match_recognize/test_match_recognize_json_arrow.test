@@ -273,8 +273,9 @@ SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES again_a(A -> A.x) AS m PAT
 ----
 Max expression depth limit
 
-# A typed macro body is bound when the macro is created, so it never passes the arrow on to a lambda slot, and an
-# overload set that is typed only in part chooses its body by types the clause cannot know yet
+# The binder chooses a macro's member by argument count and names first, whatever the types, so the chosen body is
+# expanded where that leaves one member; where it leaves several and one is typed, the choice waits for the
+# argument types, and the clause refuses the arrow
 statement ok
 CREATE MACRO typed_value(a INTEGER, f) AS f
 
@@ -284,23 +285,68 @@ SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(typed_value(1, A -> 
 10
 
 statement ok
+CREATE MACRO mapped_at(xs, f, n INTEGER) AS list_transform(xs || xs, f)[n]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mapped_at([{'x': 7}], A -> A.x, 1) AS m PATTERN (A B) DEFINE B AS true);
+----
+7
+7
+
+statement ok
+CREATE MACRO partly_typed(a INTEGER, f) AS f, (a, f, g) AS list_transform(a || g, f)
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(partly_typed(1, A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
 CREATE MACRO typed_pick(a INTEGER, f) AS 1, (a VARCHAR, f) AS 2
 
 statement ok
 CREATE TABLE jv AS SELECT * FROM (VALUES (1, 'a', '[10,20]'::JSON)) t(i, v, j);
 
-query I
+statement error
 SELECT * FROM jv MATCH_RECOGNIZE (ORDER BY i MEASURES typed_pick(v, j -> '$[0]') AS m PATTERN (A) DEFINE A AS true);
 ----
-2
+chooses its overload by argument type
+
+# The expansion is the binder's step for a macro call: the result is cast to a declared return type, and the read of
+# the macro is recorded, so that a prepared statement is bound again once the macro is replaced
+statement ok
+CREATE MACRO as_text(xs, f) RETURNS VARCHAR AS list_transform(xs || xs, f)
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES typeof(as_text([{'x': 1}], A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+VARCHAR
+VARCHAR
+
+# a macro is found by its catalog alone, and a macro called as a method is the plain call on its receiver
+statement ok
+ATTACH ':memory:' AS mr_db
 
 statement ok
-CREATE MACRO partly_typed(a INTEGER, f) AS f, (a, f, g) AS list_transform(a || g, f)
+CREATE MACRO mr_db.main.doubled_in(xs, f) AS list_transform(xs || xs, f)
 
-statement error
-SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(partly_typed(1, A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+statement ok
+CREATE MACRO memory.main.doubled_here(xs, f) AS list_transform(xs || xs, f)
+
+statement ok
+CREATE TEMP MACRO doubled_temp(xs, f) AS list_transform(xs || xs, f)
+
+query III
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'x': 1}], A -> A.x) AS a, memory.doubled_here([{'x': 1}], A -> A.x) AS b, temp.doubled_temp([{'x': 1}], A -> A.x) AS c PATTERN (A B) DEFINE B AS true);
 ----
-chooses its overload by argument type
+[1, 1]	[1, 1]	[1, 1]
+[1, 1]	[1, 1]	[1, 1]
+
+query I
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform([[{'x': 1}]], lambda v: v.map_one(A -> A.x)) AS m PATTERN (A B) DEFINE B AS true);
+----
+[[1]]
+[[1]]
 
 statement ok
 RESET lambda_syntax
@@ -320,6 +366,71 @@ statement error
 SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(again_a(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
 ----
 Max expression depth limit
+
+statement ok
+CREATE MACRO first_of(a) AS a, (a INTEGER, b INTEGER) AS a + b
+
+query I
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(first_of(A -> A.pos)) AS m PATTERN (A) DEFINE A AS true);
+----
+10
+
+statement ok
+CREATE MACRO json_after(a INTEGER, f) AS f, (a, f, g) AS f
+
+query I
+SELECT * FROM (SELECT 1 AS i, '{"a": 5}'::JSON AS j) MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(json_after(1, j -> '$.a')) AS m PATTERN (A) DEFINE A AS true);
+----
+5
+
+statement ok
+CREATE MACRO as_int(f) RETURNS INTEGER AS f
+
+query II
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(as_int(A -> A.pos)) / 4 AS m, typeof(FIRST(as_int(A -> A.pos))) AS t PATTERN (A) DEFINE A AS true);
+----
+2.5	INTEGER
+
+statement ok
+CREATE MACRO as_small(f) RETURNS SMALLINT AS f::INTEGER * 100000
+
+statement error
+SELECT * FROM jp MATCH_RECOGNIZE (ORDER BY i MEASURES count(*) AS c PATTERN (A) DEFINE A AS as_small(A -> A.pos) > 0);
+----
+out of range
+
+statement ok
+CREATE MACRO bump(v) AS v::INTEGER + 1
+
+statement ok
+PREPARE bumped AS SELECT * FROM (SELECT 1 AS i, '10'::JSON AS j) MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(bump(j -> '$')) AS m PATTERN (A) DEFINE A AS true);
+
+query I
+EXECUTE bumped
+----
+11
+
+statement ok
+CREATE OR REPLACE MACRO bump(v) AS v::INTEGER + 100
+
+query I
+EXECUTE bumped
+----
+110
+
+statement error
+SELECT * FROM t4 MATCH_RECOGNIZE (ORDER BY i MEASURES mr_db.doubled_in([{'pos': 1}], A -> A.pos) AS m PATTERN (A B) DEFINE B AS true);
+----
+Deprecated lambda arrow (->) detected
+
+# a step over a method call on a lambda parameter reads the parameter, which the step cannot
+statement ok
+CREATE TABLE u AS SELECT * FROM (VALUES (1, 'W1'), (2, 'W2'), (3, 'W3'), (4, 'W4')) v(i, w);
+
+statement error
+SELECT * FROM u MATCH_RECOGNIZE (ORDER BY i MEASURES list_transform(['Q'], lambda z: PREV(z.lower())) AS m PATTERN (A B+) DEFINE B AS true);
+----
+window functions cannot reference lambda parameters
 
 # Under the default setting the binder still binds an arrow in a lambda slot as a lambda, and then refuses it
 statement error

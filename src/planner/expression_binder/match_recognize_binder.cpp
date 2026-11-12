@@ -243,6 +243,10 @@ bool MatchRecognizeIsMethodCall(Binder &binder, const FunctionExpression &call) 
 MatchRecognizeArrowScope::MatchRecognizeArrowScope(Binder &binder_p) : binder(binder_p) {
 }
 
+bool MatchRecognizeArrowScope::IsMethodCall(const FunctionExpression &call) const {
+	return MatchRecognizeIsMethodCall(binder, call);
+}
+
 bool MatchRecognizeArrowScope::IsLambda(const FunctionExpression &call, const ParsedExpression &argument,
                                         identifier_set_t &parameters) const {
 	if (argument.GetExpressionClass() != ExpressionClass::LAMBDA ||

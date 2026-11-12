@@ -95,6 +95,8 @@ public:
 
 	//! Whether this argument of the call binds as a lambda, and the names it binds if so
 	bool IsLambda(const FunctionExpression &call, const ParsedExpression &argument, identifier_set_t &parameters) const;
+	//! Whether the binder reads the call as a method call on the names in front of its name
+	bool IsMethodCall(const FunctionExpression &call) const;
 
 private:
 	Binder &binder;

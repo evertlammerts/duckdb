@@ -32,6 +32,12 @@ statement ok
 CREATE VIEW s15.v5 AS SELECT * FROM s15.t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1]) AS s PATTERN (A+) DEFINE A AS true)
 
 statement ok
+CREATE VIEW s15.v6 AS SELECT * FROM s15.t4 MATCH_RECOGNIZE (ORDER BY i MEASURES s15.map_both([{'x': 1}], [{'x': 2}], A -> A.x) AS m PATTERN (A B) DEFINE B AS true)
+
+statement ok
+CREATE VIEW s15.v7 AS SELECT * FROM s15.t4 MATCH_RECOGNIZE (ORDER BY i MEASURES sum(s15.map_both([{'x': 1}], [{'x': 2}], A -> A.x)[1]) AS s PATTERN (A+) DEFINE A AS true)
+
+statement ok
 DETACH s15
 
 foreach setting DEFAULT ENABLE_SINGLE_ARROW DISABLE_SINGLE_ARROW
@@ -67,6 +73,17 @@ SELECT c FROM s15.v4
 
 query I
 SELECT s FROM s15.v5
+----
+4
+
+query I
+SELECT m FROM s15.v6
+----
+[1, 2]
+[1, 2]
+
+query I
+SELECT s FROM s15.v7
 ----
 4
 

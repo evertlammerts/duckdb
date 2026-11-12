@@ -205,6 +205,13 @@ MacroFunction &ExpressionBinder::UnfoldMacroExpression(FunctionExpression &funct
 	return macro_def;
 }
 
+void ExpressionBinder::RegisterMacroRead(CatalogEntry &macro) {
+	// a prepared statement must be re-bound when the macro changes
+	if (!macro.ParentCatalog().IsSystemCatalog()) {
+		binder.GetStatementProperties().RegisterDBRead(macro.ParentCatalog(), context);
+	}
+}
+
 BindResult ExpressionBinder::BindMacro(FunctionExpression &function, ScalarMacroCatalogEntry &macro_func, idx_t depth,
                                        unique_ptr<ParsedExpression> &expr) {
 	auto stack_checker = StackCheck(*expr, 3);

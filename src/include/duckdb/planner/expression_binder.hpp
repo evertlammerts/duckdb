@@ -362,6 +362,8 @@ protected:
 	void UnfoldWindowMacroExpression(unique_ptr<ParsedExpression> &expr, ScalarMacroFunction &macro_def);
 	MacroFunction &UnfoldMacroExpression(FunctionExpression &function, ScalarMacroCatalogEntry &macro_func,
 	                                     unique_ptr<ParsedExpression> &expr, idx_t depth);
+	//! Records the read of a macro's catalog, so that a prepared statement is rebound when the macro changes
+	void RegisterMacroRead(CatalogEntry &macro);
 
 	virtual string UnsupportedAggregateMessage();
 	virtual string UnsupportedWindowMessage();

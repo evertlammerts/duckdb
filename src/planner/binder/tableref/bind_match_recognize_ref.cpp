@@ -108,12 +108,50 @@ public:
 	explicit MatchRecognizeMacroExpander(Binder &binder) : ExpressionBinder(binder, binder.context) {
 	}
 
+	//! The body replaces the call, which BindMacro would bind and then cast to the declared return type
 	void Expand(FunctionExpression &call, ScalarMacroCatalogEntry &macro, unique_ptr<ParsedExpression> &expr) {
+		RegisterMacroRead(macro);
 		auto saved_lambda_bindings = binder.lambda_bindings;
-		UnfoldMacroExpression(call, macro, expr, 0);
+		try {
+			auto &member = UnfoldMacroExpression(call, macro, expr, 0);
+			if (member.return_type.id() != LogicalTypeId::UNKNOWN) {
+				expr = make_uniq<CastExpression>(member.return_type, std::move(expr));
+			}
+		} catch (...) {
+			binder.lambda_bindings = saved_lambda_bindings;
+			throw;
+		}
 		binder.lambda_bindings = saved_lambda_bindings;
 	}
 };
+
+//! Whether a macro member takes these arguments by their count and names, before any type is looked at; a method
+//! call's receiver is one more positional argument
+static bool MacroTakesArguments(const MacroFunction &member, const FunctionExpression &call, bool method_call) {
+	idx_t positional = method_call ? 1 : 0;
+	identifier_set_t named;
+	for (auto &argument : call.GetArguments()) {
+		if (argument.HasName()) {
+			named.insert(argument.GetName());
+		} else {
+			positional++;
+		}
+	}
+	auto &parameters = member.parameters;
+	if (positional + named.size() > parameters.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < parameters.size(); i++) {
+		auto &name = parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
+		const auto is_named = named.find(name) != named.end();
+		if (i < positional ? is_named
+		                   : !is_named && member.default_parameters.find(name) == member.default_parameters.end()) {
+			return false;
+		}
+		named.erase(name);
+	}
+	return named.empty();
+}
 
 //! A reference into the input only resolves where the input still is one, and every clause here is
 //! evaluated above a subquery of it - so it is computed down there verbatim and read back under a name
@@ -170,28 +208,29 @@ struct HoistedInputRefs {
 		}
 		FunctionExpression probe(call.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
 		auto entry = ColumnQualifier(binder).QualifyFunction(probe);
-		// a method call left to the binder has its receiver outside the arguments the expansion would read
-		if (!entry || entry->type != CatalogType::MACRO_ENTRY ||
-		    probe.GetQualifiedName().Path().size() != call.GetQualifiedName().Path().size()) {
+		if (!entry || entry->type != CatalogType::MACRO_ENTRY) {
 			return false;
 		}
-		// A body with a typed parameter is bound when the macro is created, so it cannot pass a parameter on to a
-		// lambda slot, and the arrow stays the JSON operator there. Where only some overloads are typed, which body
-		// the binder expands depends on argument types that are known only once bound.
+		// The binder chooses the member by argument count and names first, and by argument types only among the
+		// members left, which is known only once the arguments are bound.
+		const auto method_call =
+		    call.GetQualifiedName().Path().size() >= 2 && probe.GetQualifiedName().Path().size() == 1;
 		auto &macro = entry->Cast<ScalarMacroCatalogEntry>();
-		idx_t typed_overloads = 0;
-		for (auto &overload : macro.macros) {
-			for (auto &type : overload->types) {
-				if (type.id() != LogicalTypeId::UNKNOWN) {
-					typed_overloads++;
-					break;
-				}
+		idx_t members = 0;
+		bool typed = false;
+		for (auto &member : macro.macros) {
+			if (!MacroTakesArguments(*member, call, method_call)) {
+				continue;
+			}
+			members++;
+			for (auto &type : member->types) {
+				typed = typed || type.id() != LogicalTypeId::UNKNOWN;
 			}
 		}
-		if (typed_overloads == macro.macros.size()) {
+		if (members == 0) {
 			return false;
 		}
-		if (typed_overloads > 0) {
+		if (members > 1 && typed) {
 			throw BinderException(call,
 			                      "MATCH_RECOGNIZE cannot pass an arrow lambda to %s(), which chooses its overload by "
 			                      "argument type: write the lambda with the lambda keyword",
@@ -206,6 +245,12 @@ struct HoistedInputRefs {
 		binder.context.InterruptCheck();
 		// the call may be a whole measure or condition, whose alias names it
 		auto alias = expr->GetAlias();
+		if (method_call) {
+			// a macro called as a method is the plain call on its receiver, as the binder rewrites it
+			auto receiver = ColumnQualifier::CreateDotCallReceiver(call.GetQualifiedName());
+			receiver->SetQueryLocation(call.GetQueryLocation());
+			ColumnQualifier::MakePlainCall(call, std::move(receiver));
+		}
 		MatchRecognizeMacroExpander(binder).Expand(call, macro, expr);
 		expr->SetAlias(std::move(alias));
 		return true;
@@ -342,6 +387,15 @@ static optional_ptr<const ParsedExpression> FindEnclosingLambdaParameter(const P
 		return bound_outside ? &expr : nullptr;
 	}
 	const auto call = expr.GetExpressionClass() == ExpressionClass::FUNCTION;
+	if (call) {
+		// a method call keeps its receiver in its name until the binder reads it
+		auto &function = expr.Cast<FunctionExpression>();
+		auto &name = function.GetQualifiedName().Path()[0];
+		if (!LambdaExpression::IsLambdaParameter(inner, name) && LambdaExpression::IsLambdaParameter(enclosing, name) &&
+		    arrows.IsMethodCall(function)) {
+			return &expr;
+		}
+	}
 	optional_ptr<const ParsedExpression> found;
 	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
 		if (found) {
