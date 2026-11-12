@@ -251,7 +251,7 @@ struct GlobalBinderState {
 };
 
 //! Registers a generated DML node in GlobalBinderState::trigger_generated_returning while it binds, and removes it
-//! however the bind ends, because the node is destroyed after
+//! however the bind ends, because the registered node is destroyed after its bind.
 class TriggerGeneratedReturningScope {
 public:
 	TriggerGeneratedReturningScope(GlobalBinderState &state, QueryNode &node) : state(state), node(node) {
