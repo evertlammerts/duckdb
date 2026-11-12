@@ -3,6 +3,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "json_deserializer.hpp"
@@ -335,21 +336,27 @@ struct ExecuteSqlTableFunction {
 
 		auto &inner_context = *result->con->context;
 		inner_context.RunFunctionInTransaction([&]() {
+			auto bind_columns = [&](Binder &binder) {
+				unique_ptr<SQLStatement> statement = make_uniq<SelectStatement>();
+				statement->Cast<SelectStatement>().node = result->node->Copy();
+				// the statement is rewritten as it will be when it runs, so the columns bound here are the ones it
+				// returns
+				Optimizer(binder, inner_context).OptimizeStatement(statement);
+				auto bound = binder.Bind(*statement);
+				result->names = std::move(bound.names);
+				result->types = std::move(bound.types);
+			};
 			auto binder = Binder::CreateBinder(inner_context);
 			binder->SetBindingMode(BindingMode::EXTRACT_REPLACEMENT_SCANS);
-			unique_ptr<SQLStatement> statement = make_uniq<SelectStatement>();
-			statement->Cast<SelectStatement>().node = result->node->Copy();
-			// the statement is rewritten as it will be when it runs, so the columns bound here are the ones it returns
-			Optimizer(*binder, inner_context).OptimizeStatement(statement);
-			auto bound = binder->Bind(*statement);
-			result->names = std::move(bound.names);
-			result->types = std::move(bound.types);
+			bind_columns(*binder);
 			// An object a replacement scan found outside the catalog is pinned as a CTE, so every execution reads the
 			// object this bind found
+			bool pinned_any = false;
 			for (auto &replacement : binder->GetReplacementScans()) {
 				if (!replacement.second->external_dependency) {
 					continue;
 				}
+				pinned_any = true;
 				auto pinned = make_uniq<SelectNode>();
 				pinned->select_list.push_back(make_uniq<StarExpression>());
 				pinned->from_table = std::move(replacement.second);
@@ -363,6 +370,11 @@ struct ExecuteSqlTableFunction {
 				outer->from_table = make_uniq<SubqueryRef>(std::move(inner), "query_relation");
 				outer->cte_map.map[replacement.first] = std::move(cte_info);
 				result->node = std::move(outer);
+			}
+			// the remote rewrite can push a pinned object down with the rest of the statement, where its unresolved
+			// name kept the statement local, so the columns come from the statement that runs
+			if (pinned_any && DatabaseManager::Get(inner_context).GetRemoteCatalogCount() > 0) {
+				bind_columns(*Binder::CreateBinder(inner_context));
 			}
 		});
 		return_types = result->types;

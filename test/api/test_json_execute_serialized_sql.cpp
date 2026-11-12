@@ -259,6 +259,7 @@ TEST_CASE("json_execute_serialized_sql runs its statement as any SELECT when a r
 	if (!db.ExtensionIsLoaded("json")) {
 		return;
 	}
+	DBConfig::GetConfig(*db.instance).replacement_scans.emplace_back(ReplaceWithOutsideObject);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(i INTEGER)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO t VALUES (1)"));
@@ -298,5 +299,12 @@ TEST_CASE("json_execute_serialized_sql runs its statement as any SELECT when a r
 		REQUIRE(CHECK_COLUMN(result, 0, {4}));
 		REQUIRE(result->GetNames() == direct->GetNames());
 		REQUIRE(json_pushed_nodes.empty());
+	}
+	SECTION("an object pinned from a replacement scan joined with a remote table is bound as the statement that runs") {
+		replacement_calls = 0;
+		auto result = con.Query("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT answer, i FROM "
+		                        "outside_object, s.tbl'))");
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(replacement_calls == 1);
 	}
 }

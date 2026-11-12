@@ -42,7 +42,7 @@ SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT * FROM (VAL
 ----
 Conversion Error: Could not convert string 'abc' to INT32
 
-# an error raised while the statement runs points into the statement's own text
+# an error raised while the statement runs points into the statement's own text; only the text is pinned, not the caret
 statement error
 SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1, s::INTEGER FROM t'));
 ----
