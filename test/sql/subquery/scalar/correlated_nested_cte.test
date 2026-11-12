@@ -1,0 +1,86 @@
+# name: test/sql/subquery/scalar/correlated_nested_cte.test
+# description: A correlated subquery whose CTE definition holds a nested WITH that reads the outer row gives the rows of the same query without the CTEs
+# group: [scalar]
+
+statement ok
+CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3), (NULL)) v(x)
+
+# scalar subquery, beside the same query without CTEs
+query II
+SELECT x, (WITH o AS (WITH y AS (SELECT t.x AS v) SELECT v FROM y) SELECT sum(v) FROM o) FROM t ORDER BY ALL
+----
+1	1
+2	2
+3	3
+NULL	NULL
+
+query II
+SELECT x, (SELECT sum(v) FROM (SELECT t.x AS v)) FROM t ORDER BY ALL
+----
+1	1
+2	2
+3	3
+NULL	NULL
+
+query II
+SELECT x, (WITH o AS MATERIALIZED (WITH y AS MATERIALIZED (SELECT t.x AS v) SELECT v FROM y) SELECT sum(v) + t.x FROM o) FROM t ORDER BY ALL
+----
+1	2
+2	4
+3	6
+NULL	NULL
+
+query II
+SELECT x, (WITH o AS (WITH y AS (SELECT t.x AS v) SELECT v + 1 AS v FROM y WHERE v > 0) SELECT sum(v) FROM o) FROM t ORDER BY ALL
+----
+1	2
+2	3
+3	4
+NULL	NULL
+
+query II
+SELECT x, (SELECT sum(v) FROM (SELECT v + 1 AS v FROM (SELECT t.x AS v) WHERE v > 0)) FROM t ORDER BY ALL
+----
+1	2
+2	3
+3	4
+NULL	NULL
+
+# LATERAL
+query II
+SELECT x, y FROM t, LATERAL (WITH o AS (WITH y AS (SELECT t.x AS v) SELECT v FROM y) SELECT v AS y FROM o) ORDER BY ALL
+----
+1	1
+2	2
+3	3
+NULL	NULL
+
+query II
+SELECT x, y FROM t, LATERAL (SELECT v AS y FROM (SELECT t.x AS v)) ORDER BY ALL
+----
+1	1
+2	2
+3	3
+NULL	NULL
+
+# EXISTS
+query I
+SELECT x FROM t WHERE EXISTS (WITH o AS (WITH y AS (SELECT t.x AS v) SELECT v FROM y) SELECT v FROM o WHERE v >= 2) ORDER BY ALL
+----
+2
+3
+
+query I
+SELECT x FROM t WHERE EXISTS (SELECT v FROM (SELECT t.x AS v) WHERE v >= 2) ORDER BY ALL
+----
+2
+3
+
+# a nested WITH whose correlated CTE is not read
+query II
+SELECT x, (WITH o AS (WITH y AS (SELECT t.x AS v) SELECT 7 AS v) SELECT sum(v) FROM o) FROM t ORDER BY ALL
+----
+1	7
+2	7
+3	7
+NULL	7

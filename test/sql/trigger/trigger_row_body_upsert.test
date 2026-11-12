@@ -329,3 +329,19 @@ SELECT * FROM s ORDER BY ALL;
 108
 110
 111
+
+# the same upsert written with its own WITH clause runs once per firing statement as well
+statement ok
+CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s FOR EACH STATEMENT
+    WITH x AS (SELECT 2 AS id, (random() * 0)::INTEGER AS z) INSERT INTO a SELECT id, z FROM x ON CONFLICT DO UPDATE SET n = n + 1;
+
+statement ok
+INSERT INTO b VALUES (12), (13);
+
+query II
+SELECT * FROM a ORDER BY id;
+----
+2	13
+106	2
+107	0
+108	0

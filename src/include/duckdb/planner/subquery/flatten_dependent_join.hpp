@@ -10,6 +10,7 @@
 
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
@@ -74,7 +75,8 @@ private:
 	SubtreeAccess GetOperatorAccess(LogicalOperator &op) const;
 	//! Checks whether a subtree outputs the same rows for every row of the active domain: each of its references to
 	//! the domain feeds the input of a write whose returned rows it outputs, and those rows carry no domain key.
-	bool ReturnsUncorrelatedRows(LogicalOperator &op) const;
+	//! correlated_ctes holds the indexes of the CTEs nested in op whose definitions need the domain.
+	bool ReturnsUncorrelatedRows(LogicalOperator &op, const unordered_set<TableIndex> &correlated_ctes = {}) const;
 	idx_t GetDelimKeyIndex(idx_t index) const;
 
 	//! propagate_null_values: everything above cannot distinguish one row with all-NULL original columns from

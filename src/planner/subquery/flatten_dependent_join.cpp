@@ -108,6 +108,36 @@ static bool IsWrite(LogicalOperatorType type) {
 	}
 }
 
+// A write together with its own WITH clause and RETURNING list.
+static bool IsWriteStatement(const LogicalOperator &op) {
+	if (IsWrite(op.type)) {
+		return true;
+	}
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return IsWriteStatement(*op.children[0]);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return IsWriteStatement(*op.children[1]);
+	default:
+		return false;
+	}
+}
+
+static bool ReadsCTEOutsideWrites(const LogicalOperator &op, const unordered_set<TableIndex> &cte_indexes) {
+	if (cte_indexes.empty() || IsWrite(op.type)) {
+		return false;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		return cte_indexes.find(op.Cast<LogicalCTERef>().cte_index) != cte_indexes.end();
+	}
+	for (auto &child : op.children) {
+		if (ReadsCTEOutsideWrites(*child, cte_indexes)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetOperatorAccess(LogicalOperator &op) const {
 	SubtreeAccess result;
 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
@@ -158,16 +188,19 @@ FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetSubtreeAccess(Log
 	for (auto &child : op.children) {
 		result.Merge(GetSubtreeAccess(*child));
 	}
-	if (IsWrite(op.type)) {
-		// A write that reads no outer row runs once for the statement, so a volatile input does not tie it to one.
+	if (IsWriteStatement(op)) {
+		// A write statement that reads no outer row runs once, so a volatile part of it does not tie it to one.
 		result.volatile_expression = false;
 	}
 	access_cache.emplace(op, result);
 	return result;
 }
 
-bool FlattenDependentJoins::ReturnsUncorrelatedRows(LogicalOperator &op) const {
-	if (!RequiresDomain(op)) {
+bool FlattenDependentJoins::ReturnsUncorrelatedRows(LogicalOperator &op,
+                                                    const unordered_set<TableIndex> &correlated_ctes) const {
+	// The readers of a CTE nested in op are patched only when its definition is pushed down, so until then a read of
+	// a CTE whose definition needs the domain is found by its index.
+	if (!RequiresDomain(op) && !ReadsCTEOutsideWrites(op, correlated_ctes)) {
 		return true;
 	}
 	auto access = GetOperatorAccess(op);
@@ -180,9 +213,15 @@ bool FlattenDependentJoins::ReturnsUncorrelatedRows(LogicalOperator &op) const {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_FILTER:
-		return ReturnsUncorrelatedRows(*op.children[0]);
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-		return ReturnsUncorrelatedRows(*op.children[1]);
+		return ReturnsUncorrelatedRows(*op.children[0], correlated_ctes);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+		if (ReturnsUncorrelatedRows(*op.children[0], correlated_ctes)) {
+			return ReturnsUncorrelatedRows(*op.children[1], correlated_ctes);
+		}
+		auto consumer_correlated_ctes = correlated_ctes;
+		consumer_correlated_ctes.insert(op.Cast<LogicalMaterializedCTE>().table_index);
+		return ReturnsUncorrelatedRows(*op.children[1], consumer_correlated_ctes);
+	}
 	default:
 		return false;
 	}
@@ -1529,7 +1568,8 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownDMLInput(un
                                                                               bool propagate_null_values,
                                                                               vector<ColumnBinding> state) {
 	if (plan->type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
-		// Only row trigger firings reach here, and one batched MERGE cannot see the rows other firings write.
+		// A MERGE that reads the firing rows of a FOR EACH ROW trigger would run once per firing row, and its conflict
+		// check would not see the rows the other firings write; CREATE TRIGGER already refuses such row bodies.
 		throw NotImplementedException(
 		    "MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger");
 	}
@@ -1652,7 +1692,10 @@ BindingReplacementGraph FlattenDependentJoins::PushDownWriteInput(unique_ptr<Log
 		return replacements;
 	}
 	default:
-		D_ASSERT(IsWrite(plan->type));
+		if (!IsWrite(plan->type)) {
+			throw InternalException("Flatten dependent joins - %s in a subtree that returns uncorrelated rows",
+			                        LogicalOperatorToString(plan->type));
+		}
 		return PushDownDMLInput(plan, false, std::move(state)).replacement_graph;
 	}
 }

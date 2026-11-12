@@ -36,15 +36,22 @@ SELECT id FROM s ORDER BY ALL
 101
 102
 
-# No write's returned rows are crossed with the firing rows
+# No write's returned rows reach a cross product with the firing rows, through projections or filters alone, in the
+# plan the flattener leaves
 
 statement ok
 SET explain_output='optimized_only'
 
+statement ok
+PRAGMA disable_optimizer
+
 query II
 EXPLAIN (FORMAT JSON) INSERT INTO r VALUES (1), (2)
 ----
-logical_opt	<!REGEX>:.*"name": "CROSS_PRODUCT",\s*"children": \[\s*\{\s*"name": "INSERT".*
+logical_opt	<!REGEX>:.*"name": "CROSS_PRODUCT",\s*"children": \[\s*(\{\s*"name": "(PROJECTION|FILTER)",\s*"children": \[\s*)*\{\s*"name": "(INSERT|DELETE|UPDATE|MERGE_INTO)".*
+
+statement ok
+PRAGMA enable_optimizer
 
 statement ok
 RESET explain_output
@@ -209,6 +216,23 @@ SELECT id FROM s ORDER BY ALL
 401
 402
 
+statement ok
+SET explain_output='optimized_only'
+
+statement ok
+PRAGMA disable_optimizer
+
+query II
+EXPLAIN (FORMAT JSON) INSERT INTO r VALUES (1), (2)
+----
+logical_opt	<!REGEX>:.*"name": "CROSS_PRODUCT",\s*"children": \[\s*(\{\s*"name": "(PROJECTION|FILTER)",\s*"children": \[\s*)*\{\s*"name": "(INSERT|DELETE|UPDATE|MERGE_INTO)".*
+
+statement ok
+PRAGMA enable_optimizer
+
+statement ok
+RESET explain_output
+
 # BEFORE statement triggers on the written table fire once and see the table before the bodies write, volatile ones too
 
 statement ok
@@ -239,11 +263,18 @@ statement ok
 CREATE TRIGGER b2 BEFORE INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'bseq', nextval('bseq')
 
 statement ok
+CREATE SEQUENCE bcteseq
+
+statement ok
+CREATE TRIGGER b3 BEFORE INSERT ON s FOR EACH STATEMENT WITH x AS MATERIALIZED (SELECT nextval('bcteseq') AS v) INSERT INTO out SELECT 'bcte', v FROM x
+
+statement ok
 INSERT INTO r VALUES (1), (2)
 
 query TI
 SELECT * FROM out ORDER BY ALL
 ----
+bcte	1
 before	0
 bseq	1
 rnd	0
@@ -264,6 +295,9 @@ DROP TRIGGER b1 ON s
 
 statement ok
 DROP TRIGGER b2 ON s
+
+statement ok
+DROP TRIGGER b3 ON s
 
 # An AFTER statement trigger without a transition table fires once too
 
@@ -305,6 +339,12 @@ statement ok
 CREATE TRIGGER s7 AFTER INSERT ON s FOR EACH STATEMENT INSERT INTO out SELECT 'rnd', (random() * 0)::INTEGER
 
 statement ok
+CREATE SEQUENCE cteseq
+
+statement ok
+CREATE TRIGGER s8 AFTER INSERT ON s FOR EACH STATEMENT WITH x AS MATERIALIZED (SELECT nextval('cteseq') AS v) INSERT INTO out SELECT 'cte', v FROM x
+
+statement ok
 DELETE FROM out
 
 statement ok
@@ -317,8 +357,9 @@ statement ok
 INSERT INTO r VALUES (1), (2)
 
 query TI
-SELECT * FROM out WHERE k = 'rnd'
+SELECT * FROM out WHERE k IN ('rnd', 'cte') ORDER BY ALL
 ----
+cte	1
 rnd	0
 
 query IIII
@@ -337,6 +378,65 @@ DROP TRIGGER s6 ON s
 
 statement ok
 DROP TRIGGER s7 ON s
+
+statement ok
+DROP TRIGGER s8 ON s
+
+# A volatile row body still runs once per firing row, equal firing rows included
+
+statement ok
+DELETE FROM out
+
+statement ok
+DELETE FROM s
+
+statement ok
+DELETE FROM r
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+CREATE SEQUENCE rseq
+
+statement ok
+CREATE TABLE rv(v DOUBLE)
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id * 0 + nextval('rseq')
+
+statement ok
+CREATE TRIGGER r9 AFTER INSERT ON r FOR EACH ROW INSERT INTO rv SELECT NEW.id * 0 + random()
+
+statement ok
+INSERT INTO r VALUES (7), (7), (7)
+
+query I
+SELECT id FROM s ORDER BY ALL
+----
+1
+2
+3
+
+statement ok
+DELETE FROM rv
+
+statement ok
+INSERT INTO r SELECT 7 FROM range(200)
+
+query II
+SELECT count(*), count(DISTINCT v) > 150 FROM rv
+----
+200	true
+
+statement ok
+DROP TRIGGER r9 ON r
+
+statement ok
+DROP TRIGGER r1 ON r
+
+statement ok
+CREATE TRIGGER r1 AFTER INSERT ON r FOR EACH ROW INSERT INTO s SELECT NEW.id + 100
 
 # Two row triggers on the firing table, both writing s: each body's statement fires s's triggers over its own rows
 
@@ -512,6 +612,23 @@ query I
 SELECT id FROM s ORDER BY ALL
 ----
 103
+
+statement ok
+SET explain_output='optimized_only'
+
+statement ok
+PRAGMA disable_optimizer
+
+query II
+EXPLAIN (FORMAT JSON) INSERT INTO r VALUES (1), (2)
+----
+logical_opt	<!REGEX>:.*"name": "CROSS_PRODUCT",\s*"children": \[\s*(\{\s*"name": "(PROJECTION|FILTER)",\s*"children": \[\s*)*\{\s*"name": "(INSERT|DELETE|UPDATE|MERGE_INTO)".*
+
+statement ok
+PRAGMA enable_optimizer
+
+statement ok
+RESET explain_output
 
 statement ok
 DROP TRIGGER r4 ON r
