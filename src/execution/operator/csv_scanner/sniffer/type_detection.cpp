@@ -492,7 +492,8 @@ bool CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const
 	if (!format_candidate.initialized || !format_candidate.format.empty()) {
 		return true;
 	}
-	// The plain cast reads the column only if it reads every value detection samples and no template reads any of them
+	// The plain cast reads the column only if it reads every value detection samples and no template whose reading can
+	// differ from the cast's (one that starts with a day, a month or a two digit year) reads any of them
 	if (!plain_cast_before) {
 		for (idx_t earlier_row = first_row; earlier_row < row_idx; earlier_row++) {
 			const auto earlier_value = values[earlier_row];
