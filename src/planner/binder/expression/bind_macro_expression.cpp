@@ -319,6 +319,110 @@ static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name
 	return found;
 }
 
+static bool HasTable(TableRef &ref) {
+	if (ref.type == TableReferenceType::JOIN) {
+		auto &join = ref.Cast<JoinRef>();
+		return HasTable(*join.left) || HasTable(*join.right);
+	}
+	// a VALUES list binds its expressions in the scope around it
+	return ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::EXPRESSION_LIST;
+}
+
+using folded_expression_callback_t =
+    std::function<void(unique_ptr<ParsedExpression> &expr, const identifier_set_t &names, bool table_in_scope)>;
+
+static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, bool outer_in_scope, bool in_scope,
+                               const folded_expression_callback_t &callback);
+
+// Hands each expression of a folded subquery the names that may still read the lambda's parameter there.
+static void EnumerateFoldedNode(QueryNode &node, const identifier_set_t &names, bool table_in_scope,
+                                const folded_expression_callback_t &callback) {
+	static const identifier_set_t none;
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		auto in_scope = table_in_scope || (select.from_table && HasTable(*select.from_table));
+		identifier_set_t clause_names;
+		for (auto &name : names) {
+			bool aliased = false;
+			for (auto &item : select.select_list) {
+				aliased = aliased || item->GetAlias() == name;
+			}
+			if (!aliased) {
+				clause_names.insert(name);
+			}
+		}
+		auto &select_names = in_scope ? none : names;
+		auto &level_clause_names = in_scope ? none : clause_names;
+		for (auto &expr : select.select_list) {
+			callback(expr, select_names, in_scope);
+		}
+		for (auto &expr : select.groups.group_expressions) {
+			callback(expr, level_clause_names, in_scope);
+		}
+		for (auto clause : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*clause) {
+				callback(*clause, level_clause_names, in_scope);
+			}
+		}
+		if (select.from_table) {
+			EnumerateFoldedRef(*select.from_table, names, table_in_scope, in_scope, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+		    node, [&](unique_ptr<ParsedExpression> &child) { callback(child, level_clause_names, in_scope); });
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE:
+		for (auto &child : node.Cast<SetOperationNode>().children) {
+			EnumerateFoldedNode(*child, names, table_in_scope, callback);
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
+			callback(child, table_in_scope ? none : names, table_in_scope);
+		});
+		break;
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &cte = node.Cast<RecursiveCTENode>();
+		EnumerateFoldedNode(*cte.left, names, table_in_scope, callback);
+		EnumerateFoldedNode(*cte.right, names, table_in_scope, callback);
+		break;
+	}
+	default:
+		return;
+	}
+	for (auto &entry : node.cte_map.map) {
+		if (entry.second->query_node) {
+			EnumerateFoldedNode(*entry.second->query_node, names, table_in_scope, callback);
+		}
+	}
+}
+
+static void EnumerateFoldedRef(TableRef &ref, const identifier_set_t &names, bool outer_in_scope, bool in_scope,
+                               const folded_expression_callback_t &callback) {
+	static const identifier_set_t none;
+	switch (ref.type) {
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		EnumerateFoldedRef(*join.left, names, outer_in_scope, in_scope, callback);
+		EnumerateFoldedRef(*join.right, names, outer_in_scope, in_scope, callback);
+		if (join.condition) {
+			callback(join.condition, in_scope ? none : names, in_scope);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY:
+		EnumerateFoldedNode(*ref.Cast<SubqueryRef>().subquery->node, names, outer_in_scope, callback);
+		break;
+	case TableReferenceType::EXPRESSION_LIST:
+	case TableReferenceType::TABLE_FUNCTION:
+		ParsedExpressionIterator::EnumerateTableRefChildren(ref, [&](unique_ptr<ParsedExpression> &child) {
+			callback(child, outer_in_scope ? none : names, outer_in_scope);
+		});
+		break;
+	default:
+		break;
+	}
+}
+
 namespace {
 
 struct LambdaScope {
@@ -365,7 +469,8 @@ public:
 				auto &qualified_name = function.GetQualifiedName();
 				CaptureByCallerScope(ColumnRefExpression(qualified_name.Schema(), qualified_name.Catalog()));
 			}
-			if (body_is_qualified && FoldsArguments(function)) {
+			vector<bool> folded;
+			if (body_is_qualified && FoldedArguments(function, folded)) {
 				caller_scope_folding++;
 				ParsedExpressionIterator::EnumerateChildren(
 				    *expr, [&](unique_ptr<ParsedExpression> &child) { Rename(child); });
@@ -390,11 +495,15 @@ public:
 		case ExpressionClass::SUBQUERY: {
 			// the dummy qualification does not enter a subquery, so its references stay as written
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
-			if (body_is_qualified && caller_scope_folding > 0 && !DeclaresTable(*sq->node)) {
+			if (body_is_qualified && caller_scope_folding > 0) {
+				identifier_set_t names;
+				for (auto &scope : scopes) {
+					for (auto &parameter : scope.parameters) {
+						names.insert(parameter.get().GetColumnName());
+					}
+				}
 				vector<identifier_set_t> inner_parameters;
-				ParsedExpressionIterator::EnumerateQueryNodeChildren(
-				    *sq->node,
-				    [&](unique_ptr<ParsedExpression> &child) { ProbeFoldedSubquery(*child, inner_parameters); });
+				ProbeFoldedNode(*sq->node, names, false, inner_parameters);
 			}
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
@@ -464,12 +573,22 @@ private:
 		}
 	}
 
-	// A subquery that a folding function takes without a table binds in the lambda's scope, as the lambda's top does.
-	void ProbeFoldedSubquery(ParsedExpression &expr, vector<identifier_set_t> &inner_parameters) {
+	// A folded subquery binds in the lambda's scope wherever no table is in scope, as the lambda's top does.
+	void ProbeFoldedNode(QueryNode &node, const identifier_set_t &names, bool table_in_scope,
+	                     vector<identifier_set_t> &inner_parameters) {
+		EnumerateFoldedNode(node, names, table_in_scope,
+		                    [&](unique_ptr<ParsedExpression> &expr, const identifier_set_t &expr_names, bool in_scope) {
+			                    ProbeFoldedSubquery(*expr, expr_names, in_scope, inner_parameters);
+		                    });
+	}
+
+	void ProbeFoldedSubquery(ParsedExpression &expr, const identifier_set_t &names, bool table_in_scope,
+	                         vector<identifier_set_t> &inner_parameters) {
 		switch (expr.GetExpressionClass()) {
 		case ExpressionClass::COLUMN_REF: {
 			auto &column_ref = expr.Cast<ColumnRefExpression>();
-			if (!LambdaExpression::IsLambdaParameter(inner_parameters, column_ref.ColumnNames()[0])) {
+			auto &leading_name = column_ref.ColumnNames()[0];
+			if (names.count(leading_name) && !LambdaExpression::IsLambdaParameter(inner_parameters, leading_name)) {
 				CaptureByCallerScope(column_ref);
 			}
 			return;
@@ -484,20 +603,19 @@ private:
 			for (auto &parameter : parameters) {
 				inner_parameters.back().insert(parameter.get().GetColumnName());
 			}
-			ProbeFoldedSubquery(*lambda_expr.RightMutable(), inner_parameters);
+			ProbeFoldedSubquery(*lambda_expr.RightMutable(), names, table_in_scope, inner_parameters);
 			inner_parameters.pop_back();
 			return;
 		}
 		case ExpressionClass::SUBQUERY:
-			ParsedExpressionIterator::EnumerateQueryNodeChildren(
-			    *expr.Cast<SubqueryExpression>().Subquery()->node,
-			    [&](unique_ptr<ParsedExpression> &child) { ProbeFoldedSubquery(*child, inner_parameters); });
+			ProbeFoldedNode(*expr.Cast<SubqueryExpression>().Subquery()->node, names, table_in_scope, inner_parameters);
 			return;
 		default:
 			break;
 		}
-		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](unique_ptr<ParsedExpression> &child) { ProbeFoldedSubquery(*child, inner_parameters); });
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<ParsedExpression> &child) {
+			ProbeFoldedSubquery(*child, names, table_in_scope, inner_parameters);
+		});
 	}
 
 	bool CallerScopeBindsElsewhere(const ColumnRefExpression &column_ref) {
@@ -549,13 +667,17 @@ private:
 		if (scopes.empty() || !macro_binding.TryGetBindingIndex(parameter, index)) {
 			return;
 		}
+		Capture(ArgumentNames(index));
+	}
+
+	const identifier_set_t &ArgumentNames(column_t index) {
 		auto entry = argument_names.find(index);
 		if (entry == argument_names.end()) {
 			vector<identifier_set_t> bound;
 			entry = argument_names.emplace(index, identifier_set_t()).first;
 			CollectFreeNames(*(*macro_binding.arguments)[index], bound, entry->second);
 		}
-		Capture(entry->second);
+		return entry->second;
 	}
 
 	const identifier_set_t &CallerWindowNames() {
@@ -759,22 +881,24 @@ private:
 		}
 	}
 
-	// As ReplaceMacroParameters reads it: a name a lambda declares is never a macro parameter there.
+	// Where ReplaceMacroParameters substitutes an argument that names one of the lambda's own parameters.
 	bool ReadsMacroParameter(ParsedExpression &expr, vector<identifier_set_t> &declared) {
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
-			if (names.size() >= 2 && names[names.size() - 2].StartsWith(DummyBinding::DUMMY_NAME)) {
-				return true;
+			bool substituted = names.size() == 1 ||
+			                   (names.size() >= 2 && names[names.size() - 2].StartsWith(DummyBinding::DUMMY_NAME));
+			column_t index;
+			if (!substituted || LambdaExpression::IsLambdaParameter(declared, names.back()) ||
+			    !macro_binding.TryGetBindingIndex(names.back(), index)) {
+				return false;
 			}
-			return !LambdaExpression::IsLambdaParameter(declared, names[0]) &&
-			       macro_binding.HasMatchingBinding(names[0]);
-		}
-		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
-			auto &path = expr.Cast<FunctionExpression>().GetQualifiedName().Path();
-			if (path.size() >= 2 && !LambdaExpression::IsLambdaParameter(declared, path[0]) &&
-			    macro_binding.HasMatchingBinding(path[0])) {
-				return true;
+			auto &argument_names = ArgumentNames(index);
+			for (auto &name : declared.front()) {
+				if (argument_names.find(name) != argument_names.end()) {
+					return true;
+				}
 			}
+			return false;
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::LAMBDA) {
 			auto &lambda_expr = expr.Cast<LambdaExpression>();
@@ -872,11 +996,22 @@ private:
 				arguments.insert(arguments.begin(), FunctionArgument(std::move(receiver)));
 				function.SetQualifiedName(QualifiedName(qualified_name.Name()));
 			}
-			if (FoldsArguments(function)) {
-				folding++;
-				ParsedExpressionIterator::EnumerateChildren(
-				    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
-				folding--;
+			vector<bool> folded;
+			if (FoldedArguments(function, folded)) {
+				auto &arguments = function.GetArgumentsMutable();
+				for (idx_t i = 0; i < arguments.size(); i++) {
+					folding += folded[i];
+					RenameReferences(arguments[i].GetExpressionMutable(), renames);
+					folding -= folded[i];
+				}
+				if (function.FilterMutable()) {
+					RenameReferences(function.FilterMutable(), renames);
+				}
+				if (function.OrderByMutable()) {
+					for (auto &order : function.OrderByMutable()->orders) {
+						RenameReferences(order.expression, renames);
+					}
+				}
 				return;
 			}
 			if (!function.IsLambdaFunction()) {
@@ -891,9 +1026,15 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
-			// only in a folding call, and only without a table of its own, does a subquery read the lambda's parameter
-			auto &subquery = expr->Cast<SubqueryExpression>();
-			RenameSubquery(subquery, renames, folding > 0 && !DeclaresTable(*subquery.Subquery()->node));
+			auto &node = *expr->Cast<SubqueryExpression>().Subquery()->node;
+			if (folding > 0) {
+				auto outer_body_is_qualified = body_is_qualified;
+				body_is_qualified = false;
+				RenameFoldedNode(node, renames, folded_table_in_scope);
+				body_is_qualified = outer_body_is_qualified;
+			} else {
+				RenameSubquery(node, renames);
+			}
 			break;
 		}
 		default:
@@ -903,58 +1044,76 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
 	}
 
-	// typeof, get_type and can_cast_implicitly bind their argument in the lambda's scope and fold to a constant.
-	bool FoldsArguments(FunctionExpression &function) {
-		if (subquery_depth > 0 || !ContainsSubquery(function)) {
+	// The bind callbacks that keep only the type of these arguments: typeof, get_type (type_functions.cpp),
+	// can_cast_implicitly, st_crs (geometry_functions.cpp), the type argument of cast_to_type and replace_type, and
+	// pg_typeof, a built in macro over typeof (default_functions.cpp).
+	bool FoldedArguments(FunctionExpression &function, vector<bool> &folded) {
+		if (subquery_depth > 0 || !function.HasSubquery()) {
 			return false;
 		}
 		bool dot_call;
 		auto entry = FindFunction(function, QualifyingBinder(), dot_call);
-		if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY || !entry->ParentCatalog().IsSystemCatalog()) {
+		if (!entry || dot_call || !entry->ParentCatalog().IsSystemCatalog()) {
 			return false;
 		}
-		return entry->name == "typeof" || entry->name == "get_type" || entry->name == "can_cast_implicitly";
-	}
-
-	static bool ContainsSubquery(ParsedExpression &expr) {
-		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			return true;
+		auto &name = entry->name;
+		auto count = function.GetArguments().size();
+		folded.assign(count, false);
+		if (entry->type == CatalogType::MACRO_ENTRY) {
+			if (name == "pg_typeof") {
+				folded.assign(count, true);
+			}
+		} else if (entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+			if (name == "typeof" || name == "get_type" || name == "can_cast_implicitly" || name == "st_crs") {
+				folded.assign(count, true);
+			} else if (name == "cast_to_type") {
+				folded.assign(count, false);
+				for (idx_t i = 1; i < count && i < 2; i++) {
+					folded[i] = true;
+				}
+			} else if (name == "replace_type") {
+				for (idx_t i = 1; i < count && i < 3; i++) {
+					folded[i] = true;
+				}
+			}
 		}
-		bool found = false;
-		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || ContainsSubquery(*child); });
-		return found;
-	}
-
-	static bool DeclaresTable(QueryNode &node) {
-		bool found = false;
-		ParsedExpressionIterator::EnumerateQueryNodeChildren(
-		    node, [&](unique_ptr<ParsedExpression> &child) { found = found || ContainsTable(*child); },
-		    [&](TableRef &ref) { found = found || ref.type != TableReferenceType::EMPTY_FROM; });
-		return found;
-	}
-
-	static bool ContainsTable(ParsedExpression &expr) {
-		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY &&
-		    DeclaresTable(*expr.Cast<SubqueryExpression>().Subquery()->node)) {
-			return true;
+		for (auto fold : folded) {
+			if (fold) {
+				return true;
+			}
 		}
-		bool found = false;
-		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || ContainsTable(*child); });
-		return found;
+		return false;
 	}
 
-	// A lambda beside a table of its name reads x.v as that table; a folded subquery renames as the lambda's top.
-	void RenameSubquery(SubqueryExpression &subquery, const identifier_map_t<Identifier> &renames, bool folded) {
+	// Renames the references of a folded subquery that may still read the lambda's parameter.
+	void RenameFoldedNode(QueryNode &node, const identifier_map_t<Identifier> &renames, bool table_in_scope) {
+		identifier_set_t names;
+		for (auto &entry : renames) {
+			names.insert(entry.first);
+		}
+		EnumerateFoldedNode(node, names, table_in_scope,
+		                    [&](unique_ptr<ParsedExpression> &expr, const identifier_set_t &expr_names, bool in_scope) {
+			                    identifier_map_t<Identifier> expr_renames;
+			                    for (auto &entry : renames) {
+				                    if (expr_names.find(entry.first) != expr_names.end()) {
+					                    expr_renames.emplace(entry.first, entry.second);
+				                    }
+			                    }
+			                    auto outer = folded_table_in_scope;
+			                    folded_table_in_scope = in_scope;
+			                    RenameReferences(expr, expr_renames);
+			                    folded_table_in_scope = outer;
+		                    });
+	}
+
+	// A lambda beside a table of its name reads x.v as that table, as without the macro.
+	void RenameSubquery(QueryNode &node, const identifier_map_t<Identifier> &renames) {
 		auto outer_body_is_qualified = body_is_qualified;
 		body_is_qualified = false;
 		auto outer_folding = folding;
-		if (!folded) {
-			subquery_depth++;
-			folding = 0;
-		}
-		EnumerateScopedNodeExpressions(*subquery.Subquery()->node, identifier_set_t(),
+		subquery_depth++;
+		folding = 0;
+		EnumerateScopedNodeExpressions(node, identifier_set_t(),
 		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
 			                               identifier_map_t<Identifier> scope_renames;
 			                               for (auto &entry : renames) {
@@ -964,10 +1123,8 @@ private:
 			                               }
 			                               RenameReferences(child, scope_renames);
 		                               });
-		if (!folded) {
-			subquery_depth--;
-			folding = outer_folding;
-		}
+		subquery_depth--;
+		folding = outer_folding;
 		body_is_qualified = outer_body_is_qualified;
 	}
 
@@ -1009,6 +1166,7 @@ private:
 	idx_t subquery_depth = 0;
 	idx_t folding = 0;
 	idx_t caller_scope_folding = 0;
+	bool folded_table_in_scope = false;
 	unordered_map<column_t, identifier_set_t> argument_names;
 	unique_ptr<identifier_set_t> caller_window_names;
 	unique_ptr<identifier_set_t> used_names;
