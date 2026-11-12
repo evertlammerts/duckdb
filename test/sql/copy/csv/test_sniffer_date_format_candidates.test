@@ -193,8 +193,9 @@ SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_dash_ts.csv');
 VARCHAR	2024-02-13 10:00:00
 VARCHAR	13-02-2024 10:00:00
 
-# the plain cast does not read a value in a template layout that a template reads, which it would read with a year of
-# one or two digits, so the order of such a value and ISO 8601 text does not matter
+# the plain cast does not read a value in a template layout that a template starting with a day, a month or a two
+# digit year reads, which it would read with a year of one or two digits, so the order of such a value and ISO 8601
+# text does not matter
 
 statement ok
 COPY (SELECT * FROM (VALUES ('2024-02-13'), ('01-02-24'), ('2024-02-14')) t(d)) TO '{TEST_DIR}/iso_then_template.csv' (HEADER);
@@ -233,14 +234,17 @@ SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_short_slash.csv');
 VARCHAR	2024-02-13
 VARCHAR	01/02/24
 
+# a template that reads a four digit year first reads what the plain cast reads, so it does not count against it;
+# the reverse order is VARCHAR because %Y/%m/%d becomes the column's format and does not read ISO 8601 text
+
 statement ok
 COPY (SELECT * FROM (VALUES ('2024-02-13'), ('2024/02/14')) t(d)) TO '{TEST_DIR}/iso_then_year_slash.csv' (HEADER);
 
 query II
 SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_then_year_slash.csv');
 ----
-VARCHAR	2024-02-13
-VARCHAR	2024/02/14
+DATE	2024-02-13
+DATE	2024-02-14
 
 statement ok
 COPY (SELECT * FROM (VALUES ('2024/02/14'), ('2024-02-13')) t(d)) TO '{TEST_DIR}/year_slash_then_iso.csv' (HEADER);
@@ -566,6 +570,66 @@ SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/slash_column_then_ye
 ----
 DATE	2024-02-13	VARCHAR	24-01-02
 DATE	2024-02-14	VARCHAR	24-01-03
+
+# a later column of a type settled with the plain cast is checked at every value, not only at its first
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13', '2024-03-01'), ('2024-02-14', NULL), ('2024-02-15', '01-02-24')) t(a, b)) TO '{TEST_DIR}/iso_column_then_late_template.csv' (HEADER);
+
+query IIII
+SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/iso_column_then_late_template.csv');
+----
+DATE	2024-02-13	VARCHAR	2024-03-01
+DATE	2024-02-14	VARCHAR	NULL
+DATE	2024-02-15	VARCHAR	01-02-24
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13 10:00:00', '2024-03-01 10:00:00'), ('2024-02-14 10:00:00', NULL), ('2024-02-15 10:00:00', '01-02-24 10:00:00')) t(a, b)) TO '{TEST_DIR}/iso_column_then_late_template_ts.csv' (HEADER);
+
+query IIII
+SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/iso_column_then_late_template_ts.csv');
+----
+TIMESTAMP	2024-02-13 10:00:00	VARCHAR	2024-03-01 10:00:00
+TIMESTAMP	2024-02-14 10:00:00	VARCHAR	NULL
+TIMESTAMP	2024-02-15 10:00:00	VARCHAR	01-02-24 10:00:00
+
+# a later column whose values start with a four digit year keeps the plain cast's reading
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13', '2024/02/14'), ('2024-02-15', '2024/02/16')) t(a, b)) TO '{TEST_DIR}/iso_column_then_year_slash.csv' (HEADER);
+
+query IIII
+SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/iso_column_then_year_slash.csv');
+----
+DATE	2024-02-13	DATE	2024-02-14
+DATE	2024-02-15	DATE	2024-02-16
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13 10:00:00', '2024/02/14 10:00:00'), ('2024-02-15 10:00:00', '2024/02/16 10:00:00')) t(a, b)) TO '{TEST_DIR}/iso_column_then_year_slash_ts.csv' (HEADER);
+
+query IIII
+SELECT typeof(a), a, typeof(b), b FROM read_csv('{TEST_DIR}/iso_column_then_year_slash_ts.csv');
+----
+TIMESTAMP	2024-02-13 10:00:00	TIMESTAMP	2024-02-14 10:00:00
+TIMESTAMP	2024-02-15 10:00:00	TIMESTAMP	2024-02-16 10:00:00
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13 10:00:00'), ('2024/02/14')) t(d)) TO '{TEST_DIR}/iso_ts_then_year_slash_date.csv' (HEADER);
+
+query II
+SELECT typeof(d), d FROM read_csv('{TEST_DIR}/iso_ts_then_year_slash_date.csv');
+----
+TIMESTAMP	2024-02-13 10:00:00
+TIMESTAMP	2024-02-14 00:00:00
+
+statement ok
+COPY (SELECT * FROM (VALUES ('2024-02-13', '2024/02/13', '13/02/2024 10:00:00'), ('2024-02-14', '2024/02/14', '14/02/2024 10:00:00')) t(a, b, t)) TO '{TEST_DIR}/iso_column_then_year_slash_user_ts.csv' (HEADER);
+
+query IIII
+SELECT typeof(b), b, typeof(t), t FROM read_csv('{TEST_DIR}/iso_column_then_year_slash_user_ts.csv', timestampformat = '%d/%m/%Y %H:%M:%S');
+----
+DATE	2024-02-13	TIMESTAMP	2024-02-13 10:00:00
+DATE	2024-02-14	TIMESTAMP	2024-02-14 10:00:00
 
 # b takes the plain cast (see two_columns_iso.csv), which is then the file's date format, and c's values need %m-%d-%y
 

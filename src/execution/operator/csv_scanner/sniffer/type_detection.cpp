@@ -410,7 +410,19 @@ static bool StartsLikeTemplateValue(string &separator, const string_t &value) {
 	return StartsWithNumericDate(separator, value) && ValidSeparator(separator);
 }
 
-bool CSVSniffer::TemplateReadsValue(const string_t &value, const LogicalTypeId sql_type) {
+static idx_t FirstFieldWidth(const string_t &value) {
+	const auto begin = value.GetData();
+	const auto end = begin + value.GetSize();
+	const auto field = std::find_if_not(begin, end, StringUtil::CharacterIsSpace);
+	return NumericCast<idx_t>(std::find_if_not(field, end, StringUtil::CharacterIsDigit) - field);
+}
+
+bool CSVSniffer::PlainCastMayMisread(const string_t &value, const LogicalTypeId sql_type) {
+	// A template that reads a four digit year first reads what the plain cast reads, and every other template starts
+	// with a field of one or two digits
+	if (FirstFieldWidth(value) > 2) {
+		return false;
+	}
 	string separator;
 	if (!StartsLikeTemplateValue(separator, value)) {
 		return false;
@@ -487,14 +499,14 @@ bool CSVSniffer::DetectDateAndTimeStampFormats(CSVStateMachine &candidate, const
 			if (!earlier_value.IsValid()) {
 				continue;
 			}
-			if (TemplateReadsValue(earlier_value.GetValue(), type) ||
+			if (PlainCastMayMisread(earlier_value.GetValue(), type) ||
 			    !CanYouCastIt(buffer_manager->context, earlier_value.GetValue(), sql_type, candidate.dialect_options,
 			                  false, candidate.options.decimal_separator[0], candidate.options.thousands_separator)) {
 				return false;
 			}
 		}
 	}
-	return !TemplateReadsValue(value, type);
+	return !PlainCastMayMisread(value, type);
 }
 
 void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machine,
@@ -540,7 +552,7 @@ void CSVSniffer::SniffTypes(DataChunk &data_chunk, CSVStateMachine &state_machin
 					// The plain cast reads a date or timestamp in a template layout with a year of one or two digits
 					const auto template_type =
 					    sql_type.id() == LogicalTypeId::DATE ? LogicalTypeId::DATE : LogicalTypeId::TIMESTAMP;
-					format_reads = !TemplateReadsValue(column_values.GetValueUnsafe(row_idx), template_type);
+					format_reads = !PlainCastMayMisread(column_values.GetValueUnsafe(row_idx), template_type);
 				}
 				// try cast from string to sql_type
 				if (sql_type == LogicalType::VARCHAR) {
