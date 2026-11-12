@@ -542,6 +542,12 @@ statement ok
 SET VARIABLE bv = 5;
 
 statement ok
+SET VARIABLE rseq = 'bseq';
+
+statement ok
+CREATE SEQUENCE bseq;
+
+statement ok
 CREATE TABLE bc(id INTEGER);
 
 statement ok
@@ -554,15 +560,25 @@ statement ok
 CREATE TRIGGER b_val AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl VALUES ('val', $bv);
 
 statement ok
-CREATE TRIGGER b_sub AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SELECT 'sub', a FROM (SELECT 10 AS a, $bv AS b);
+CREATE TRIGGER b_sub AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SELECT 'sub', b FROM (SELECT 10 AS a, $bv AS b);
+
+# A $name the plan prunes
+statement ok
+CREATE TRIGGER b_pruned AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SELECT 'pruned', a FROM (SELECT 10 AS a, $bv AS b);
+
+statement ok
+CREATE TRIGGER b_query AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl SELECT 'query', * FROM query('SELECT $bv::INTEGER');
 
 statement error
-CREATE TRIGGER b_ret AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl VALUES ('ret', 20) RETURNING $bv;
+CREATE TRIGGER b_ret AFTER INSERT ON bc FOR EACH STATEMENT INSERT INTO bl VALUES ('ret', 20) RETURNING nextval($rseq);
 ----
 Binder Error: RETURNING is not allowed in a trigger body (trigger "b_ret" on table "bc")
 
 statement ok
 CREATE TRIGGER b_row AFTER INSERT ON br FOR EACH ROW INSERT INTO bl VALUES ('row', NEW.id + $bv);
+
+statement ok
+INSERT INTO bc VALUES (0);
 
 # A prepared firing statement without parameters reads the variable at EXECUTE
 statement ok
@@ -574,12 +590,12 @@ SET VARIABLE bv = 6;
 statement ok
 EXECUTE bp;
 
-# A named parameter of the firing statement does not reach the bodies
+# Named parameters of the firing statement do not reach the bodies, here one that names no sequence
 statement ok
-PREPARE bq AS INSERT INTO bc VALUES ($bv);
+PREPARE bq AS INSERT INTO bc SELECT $bv WHERE $rseq <> '';
 
 statement ok
-EXECUTE bq(bv := 7);
+EXECUTE bq(bv := 7, rseq := 'no_such_sequence');
 
 statement ok
 PREPARE bpr AS INSERT INTO br VALUES ($bv);
@@ -590,19 +606,30 @@ EXECUTE bpr(bv := 100);
 query TI
 SELECT k, id FROM bl ORDER BY ALL;
 ----
+pruned	10
+pruned	10
+pruned	10
+query	5
+query	6
+query	6
 row	106
-sub	10
-sub	10
+sub	5
+sub	6
+sub	6
+val	5
 val	6
 val	6
 
 query I
 SELECT id FROM bc ORDER BY id;
 ----
+0
 1
 7
 
-# The sequence a body names through a variable is the one it depends on, whatever the firing statement passes
+# A body's nextval($sq) uses the sequence the variable names when the body binds, whatever the firing statement
+# passes; the recorded dependency is the one it named at CREATE, so the two agree only while the variable keeps that
+# value
 statement ok
 SET VARIABLE sq = 'bs1';
 
@@ -642,24 +669,24 @@ FROM bn;
 ----
 bs2
 
-# Without the variable the firing fails as an unprepared one does
+# Without the variable the firing fails, prepared or not, and writes nothing
 statement ok
 RESET VARIABLE bv;
 
 statement error
 EXECUTE bp;
 ----
-Values were not provided for the following parameters: bv
+Variable "bv" is not set: a trigger body reads $bv as a user variable
 
 statement error
 INSERT INTO bc VALUES (3);
 ----
-Values were not provided for the following parameters: bv
+Variable "bv" is not set: a trigger body reads $bv as a user variable
 
 query I
 SELECT count(*) FROM bc;
 ----
-2
+3
 
 # A row body with RETURNING into a table with a statement trigger is refused at CREATE instead of failing to schedule
 statement ok

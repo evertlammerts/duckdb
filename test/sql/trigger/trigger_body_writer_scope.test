@@ -58,6 +58,30 @@ SELECT id FROM ins;
 statement ok
 DELETE FROM out;
 
+# BEFORE and AFTER statement bodies fired by an INSERT with RETURNING
+statement ok
+CREATE TABLE ret(id INTEGER);
+
+statement ok
+CREATE TRIGGER ret_before BEFORE INSERT ON ret FOR EACH STATEMENT INSERT INTO out SELECT 'ret before', id FROM log;
+
+statement ok
+CREATE TRIGGER ret_after AFTER INSERT ON ret FOR EACH STATEMENT INSERT INTO out SELECT 'ret after', id FROM log;
+
+query I
+WITH log AS (SELECT 99 AS id) INSERT INTO ret SELECT id FROM log RETURNING *;
+----
+99
+
+query TI
+SELECT v, id FROM out ORDER BY v;
+----
+ret after	1
+ret before	1
+
+statement ok
+DELETE FROM out;
+
 statement ok
 CREATE TABLE ins_row(id INTEGER);
 
@@ -244,7 +268,7 @@ named row	51
 statement ok
 DELETE FROM out;
 
-# A CTE of the writer named like a transition table: the transition table wins, as on main
+# A CTE of the writer named like a transition table: the transition table shadows the CTE
 statement ok
 CREATE TABLE tt(id INTEGER);
 
@@ -304,7 +328,7 @@ own	7
 statement ok
 DELETE FROM out;
 
-# Writer aliases named like a table a statement body reads leave the table visible, as on main
+# A writer alias is not visible to a statement body, which reads the table named like the alias
 statement ok
 CREATE TABLE al(id INTEGER);
 
@@ -548,7 +572,7 @@ statement ok
 INSERT INTO fb_row VALUES (1);
 
 statement ok
-RESET search_path;
+SET search_path = 'main';
 
 statement error
 WITH only2 AS (SELECT 99 AS id) INSERT INTO fb_row VALUES (3);

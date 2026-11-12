@@ -1,11 +1,11 @@
 # name: test/sql/trigger/trigger_dependency_creation_order.test
-# description: A trigger depends on what its own body references, whichever triggers exist on the tables it writes
+# description: A trigger does not depend on what the bodies of the triggers it fires reference
 # group: [trigger]
 
 require noforcestorage
 
 statement ok
-CREATE MACRO trigger_deps(trg) AS TABLE
+CREATE TEMP MACRO trigger_deps(trg) AS TABLE
 SELECT e.name, d.deptype
 FROM duckdb_dependencies() d
 JOIN duckdb_triggers() t ON t.trigger_oid = d.refobjid
@@ -685,3 +685,210 @@ query II
 SELECT (SELECT count(*) FROM a15), (SELECT list(id) FROM log15);
 ----
 0	[15, 15]
+
+# A view, a macro, an enum type and a sequence default a reached trigger resolves stay off the writers
+statement ok
+CREATE TABLE a16(id INTEGER);
+
+statement ok
+CREATE TABLE b16(id INTEGER);
+
+statement ok
+CREATE TABLE c16(id INTEGER);
+
+statement ok
+CREATE TABLE src16(id INTEGER);
+
+statement ok
+CREATE VIEW v16 AS SELECT id FROM src16;
+
+statement ok
+CREATE MACRO f16(x) AS x + 1;
+
+statement ok
+CREATE TYPE mood16 AS ENUM ('happy', 'sad');
+
+statement ok
+CREATE SEQUENCE seq16;
+
+statement ok
+CREATE TABLE log16(n INTEGER DEFAULT nextval('seq16'), id INTEGER, m VARCHAR);
+
+statement ok
+CREATE TRIGGER sa16 AFTER INSERT ON a16 FOR EACH STATEMENT
+	INSERT INTO log16 (id, m) SELECT f16(id), 'happy'::mood16::VARCHAR FROM v16;
+
+statement ok
+CREATE TRIGGER tb16 AFTER INSERT ON b16 FOR EACH ROW INSERT INTO a16 VALUES (NEW.id);
+
+statement ok
+CREATE TRIGGER sc16 AFTER INSERT ON c16 FOR EACH STATEMENT INSERT INTO a16 SELECT id FROM c16;
+
+query II
+FROM trigger_deps('tb16');
+----
+a16	n
+b16	a
+
+query II
+FROM trigger_deps('sc16');
+----
+a16	n
+c16	a
+
+query II
+FROM trigger_deps('sa16');
+----
+a16	a
+f16	n
+log16	n
+mood16	n
+seq16	n
+src16	n
+v16	n
+
+statement ok
+INSERT INTO src16 VALUES (7);
+
+statement ok
+INSERT INTO b16 VALUES (1);
+
+statement ok
+INSERT INTO c16 VALUES (2);
+
+query III
+FROM log16 ORDER BY n;
+----
+1	8	happy
+2	8	happy
+
+statement ok
+DROP TRIGGER sa16 ON a16;
+
+statement ok
+DROP VIEW v16;
+
+statement ok
+DROP MACRO f16;
+
+statement ok
+DROP TYPE mood16;
+
+statement ok
+INSERT INTO b16 VALUES (3);
+
+query I
+SELECT list(id ORDER BY id) FROM a16;
+----
+[1, 2, 3]
+
+# A writer whose reached trigger resolves an unqualified name to another database in the writer's session is
+# accepted in either order; a trigger's own reference to another database is refused
+statement ok
+ATTACH '{TEST_DIR}/trigger_dependency_creation_order.db' AS o17 (STORAGE_VERSION 'v2.0.0');
+
+statement ok
+ATTACH ':memory:' AS w17;
+
+statement ok
+CREATE TABLE a17(id INTEGER);
+
+statement ok
+CREATE TABLE w17.log17(id INTEGER);
+
+statement ok
+CREATE TABLE b17(id INTEGER);
+
+statement ok
+CREATE TABLE o17.a17(id INTEGER);
+
+statement ok
+CREATE TABLE o17.b17(id INTEGER);
+
+statement ok
+CREATE TABLE o17.a17_second(id INTEGER);
+
+statement ok
+CREATE TABLE o17.b17_second(id INTEGER);
+
+statement ok
+CREATE TABLE o17.log17(id INTEGER);
+
+statement error
+CREATE TRIGGER sa17_bad AFTER INSERT ON a17 FOR EACH STATEMENT INSERT INTO o17.log17 VALUES (0);
+----
+Trigger "sa17_bad" cannot reference "log17" from a different catalog ("o17")
+
+statement error
+CREATE TRIGGER tb17_bad AFTER INSERT ON b17 FOR EACH ROW INSERT INTO o17.a17 VALUES (NEW.id);
+----
+Trigger "tb17_bad" cannot reference "a17" from a different catalog ("o17")
+
+statement ok
+USE o17;
+
+statement ok
+CREATE TRIGGER sa17 AFTER INSERT ON a17 FOR EACH STATEMENT INSERT INTO log17 VALUES (17);
+
+statement ok
+USE w17;
+
+statement ok
+CREATE TRIGGER tb17 AFTER INSERT ON o17.b17 FOR EACH ROW INSERT INTO o17.a17 VALUES (NEW.id);
+
+statement ok
+CREATE TRIGGER tb17_second AFTER INSERT ON o17.b17_second FOR EACH ROW INSERT INTO o17.a17_second VALUES (NEW.id);
+
+statement ok
+USE o17;
+
+statement ok
+CREATE TRIGGER sa17_second AFTER INSERT ON a17_second FOR EACH STATEMENT INSERT INTO log17 VALUES (18);
+
+query II
+FROM trigger_deps('tb17');
+----
+a17	n
+b17	a
+
+query II
+FROM trigger_deps('tb17_second');
+----
+a17_second	n
+b17_second	a
+
+statement ok
+INSERT INTO b17 VALUES (1);
+
+statement ok
+INSERT INTO b17_second VALUES (2);
+
+query II
+SELECT (SELECT list(id ORDER BY id) FROM o17.log17), (SELECT count(*) FROM w17.log17);
+----
+[17, 18]	0
+
+# The recorded dependencies survive a reload of the database
+statement ok
+USE w17;
+
+statement ok
+DETACH o17;
+
+statement ok
+ATTACH '{TEST_DIR}/trigger_dependency_creation_order.db' AS o17;
+
+statement ok
+USE o17;
+
+query II
+FROM trigger_deps('tb17');
+----
+a17	n
+b17	a
+
+query II
+FROM trigger_deps('sa17');
+----
+a17	a
+log17	n

@@ -108,6 +108,9 @@ static constexpr const char *TRIGGER_BASE_CTE_PREFIX = "__duckdb_trigger_base_";
 static constexpr const char *TRIGGER_BODY_CTE_PREFIX = "__duckdb_trigger_body_";
 static constexpr const char *TRIGGER_BEFORE_BODY_CTE_PREFIX = "__duckdb_trigger_before_body_";
 
+//! The generated CTE nodes holding fired trigger bodies, each with the scope it binds in
+using trigger_body_list_t = vector<pair<reference<QueryNode>, TriggerBodyCTE>>;
+
 static unique_ptr<CommonTableExpressionInfo> MakeTransitionTableAliasCTE(const Identifier &base_cte_name,
                                                                          const identifier_set_t &exclude_columns) {
 	auto alias_cte = make_uniq<CommonTableExpressionInfo>();
@@ -265,19 +268,6 @@ static unique_ptr<QueryNode> CopyFiredTriggerBody(const TriggerCatalogEntry &tri
 	return trigger.trigger_action->Copy();
 }
 
-static bool &GetDMLTriggerGeneratedReturning(QueryNode &node) {
-	switch (node.type) {
-	case QueryNodeType::INSERT_QUERY_NODE:
-		return node.Cast<InsertQueryNode>().trigger_generated_returning;
-	case QueryNodeType::UPDATE_QUERY_NODE:
-		return node.Cast<UpdateQueryNode>().trigger_generated_returning;
-	case QueryNodeType::DELETE_QUERY_NODE:
-		return node.Cast<DeleteQueryNode>().trigger_generated_returning;
-	default:
-		throw InternalException("GetDMLTriggerGeneratedReturning: unexpected node type");
-	}
-}
-
 static Identifier GetTableAlias(const QueryNode &node, const Identifier &fallback) {
 	switch (node.type) {
 	case QueryNodeType::INSERT_QUERY_NODE: {
@@ -366,18 +356,10 @@ static vector<pair<column_t, Identifier>> ReferencedVirtualColumns(vector<unique
 	return result;
 }
 
-static void MarkTriggerBody(CommonTableExpressionInfo &cte, const TriggerCatalogEntry &trigger,
-                            const Identifier &transition_source) {
-	cte.is_trigger_body = true;
-	cte.trigger_catalog = trigger.ParentCatalog().GetName();
-	cte.trigger_schema_path = trigger.ParentSchema().GetSchemaPath();
-	cte.trigger_transition_source = transition_source;
-}
-
 static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<TriggerCatalogEntry>> &after_triggers,
                                 const Identifier &base_cte_name, const string &uuid_suffix,
                                 const identifier_set_t &injected_names, const TableCatalogEntry &table,
-                                const vector<Identifier> &old_capture_names) {
+                                const vector<Identifier> &old_capture_names, trigger_body_list_t &trigger_bodies) {
 	// For UPDATE with OLD capture the base CTE also carries the reserved OLD columns; keep them out of the NEW alias.
 	bool update_old_capture = !old_capture_names.empty();
 	identifier_set_t new_alias_exclude = injected_names;
@@ -391,7 +373,7 @@ static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<
 		trig_cte->query_node = CopyFiredTriggerBody(trigger, table);
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		MarkTriggerBody(*trig_cte, trigger, base_cte_name);
+		trigger_bodies.emplace_back(*trig_cte->query_node, TriggerBodyCTE {trigger.ParentSchema(), base_cte_name});
 
 		// Scoped to this body so sibling triggers can't see the alias.
 		auto &body_map = trig_cte->query_node->cte_map.map;
@@ -411,14 +393,14 @@ static void AddAfterTriggerCTEs(SelectNode &outer, const vector<const_reference<
 
 // Build the trigger CTE chain as a SelectNode: BEFORE bodies → base DML → AFTER bodies.
 // For RETURNING the outer projection is a plain SELECT *, rebound through ReturningBinder later.
-static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const TableCatalogEntry &table,
-                                                const vector<const_reference<TriggerCatalogEntry>> &before_triggers,
-                                                const vector<const_reference<TriggerCatalogEntry>> &after_triggers,
-                                                const string &uuid_suffix, const Identifier &base_cte_name,
-                                                bool has_returning,
-                                                const vector<pair<column_t, Identifier>> &injected_virtuals,
-                                                const vector<Identifier> &old_capture_names,
-                                                optional_ptr<QueryNode> &out_capture_base) {
+static unique_ptr<SelectNode>
+BuildTriggerChain(const QueryNode &node, const TableCatalogEntry &table,
+                  const vector<const_reference<TriggerCatalogEntry>> &before_triggers,
+                  const vector<const_reference<TriggerCatalogEntry>> &after_triggers, const string &uuid_suffix,
+                  const Identifier &base_cte_name, bool has_returning,
+                  const vector<pair<column_t, Identifier>> &injected_virtuals,
+                  const vector<Identifier> &old_capture_names, optional_ptr<QueryNode> &out_capture_base,
+                  optional_ptr<QueryNode> &out_returning_base, trigger_body_list_t &trigger_bodies) {
 	auto outer = make_uniq<SelectNode>();
 	if (has_returning) {
 		outer->select_list.push_back(make_uniq<StarExpression>());
@@ -438,7 +420,8 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 		trig_cte->query_node = CopyFiredTriggerBody(before_triggers[i].get(), table);
 		trig_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		trig_cte->is_trigger_generated = true;
-		MarkTriggerBody(*trig_cte, before_triggers[i].get(), Identifier());
+		trigger_bodies.emplace_back(*trig_cte->query_node,
+		                            TriggerBodyCTE {before_triggers[i].get().ParentSchema(), Identifier()});
 		outer->cte_map.map[body_cte_name] = std::move(trig_cte);
 	}
 
@@ -447,7 +430,7 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 	auto base_node = node.Copy();
 	auto &base_returning = GetDMLReturningList(*base_node);
 	base_returning.push_back(make_uniq<StarExpression>());
-	GetDMLTriggerGeneratedReturning(*base_node) = true;
+	out_returning_base = base_node.get();
 	identifier_set_t injected_names;
 	for (auto &vc : injected_virtuals) {
 		base_returning.push_back(make_uniq<ColumnRefExpression>(vc.second));
@@ -464,9 +447,44 @@ static unique_ptr<SelectNode> BuildTriggerChain(const QueryNode &node, const Tab
 	}
 	outer->cte_map.map[base_cte_name] = std::move(base_cte);
 
-	AddAfterTriggerCTEs(*outer, after_triggers, base_cte_name, uuid_suffix, injected_names, table, old_capture_names);
+	AddAfterTriggerCTEs(*outer, after_triggers, base_cte_name, uuid_suffix, injected_names, table, old_capture_names,
+	                    trigger_bodies);
 	return outer;
 }
+
+// Registers a chain's OLD capture request and fired body CTE nodes in the global binder state while the chain binds,
+// and removes them however the bind ends, because the registered nodes are destroyed with the chain.
+class TriggerChainBindState {
+public:
+	TriggerChainBindState(GlobalBinderState &state, const trigger_body_list_t &trigger_bodies,
+	                      optional_ptr<QueryNode> capture_base, const vector<Identifier> &old_capture_names,
+	                      QueryNode &returning_base)
+	    : state(state), capture_base(capture_base), trigger_bodies(trigger_bodies),
+	      returning_base(state, returning_base) {
+		if (capture_base) {
+			state.trigger_old_capture.insert(*capture_base);
+			state.trigger_old_capture_cte_names[*capture_base] = old_capture_names;
+		}
+		for (auto &body : trigger_bodies) {
+			state.trigger_body_ctes.emplace(body.first, body.second);
+		}
+	}
+	~TriggerChainBindState() {
+		if (capture_base) {
+			state.trigger_old_capture.erase(*capture_base);
+			state.trigger_old_capture_cte_names.erase(*capture_base);
+		}
+		for (auto &body : trigger_bodies) {
+			state.trigger_body_ctes.erase(body.first);
+		}
+	}
+
+private:
+	GlobalBinderState &state;
+	optional_ptr<QueryNode> capture_base;
+	trigger_body_list_t trigger_bodies;
+	TriggerGeneratedReturningScope returning_base;
+};
 
 BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
                                       const vector<const_reference<TriggerCatalogEntry>> &before_triggers,
@@ -496,19 +514,19 @@ BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
 	}
 
 	optional_ptr<QueryNode> capture_base;
-	auto outer = BuildTriggerChain(node, table, before_triggers, after_triggers, uuid_suffix, base_cte_name,
-	                               has_returning, injected_virtuals, old_capture_names, capture_base);
+	optional_ptr<QueryNode> returning_base;
+	trigger_body_list_t trigger_bodies;
+	auto outer =
+	    BuildTriggerChain(node, table, before_triggers, after_triggers, uuid_suffix, base_cte_name, has_returning,
+	                      injected_virtuals, old_capture_names, capture_base, returning_base, trigger_bodies);
 	// Request OLD capture on the generated base UPDATE in scoped binder state, active only while binding this
 	// chain. BindNode(UpdateQueryNode) reads the request by node identity, so it never touches the parsed AST.
 	// The reserved CTE presentation names are separate, optional state for the statement-trigger CTE consumer.
-	if (capture_base) {
-		global_binder_state->trigger_old_capture.insert(*capture_base);
-		global_binder_state->trigger_old_capture_cte_names[*capture_base] = old_capture_names;
-	}
-	auto chain = Bind(*outer);
-	if (capture_base) {
-		global_binder_state->trigger_old_capture.erase(*capture_base);
-		global_binder_state->trigger_old_capture_cte_names.erase(*capture_base);
+	BoundStatement chain;
+	{
+		TriggerChainBindState chain_state(*global_binder_state, trigger_bodies, capture_base, old_capture_names,
+		                                  *returning_base);
+		chain = Bind(*outer);
 	}
 
 	if (!has_returning) {
@@ -527,7 +545,7 @@ BoundStatement Binder::ExpandTriggers(QueryNode &node, TableCatalogEntry &table,
 	// the no-trigger path (rejects aggregates/subqueries/windows, resolves qualified columns, virtual
 	// vs real rowid).  bound_columns is the identity over all logical columns (generated included)
 	// because our RETURNING * child materialises every logical column in order.
-	D_ASSERT(!GetDMLTriggerGeneratedReturning(node));
+	D_ASSERT(!IsTriggerGeneratedReturning(node));
 	auto returning_binder_owner = CreateReturningBinder(false);
 	vector<Identifier> col_names;
 	vector<LogicalType> col_types;
@@ -662,7 +680,17 @@ string Binder::RowScopeName(TriggerEventType event_type) {
 }
 
 void Binder::SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema) {
-	entry_retriever.SetSearchPath(GetSearchPath(trigger_schema.ParentCatalog(), trigger_schema.GetSchemaPath(), true));
+	auto &catalog = trigger_schema.ParentCatalog();
+	auto &catalog_name = catalog.GetName();
+	auto schema_path = trigger_schema.GetSchemaPath();
+	vector<CatalogSearchEntry> search_path;
+	search_path.push_back(CatalogSearchEntry::FromSchemaPath(catalog_name, schema_path));
+	auto default_schema = catalog.GetDefaultSchema();
+	if (default_schema && !default_schema->empty() && (schema_path.size() != 1 || schema_path[0] != *default_schema)) {
+		search_path.emplace_back(catalog_name, *default_schema);
+	}
+	search_path.emplace_back(catalog_name, INVALID_SCHEMA);
+	entry_retriever.SetSearchPath(std::move(search_path));
 }
 
 void Binder::PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema) {
@@ -694,7 +722,6 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 	D_ASSERT(!triggers.empty());
 	D_ASSERT(returning_list.empty());
 	returning_list.push_back(make_uniq<StarExpression>());
-	GetDMLTriggerGeneratedReturning(node) = true;
 
 	auto uuid_suffix = UUID::ToString(UUID::GenerateRandomUUID());
 	Identifier base_cte_name(TRIGGER_BASE_CTE_PREFIX + uuid_suffix);
@@ -703,6 +730,7 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 	base_cte->query_node = node.Copy();
 	base_cte->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
 	base_cte->is_trigger_generated = true;
+	auto &returning_base = *base_cte->query_node;
 
 	auto outer = make_uniq<SelectNode>();
 	outer->select_list.push_back(make_uniq<FunctionExpression>("count_star", vector<unique_ptr<ParsedExpression>>()));
@@ -711,7 +739,11 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 	outer->from_table = std::move(from_ref);
 	outer->cte_map.map[base_cte_name] = std::move(base_cte);
 
-	auto bound = Bind(*outer);
+	BoundStatement bound;
+	{
+		TriggerGeneratedReturningScope returning_scope(*global_binder_state, returning_base);
+		bound = Bind(*outer);
+	}
 	auto &base_mat_cte = bound.plan->Cast<LogicalMaterializedCTE>();
 	auto cte_table_idx = base_mat_cte.table_index;
 

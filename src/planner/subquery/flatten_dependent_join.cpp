@@ -1731,8 +1731,7 @@ FlattenDependentJoins::PushDownCorrelatedNodeInternal(unique_ptr<LogicalOperator
 		return PushDownDML(plan, false, std::move(state));
 	}
 	case LogicalOperatorType::LOGICAL_MERGE_INTO:
-		// Only the FOR EACH ROW trigger expansion puts a MERGE under a dependent join, and its conflict check would
-		// not see the rows that other firings of the same statement write.
+		// Only row trigger firings reach here, and one batched MERGE cannot see the rows other firings write.
 		throw NotImplementedException(
 		    "MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger");
 	case LogicalOperatorType::LOGICAL_PIVOT:
