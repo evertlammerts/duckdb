@@ -921,6 +921,188 @@ SELECT (SELECT count(*) FROM main.dest), (SELECT count(*) FROM s2.dest);
 ----
 1	0
 
+# A name in neither the trigger's schema nor its catalog's default schema follows each firing session's search path,
+# into another database too, as a view's body does, while CREATE recorded the entry the creator's path resolved
+statement ok
+ATTACH ':memory:' AS dbf;
+
+statement ok
+CREATE SCHEMA dbf.s;
+
+statement ok
+CREATE SCHEMA dbf.support;
+
+statement ok
+CREATE TABLE dbf.s.t23(id INTEGER);
+
+statement ok
+CREATE TABLE dbf.s.audit(v VARCHAR);
+
+statement ok
+CREATE TABLE dbf.support.fsrc(v VARCHAR);
+
+statement ok
+INSERT INTO dbf.support.fsrc VALUES ('owner');
+
+statement ok
+SET search_path = 'dbf.s,dbf.support';
+
+statement ok
+CREATE TRIGGER t23_after AFTER INSERT ON dbf.s.t23 FOR EACH STATEMENT INSERT INTO audit SELECT 'trigger ' || v FROM fsrc;
+
+statement ok
+CREATE VIEW dbf.s.v23 AS SELECT 'view ' || v AS v FROM fsrc;
+
+statement ok
+INSERT INTO dbf.s.t23 VALUES (0);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TABLE memory.main.fsrc(v VARCHAR);
+
+statement ok
+INSERT INTO memory.main.fsrc VALUES ('caller');
+
+statement ok
+INSERT INTO dbf.s.t23 VALUES (1);
+
+query T
+SELECT v FROM dbf.s.audit UNION ALL SELECT v FROM dbf.s.v23 ORDER BY v;
+----
+trigger caller
+trigger owner
+view caller
+
+statement error
+DROP TABLE dbf.support.fsrc;
+----
+trigger "t23_after" on table "t23" depends on table "fsrc"
+
+statement error
+CREATE TRIGGER t23_from_memory AFTER INSERT ON dbf.s.t23 FOR EACH STATEMENT INSERT INTO audit SELECT v FROM fsrc;
+----
+cannot reference "fsrc" from a different catalog
+
+statement ok
+DETACH dbf;
+
+# Within one database the trigger depends on the creator's table but reads the firing session's, as the view does
+statement ok
+CREATE TABLE s.t21(id INTEGER);
+
+statement ok
+CREATE TABLE s.log21(v VARCHAR);
+
+statement ok
+CREATE TABLE s2.cc(v VARCHAR);
+
+statement ok
+INSERT INTO s2.cc VALUES ('s2.cc');
+
+statement ok
+CREATE TABLE s3.cc(v VARCHAR);
+
+statement ok
+INSERT INTO s3.cc VALUES ('s3.cc');
+
+statement ok
+SET search_path = 's,s2';
+
+statement ok
+CREATE TRIGGER t21_after AFTER INSERT ON t21 FOR EACH STATEMENT INSERT INTO log21 SELECT 'trigger ' || v FROM cc;
+
+statement ok
+CREATE VIEW v21 AS SELECT 'view ' || v AS v FROM cc;
+
+statement ok
+SET search_path = 's3';
+
+statement ok
+INSERT INTO s.t21 VALUES (1);
+
+query T
+SELECT v FROM s.log21 UNION ALL SELECT v FROM s.v21;
+----
+trigger s3.cc
+view s3.cc
+
+statement ok
+RESET search_path;
+
+statement ok
+DROP VIEW s.v21;
+
+statement error
+DROP TABLE s2.cc;
+----
+trigger "t21_after" on table "t21" depends on table "cc"
+
+statement ok
+DROP TABLE s3.cc;
+
+# A table created in the trigger's schema after CREATE takes over a name the body found in the default schema, and
+# can be dropped again, as for a view
+statement ok
+CREATE TABLE s.t22(id INTEGER);
+
+statement ok
+CREATE TABLE main.out22(v VARCHAR);
+
+statement ok
+CREATE TABLE main.src22(v VARCHAR);
+
+statement ok
+INSERT INTO main.src22 VALUES ('main.src22');
+
+statement ok
+CREATE TRIGGER t22_after AFTER INSERT ON s.t22 FOR EACH STATEMENT INSERT INTO main.out22 SELECT v FROM src22;
+
+statement ok
+CREATE VIEW s.v22 AS SELECT v FROM src22;
+
+statement ok
+INSERT INTO s.t22 VALUES (1);
+
+statement ok
+CREATE TABLE s.src22(v VARCHAR);
+
+statement ok
+INSERT INTO s.src22 VALUES ('s.src22');
+
+statement ok
+INSERT INTO s.t22 VALUES (2);
+
+query T
+SELECT v FROM main.out22 ORDER BY v;
+----
+main.src22
+s.src22
+
+query T
+SELECT v FROM s.v22;
+----
+s.src22
+
+statement ok
+DROP TABLE s.src22;
+
+statement ok
+INSERT INTO s.t22 VALUES (3);
+
+query T
+SELECT v FROM main.out22 ORDER BY v;
+----
+main.src22
+main.src22
+s.src22
+
+query T
+SELECT v FROM s.v22;
+----
+main.src22
+
 # UPDATE and DELETE bodies, a type and a table function naming a table by string, each present in both schemas
 statement ok
 DELETE FROM s.log;

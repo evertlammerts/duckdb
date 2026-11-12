@@ -5,7 +5,7 @@
 require noforcestorage
 
 statement ok
-CREATE MACRO trigger_deps(trg) AS TABLE
+CREATE TEMP MACRO trigger_deps(trg) AS TABLE
 SELECT e.name, d.deptype
 FROM duckdb_dependencies() d
 JOIN duckdb_triggers() t ON t.trigger_oid = d.refobjid
@@ -791,16 +791,19 @@ SELECT list(id ORDER BY id) FROM a16;
 ----
 [1, 2, 3]
 
-# A reached trigger whose unqualified body resolves to another database in the writer's session no longer
-# refuses the writer, in either order; the refusal of the writer's own reference stays
+# A writer whose reached trigger resolves an unqualified name to another database in the writer's session is
+# accepted in either order; a trigger's own reference to another database is refused
 statement ok
 ATTACH '{TEST_DIR}/trigger_dependency_creation_order.db' AS o17 (STORAGE_VERSION 'v2.0.0');
+
+statement ok
+ATTACH ':memory:' AS w17;
 
 statement ok
 CREATE TABLE a17(id INTEGER);
 
 statement ok
-CREATE TABLE log17(id INTEGER);
+CREATE TABLE w17.log17(id INTEGER);
 
 statement ok
 CREATE TABLE b17(id INTEGER);
@@ -837,7 +840,7 @@ statement ok
 CREATE TRIGGER sa17 AFTER INSERT ON a17 FOR EACH STATEMENT INSERT INTO log17 VALUES (17);
 
 statement ok
-USE memory;
+USE w17;
 
 statement ok
 CREATE TRIGGER tb17 AFTER INSERT ON o17.b17 FOR EACH ROW INSERT INTO o17.a17 VALUES (NEW.id);
@@ -852,13 +855,13 @@ statement ok
 CREATE TRIGGER sa17_second AFTER INSERT ON a17_second FOR EACH STATEMENT INSERT INTO log17 VALUES (18);
 
 query II
-FROM memory.trigger_deps('tb17');
+FROM trigger_deps('tb17');
 ----
 a17	n
 b17	a
 
 query II
-FROM memory.trigger_deps('tb17_second');
+FROM trigger_deps('tb17_second');
 ----
 a17_second	n
 b17_second	a
@@ -870,13 +873,13 @@ statement ok
 INSERT INTO b17_second VALUES (2);
 
 query II
-SELECT (SELECT list(id ORDER BY id) FROM o17.log17), (SELECT count(*) FROM memory.log17);
+SELECT (SELECT list(id ORDER BY id) FROM o17.log17), (SELECT count(*) FROM w17.log17);
 ----
 [17, 18]	0
 
 # The recorded dependencies survive a reload of the database
 statement ok
-USE memory;
+USE w17;
 
 statement ok
 DETACH o17;
@@ -888,16 +891,13 @@ statement ok
 USE o17;
 
 query II
-FROM memory.trigger_deps('tb17');
+FROM trigger_deps('tb17');
 ----
 a17	n
 b17	a
 
 query II
-FROM memory.trigger_deps('sa17');
+FROM trigger_deps('sa17');
 ----
 a17	a
 log17	n
-
-statement ok
-USE memory;
