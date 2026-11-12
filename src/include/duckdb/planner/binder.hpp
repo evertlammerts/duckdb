@@ -231,6 +231,9 @@ struct GlobalBinderState {
 	//! table order, under which the captured OLD image is exposed via SQL aliases. Only populated for capture
 	//! requests presented through a CTE; a consumer that reads the OLD image directly leaves it absent.
 	reference_map_t<QueryNode, vector<Identifier>> trigger_old_capture_cte_names;
+	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity. A trigger being created
+	//! does not depend on what those bodies resolve.
+	reference_set_t<QueryNode> trigger_body_ctes;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
