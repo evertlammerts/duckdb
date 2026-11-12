@@ -13,6 +13,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
@@ -519,6 +520,29 @@ public:
 			    macro_binding.HasMatchingBinding(path[0]) && IsDotCall(function, QualifyingBinder())) {
 				CaptureMacroParameter(path[0]);
 			}
+			if (body_is_qualified && path.size() >= 3 && IsLambdaParameter(path[0]) &&
+			    IsDotCall(function, QualifyingBinder())) {
+				auto &qualified_name = function.GetQualifiedName();
+				CaptureByCallerScope(ColumnRefExpression(qualified_name.Schema(), qualified_name.Catalog()));
+			}
+			vector<bool> folded;
+			if (body_is_qualified && FoldedArguments(function, folded)) {
+				auto &arguments = function.GetArgumentsMutable();
+				for (idx_t i = 0; i < arguments.size(); i++) {
+					caller_scope_folding += folded[i];
+					Rename(arguments[i].GetExpressionMutable());
+					caller_scope_folding -= folded[i];
+				}
+				if (function.FilterMutable()) {
+					Rename(function.FilterMutable());
+				}
+				if (function.OrderByMutable()) {
+					for (auto &order : function.OrderByMutable()->orders) {
+						Rename(order.expression);
+					}
+				}
+				return;
+			}
 			if (!function.IsLambdaFunction()) {
 				break;
 			}
@@ -535,8 +559,18 @@ public:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
-			// the dummy qualification does not enter a subquery, so its references stay as written
+			// the dummy qualification does not enter a subquery; the caller's scope is asked about a folded one only
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
+			if (body_is_qualified && caller_scope_folding > 0) {
+				identifier_set_t names;
+				for (auto &scope : scopes) {
+					for (auto &parameter : scope.parameters) {
+						names.insert(parameter.get().GetColumnName());
+					}
+				}
+				vector<identifier_set_t> inner_parameters;
+				ProbeFoldedNode(*sq->node, names, false, inner_parameters);
+			}
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
 			ParsedExpressionIterator::EnumerateQueryNodeChildren(
@@ -579,9 +613,120 @@ private:
 		return false;
 	}
 
+	optional_ptr<LambdaScope> DeclaringScope(const Identifier &name) {
+		for (idx_t i = scopes.size(); i > 0; i--) {
+			for (auto &parameter : scopes[i - 1].parameters) {
+				if (parameter.get().GetColumnName() == name) {
+					return scopes[i - 1];
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// The caller's scope, where a scalar macro body binds, tries its own tables before lambda parameters.
+	void CaptureByCallerScope(const ColumnRefExpression &column_ref) {
+		if (!column_ref.IsQualified()) {
+			return;
+		}
+		auto &parameter = column_ref.ColumnNames()[0];
+		auto scope = DeclaringScope(parameter);
+		if (!scope || scope->captured.find(parameter) != scope->captured.end()) {
+			return;
+		}
+		if (CallerScopeBindsElsewhere(column_ref)) {
+			Capture(identifier_set_t {parameter});
+		}
+	}
+
+	// A folded subquery binds in the lambda's scope wherever no table is in scope, as the lambda's top does.
+	void ProbeFoldedNode(QueryNode &node, const identifier_set_t &names, bool table_in_scope,
+	                     vector<identifier_set_t> &inner_parameters) {
+		EnumerateFoldedNode(node, names, table_in_scope,
+		                    [&](unique_ptr<ParsedExpression> &expr, const identifier_set_t &expr_names, bool in_scope) {
+			                    ProbeFoldedSubquery(*expr, expr_names, in_scope, inner_parameters);
+		                    });
+	}
+
+	void ProbeFoldedSubquery(ParsedExpression &expr, const identifier_set_t &names, bool table_in_scope,
+	                         vector<identifier_set_t> &inner_parameters) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::COLUMN_REF: {
+			auto &column_ref = expr.Cast<ColumnRefExpression>();
+			auto &leading_name = column_ref.ColumnNames()[0];
+			if (names.count(leading_name) && !LambdaExpression::IsLambdaParameter(inner_parameters, leading_name)) {
+				CaptureByCallerScope(column_ref);
+			}
+			return;
+		}
+		case ExpressionClass::FUNCTION: {
+			// a dot call's receiver and an arrow at a lambda position are read as at the top of the lambda
+			auto &function = expr.Cast<FunctionExpression>();
+			auto &path = function.GetQualifiedName().Path();
+			if (path.size() >= 3 && names.count(path[0]) &&
+			    !LambdaExpression::IsLambdaParameter(inner_parameters, path[0]) && IsDotCall(function, ProbeBinder())) {
+				auto &qualified_name = function.GetQualifiedName();
+				CaptureByCallerScope(ColumnRefExpression(qualified_name.Schema(), qualified_name.Catalog()));
+			}
+			EnumerateCallChildren(
+			    function, ProbeBinder(),
+			    [&](unique_ptr<ParsedExpression> &child) {
+				    ProbeFoldedSubquery(*child, names, table_in_scope, inner_parameters);
+			    },
+			    [&](LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters) {
+				    inner_parameters.emplace_back();
+				    for (auto &parameter : parameters) {
+					    inner_parameters.back().insert(parameter.get().GetColumnName());
+				    }
+				    ProbeFoldedSubquery(*lambda_expr.RightMutable(), names, table_in_scope, inner_parameters);
+				    inner_parameters.pop_back();
+			    });
+			return;
+		}
+		case ExpressionClass::SUBQUERY:
+			// the IN, ANY or ALL operand is a child of the subquery expression, read below
+			ProbeFoldedNode(*expr.Cast<SubqueryExpression>().Subquery()->node, names, table_in_scope, inner_parameters);
+			break;
+		default:
+			break;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<ParsedExpression> &child) {
+			ProbeFoldedSubquery(*child, names, table_in_scope, inner_parameters);
+		});
+	}
+
+	bool CallerScopeBindsElsewhere(const ColumnRefExpression &column_ref) {
+		auto &parameter = column_ref.ColumnNames()[0];
+		vector<DummyBinding> parameter_binding;
+		parameter_binding.emplace_back(vector<LogicalType> {LogicalType::ANY}, vector<Identifier> {parameter},
+		                               parameter.GetIdentifierName());
+		ColumnQualifier qualifier(binder, &parameter_binding);
+		ColumnRefExpression probe(column_ref.ColumnNames());
+		unique_ptr<ParsedExpression> qualified;
+		try {
+			ErrorData error;
+			qualified = qualifier.QualifyColumnName(probe, error);
+		} catch (std::exception &ex) {
+			if (ErrorData(ex).Type() != ExceptionType::BINDER) {
+				throw;
+			}
+			// an ambiguous name in the caller's scope is no reading of the parameter either
+			return true;
+		}
+		D_ASSERT(qualified);
+		reference<ParsedExpression> base = *qualified;
+		while (base.get().GetExpressionType() == ExpressionType::STRUCT_EXTRACT) {
+			base = *base.get().Cast<OperatorExpression>().GetChildren()[0];
+		}
+		return base.get().GetExpressionClass() != ExpressionClass::LAMBDA_REF;
+	}
+
 	// A rename can end ReplaceMacroParameters' last name test, so a qualified form counts whatever its last name.
 	void CaptureColumnReference(ColumnRefExpression &column_ref) {
 		auto &names = column_ref.ColumnNames();
+		if (body_is_qualified) {
+			CaptureByCallerScope(column_ref);
+		}
 		if (!column_ref.IsQualified()) {
 			if (!IsLambdaParameter(names[0])) {
 				CaptureMacroParameter(names[0]);
@@ -1088,6 +1233,7 @@ private:
 	vector<LambdaScope> scopes;
 	idx_t subquery_depth = 0;
 	idx_t folding = 0;
+	idx_t caller_scope_folding = 0;
 	bool folded_table_in_scope = false;
 	unordered_map<column_t, identifier_set_t> argument_names;
 	unique_ptr<identifier_set_t> caller_window_names;

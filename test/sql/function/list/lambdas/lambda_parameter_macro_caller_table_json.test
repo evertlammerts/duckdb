@@ -1,0 +1,46 @@
+# name: test/sql/function/list/lambdas/lambda_parameter_macro_caller_table_json.test
+# description: A caller table named like a macro body's lambda parameter, with a JSON arrow in the body
+# group: [lambdas]
+
+require json
+
+statement ok
+CREATE TABLE x AS SELECT 'zz' AS d;
+
+# the arrow inside concat is the JSON operator, its left side the enclosing lambda's parameter
+
+statement ok
+CREATE MACRO j() AS list_transform(['{"k": 42, "zz": 7}'::JSON], lambda x: concat(x -> 'k', ''));
+
+query I
+SELECT j() FROM x;
+----
+[42]
+
+statement ok
+CREATE MACRO jd() AS list_transform([{'d': 'k', 'k': 42}], lambda x: concat(x -> x.d, ''));
+
+query I
+SELECT jd() FROM x;
+----
+[42]
+
+query I
+SELECT jd() FROM x AS q;
+----
+[42]
+
+# inside a folded subquery an arrow off a lambda position is the JSON operator, so its left side reads the parameter
+
+statement ok
+CREATE MACRO json_fold() AS list_transform([{'d': 'k', 'K': 42}], lambda x: typeof((SELECT x -> upper(x.d))));
+
+query I
+SELECT json_fold() FROM (SELECT 50 AS d) x;
+----
+[JSON]
+
+query I
+SELECT list_transform([{'d': 'k', 'K': 42}], lambda x: typeof((SELECT x -> upper(x.d)))) FROM (SELECT 50 AS d) q;
+----
+[JSON]
