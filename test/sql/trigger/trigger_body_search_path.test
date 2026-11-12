@@ -523,6 +523,154 @@ SELECT (SELECT count(*) FROM memory.main.log WHERE v = 't4 main'), (SELECT count
 ----
 1	0
 
+# In a schema of db2 other than main, a name found only in db2's main resolves there, not in the session database's main
+statement ok
+CREATE SCHEMA db2.s;
+
+statement ok
+CREATE TABLE db2.main.src(v VARCHAR);
+
+statement ok
+INSERT INTO db2.main.src VALUES ('db2.main.src');
+
+statement ok
+CREATE TABLE db2.s.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.log2(v VARCHAR);
+
+statement ok
+CREATE TABLE memory.main.log2(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.s.t18(id INTEGER);
+
+statement ok
+CREATE TABLE db2.s.r18(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t18_read AFTER INSERT ON s.t18 FOR EACH STATEMENT INSERT INTO log SELECT 'read ' || v FROM src;
+
+statement ok
+CREATE TRIGGER r18_write AFTER INSERT ON s.r18 FOR EACH ROW INSERT INTO log2 VALUES ('r18 row ' || NEW.id);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TRIGGER t18_created AFTER INSERT ON db2.s.t18 FOR EACH STATEMENT INSERT INTO log SELECT 'created ' || v FROM src;
+
+statement ok
+INSERT INTO db2.s.t18 VALUES (1);
+
+statement ok
+INSERT INTO db2.s.r18 VALUES (1);
+
+query T
+SELECT v FROM db2.s.log ORDER BY v;
+----
+created db2.main.src
+read db2.main.src
+
+query II
+SELECT (SELECT count(*) FROM db2.main.log2), (SELECT count(*) FROM memory.main.log2);
+----
+1	0
+
+# An INSERT target qualified with a nested schema picks its catalog under the body's search path
+statement ok
+CREATE SCHEMA db2.s.inner;
+
+statement ok
+CREATE TABLE db2.s.inner.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.t19(id INTEGER);
+
+statement ok
+CREATE TABLE db2.main.r19(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t19_statement AFTER INSERT ON t19 FOR EACH STATEMENT INSERT INTO s.inner.log VALUES ('t19 statement');
+
+statement ok
+CREATE TRIGGER r19_row AFTER INSERT ON r19 FOR EACH ROW INSERT INTO s.inner.log VALUES ('r19 row ' || NEW.id);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TRIGGER t19_created AFTER INSERT ON db2.main.t19 FOR EACH STATEMENT INSERT INTO s.inner.log VALUES ('t19 created');
+
+statement ok
+INSERT INTO db2.main.t19 VALUES (1);
+
+statement ok
+INSERT INTO db2.main.r19 VALUES (1);
+
+query T
+SELECT v FROM db2.s.inner.log ORDER BY v;
+----
+r19 row 1
+t19 created
+t19 statement
+
+# An INSERT target whose lone qualifier is a schema of db2 and later also an attached database is ambiguous, as in a
+# view of db2, instead of writing into that database
+statement ok
+CREATE SCHEMA db2.x;
+
+statement ok
+CREATE TABLE db2.x.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.t20(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t20_after AFTER INSERT ON t20 FOR EACH STATEMENT INSERT INTO x.log VALUES ('t20');
+
+statement ok
+CREATE VIEW v20 AS SELECT count(*) AS n FROM x.log;
+
+statement ok
+USE memory;
+
+statement ok
+INSERT INTO db2.main.t20 VALUES (1);
+
+statement ok
+ATTACH ':memory:' AS x;
+
+statement ok
+CREATE TABLE x.main.log(v VARCHAR);
+
+statement error
+INSERT INTO db2.main.t20 VALUES (2);
+----
+Ambiguous reference to catalog or schema "x"
+
+statement error
+SELECT n FROM db2.v20;
+----
+Ambiguous reference to catalog or schema "x"
+
+statement ok
+DETACH x;
+
+query T
+SELECT v FROM db2.x.log;
+----
+t20
+
 statement ok
 DETACH db2;
 
@@ -703,6 +851,75 @@ statement error
 SELECT n FROM s.v12;
 ----
 Table with name only_s2 does not exist
+
+# A name in the catalog's default schema and in the firing session's path, but not in the trigger's schema, resolves
+# in the default schema, for a macro as in a view's body, and for a table read and a table written
+statement ok
+CREATE SCHEMA s3;
+
+statement ok
+CREATE TABLE s3.log(v VARCHAR);
+
+statement ok
+CREATE TABLE s3.t17(id INTEGER);
+
+statement ok
+CREATE TABLE s3.r17(id INTEGER);
+
+statement ok
+CREATE MACRO s2.mac() AS 's2.mac';
+
+statement ok
+CREATE TABLE main.pick(v VARCHAR);
+
+statement ok
+INSERT INTO main.pick VALUES ('main.pick');
+
+statement ok
+CREATE TABLE s2.pick(v VARCHAR);
+
+statement ok
+INSERT INTO s2.pick VALUES ('s2.pick');
+
+statement ok
+CREATE TABLE main.dest(v VARCHAR);
+
+statement ok
+CREATE TABLE s2.dest(v VARCHAR);
+
+statement ok
+CREATE TRIGGER t17_after AFTER INSERT ON s3.t17 FOR EACH STATEMENT
+INSERT INTO log SELECT 'trigger ' || mac() UNION ALL SELECT 'trigger ' || v FROM pick;
+
+statement ok
+CREATE TRIGGER r17_row AFTER INSERT ON s3.r17 FOR EACH ROW INSERT INTO dest VALUES ('r17 row ' || NEW.id);
+
+statement ok
+CREATE VIEW s3.v17 AS SELECT 'view ' || mac() AS v;
+
+statement ok
+SET search_path = 's2';
+
+statement ok
+INSERT INTO s3.t17 VALUES (1);
+
+statement ok
+INSERT INTO s3.r17 VALUES (1);
+
+query T
+SELECT v FROM s3.log UNION ALL SELECT v FROM s3.v17 ORDER BY v;
+----
+trigger main.mac
+trigger main.pick
+view main.mac
+
+statement ok
+RESET search_path;
+
+query II
+SELECT (SELECT count(*) FROM main.dest), (SELECT count(*) FROM s2.dest);
+----
+1	0
 
 # UPDATE and DELETE bodies, a type and a table function naming a table by string, each present in both schemas
 statement ok

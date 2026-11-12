@@ -203,6 +203,14 @@ private:
 	idx_t delim_index;
 };
 
+//! The scope a generated CTE holding a fired trigger's body binds in
+struct TriggerBodyCTE {
+	//! The schema of the trigger, which the body's names resolve in first
+	reference<const SchemaCatalogEntry> schema;
+	//! The CTE of the firing statement's changed rows, the one name outside the body it can read; empty for BEFORE
+	Identifier transition_source;
+};
+
 //! GlobalBinderState is state shared over the ENTIRE query, including subqueries, views, etc
 struct GlobalBinderState {
 	//! The count of bound_tables
@@ -230,6 +238,9 @@ struct GlobalBinderState {
 	//! table order, under which the captured OLD image is exposed via SQL aliases. Only populated for capture
 	//! requests presented through a CTE; a consumer that reads the OLD image directly leaves it absent.
 	reference_map_t<QueryNode, vector<Identifier>> trigger_old_capture_cte_names;
+	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the scope the body
+	//! binds in. A trigger being created does not depend on what those bodies resolve.
+	reference_map_t<QueryNode, TriggerBodyCTE> trigger_body_ctes;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
@@ -307,12 +318,11 @@ public:
 	BoundStatement BindAlterAddIndex(BoundStatement &result, CatalogEntry &entry, unique_ptr<AlterInfo> alter_info);
 
 	void SetCatalogLookupCallback(catalog_entry_callback_t callback);
-	//! Resolves names in the schema of a trigger first, as a view's body does
+	//! Resolves names in the schema of a trigger, then in its catalog's default schema, then as the session does
 	void SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema);
 	//! Binds as a fired trigger's body: in the trigger's schema, recording nothing for a trigger being created
 	void PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema);
-	//! The scope a fired trigger's body binds in: no name of the firing statement, except a given CTE of its changed
-	//! rows
+	//! Hides the firing statement's CTEs and columns from a fired trigger body, except a given CTE of its changed rows
 	static shared_ptr<Binder> CreateTriggerBodyScope(Binder &parent,
 	                                                 const Identifier &transition_source = Identifier());
 	void BindCreateViewInfo(CreateViewInfo &base);
@@ -722,7 +732,7 @@ private:
 	Identifier BindCatalog(const Identifier &catalog_name);
 	SchemaCatalogEntry &BindCreateSchema(CreateInfo &info);
 
-	vector<CatalogSearchEntry> GetSearchPath(const Catalog &catalog, const vector<Identifier> &schema_path,
+	vector<CatalogSearchEntry> GetSearchPath(Catalog &catalog, const vector<Identifier> &schema_path,
 	                                         bool default_schema_precedence = false);
 
 	BoundStatement BindSelectNode(SelectNode &statement, BoundStatement from_table);
