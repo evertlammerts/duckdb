@@ -18,8 +18,10 @@ static unique_ptr<SubqueryRef> ParseSubquery(const string &query, TableFunctionB
 	}
 
 	auto &stmt = parser.statements[0];
-	// a parameter that only appears inside the string is invisible to the prepared statement and never gets a value
-	if (input.binder && input.binder->GetBindingMode() == BindingMode::PREPARE) {
+	// a parameter that only appears inside the string is invisible to the prepared statement and never gets a value;
+	// in a fired trigger body it names a user variable, never a parameter of the firing statement
+	if (input.binder && input.binder->GetBindingMode() == BindingMode::PREPARE &&
+	    !input.binder->BindsFiredTriggerBody()) {
 		for (auto &entry : stmt->named_param_map) {
 			if (!input.binder->StatementHasParameter(entry.first)) {
 				throw BinderException("Prepared statement parameter \"$%s\" only appears inside query(): declare it in "

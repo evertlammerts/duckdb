@@ -251,7 +251,7 @@ BoundStatement Binder::BindNode(UpdateQueryNode &node) {
 		unique_ptr<LogicalOperator> update_as_logicaloperator = std::move(update);
 
 		auto returning_result =
-		    BindReturning(std::move(node.returning_list), node.trigger_generated_returning, table, node.table->alias,
+		    BindReturning(std::move(node.returning_list), IsTriggerGeneratedReturning(node), table, node.table->alias,
 		                  update_table_index, std::move(update_as_logicaloperator));
 		if (capture_old) {
 			// Expose the captured OLD physical columns as extra output columns of the base CTE, under the reserved

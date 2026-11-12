@@ -1,5 +1,5 @@
 # name: test/sql/trigger/trigger_row_body_upsert.test
-# description: A FOR EACH ROW body that is an upsert or a MERGE INTO is refused at CREATE TRIGGER, since all firings of a statement run against one snapshot and one firing's conflict check cannot see another firing's insert
+# description: An upsert or MERGE INTO body of a FOR EACH ROW trigger is refused at CREATE TRIGGER, since all firings of a statement run against one snapshot; one in a statement trigger that row bodies fire runs once per firing statement, as plain SQL over the rows those bodies wrote
 # group: [trigger]
 
 require noforcestorage
