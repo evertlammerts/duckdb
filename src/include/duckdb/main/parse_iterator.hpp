@@ -73,10 +73,10 @@ public:
 private:
 	bool PeekInternal();
 	void ApplyInvalidationPolicy(const ErrorData &error);
-	//! Tokenize the full input once (grammar-free); no-op if already tokenized.
+	//! Tokenize the full input once with the grammar of `EnsureGrammar`; no-op if already tokenized.
 	void EnsureTokenized();
-	//! The session grammar of the first Peek; the Unicode space rewrite of `sql` and its tokenization both use it
-	const CompiledGrammar &EnsureGrammar();
+	//! Keep the session grammar on first use, `session_grammar` when given, and rewrite `sql` with its tokenizer
+	const CompiledGrammar &EnsureGrammar(shared_ptr<CompiledGrammar> session_grammar);
 
 private:
 	//! The bound context, used for parser options / metrics / override extensions.

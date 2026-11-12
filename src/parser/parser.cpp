@@ -210,12 +210,12 @@ void Parser::ThrowParserOverrideError(ParserOverrideResult &result) {
 	}
 }
 
-bool Parser::ValidateUTF8(const string &query) {
+bool Parser::IsASCIIAfterValidatingUTF8(const string &query) {
 	return ValidateUTF8Query(query) == UnicodeType::ASCII;
 }
 
 string Parser::NormalizeSQLString(const string &query, const Tokenizer &tokenizer) {
-	if (ValidateUTF8(query)) {
+	if (IsASCIIAfterValidatingUTF8(query)) {
 		return query;
 	}
 	string normalized;

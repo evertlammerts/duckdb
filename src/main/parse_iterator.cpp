@@ -19,7 +19,7 @@ ParseIterator::ParseIterator(ClientContext &context_p, const string &sql_p, bool
                              optional_ptr<ClientContextLock> held_lock_p)
     : context(context_p), apply_invalidation_policy(apply_invalidation_policy_p), held_lock(held_lock_p) {
 	try {
-		sql_is_ascii = Parser::ValidateUTF8(sql_p);
+		sql_is_ascii = Parser::IsASCIIAfterValidatingUTF8(sql_p);
 		sql = sql_p;
 	} catch (std::exception &ex) {
 		ApplyInvalidationPolicy(ErrorData(ex));
@@ -75,7 +75,7 @@ bool ParseIterator::PeekInternal() {
 	// query. If one does, we yield its statements one at a time and skip the PEG path entirely.
 	if (!override_resolved) {
 		override_resolved = true;
-		EnsureGrammar();
+		EnsureGrammar(options.compiled_grammar);
 		if (options.extensions) {
 			bool has_strict_extension_error = false;
 			ErrorData last_strict_extension_error;
@@ -157,17 +157,17 @@ bool ParseIterator::PeekInternal() {
 void ParseIterator::EnsureTokenized() {
 	if (!token_iterator) {
 		// Tokenize the full input once. Subsequent Peek/HasMore calls walk through the iterator;
-		// we never re-tokenize. Tokenization is grammar-free.
-		auto &tokenizer = EnsureGrammar().GetTokenizer();
+		// we never re-tokenize.
+		auto &tokenizer = EnsureGrammar(nullptr).GetTokenizer();
 		ParserTokenizerBehavior behavior(sql);
 		tokenizer.TokenizeInput(behavior);
 		token_iterator = make_uniq<TokenIterator>(behavior);
 	}
 }
 
-const CompiledGrammar &ParseIterator::EnsureGrammar() {
+const CompiledGrammar &ParseIterator::EnsureGrammar(shared_ptr<CompiledGrammar> session_grammar) {
 	if (!grammar) {
-		grammar = CompiledGrammar::Get(context);
+		grammar = session_grammar ? std::move(session_grammar) : CompiledGrammar::Get(context);
 		string rewritten;
 		if (!sql_is_ascii && Parser::StripUnicodeSpaces(sql, rewritten, grammar->GetTokenizer())) {
 			sql = std::move(rewritten);

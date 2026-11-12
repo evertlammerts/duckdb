@@ -110,8 +110,8 @@ public:
 	//! Set `new_query` to `query_str` with the Unicode spaces between the tokens `tokenizer` finds made ASCII, if any
 	static bool StripUnicodeSpaces(const string &query_str, string &new_query, const Tokenizer &tokenizer);
 
-	//! Throw a ParserException when `query` is not valid UTF-8; returns whether it is ASCII
-	static bool ValidateUTF8(const string &query);
+	//! Throw a ParserException when `query` is not valid UTF-8, else return whether it is ASCII
+	static bool IsASCIIAfterValidatingUTF8(const string &query);
 	//! Validate UTF-8 (throws on invalid), then rewrite the Unicode spaces between the tokens `tokenizer` finds
 	static string NormalizeSQLString(const string &query, const Tokenizer &tokenizer);
 

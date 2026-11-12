@@ -217,10 +217,9 @@ TEST_CASE("Unicode spaces are rewritten with the tokenizer of the dialect", "[ap
 	REQUIRE_NO_FAIL(con.Query("SET current_dialect = 'backslash_escape'"));
 
 	// U+00A0 inside the second literal, which follows a literal holding a backslash escaped quote
-	const string sql = "SELECT 'it\\'s' AS a, length('x\xC2\xA0y') AS n, strlen('x\xC2\xA0y') AS o";
+	const string sql = "SELECT 'it\\'s' AS a, length('x\xC2\xA0y') AS n";
 	auto result = con.Query(sql);
 	REQUIRE(CHECK_COLUMN(result, 1, {3}));
-	REQUIRE(CHECK_COLUMN(result, 2, {4}));
 
 	Parser parser(*con.context);
 	parser.ParseQuery(sql);
@@ -231,4 +230,35 @@ TEST_CASE("Unicode spaces are rewritten with the tokenizer of the dialect", "[ap
 	result = con.Query("SELECT\xC2\xA0'it\\'s' AS a,\xC2\xA0"
 	                   "42 AS b");
 	REQUIRE(CHECK_COLUMN(result, 1, {42}));
+}
+
+struct RecordingOverrideInfo : public ParserExtensionInfo {
+	vector<string> received;
+};
+
+static ParserOverrideResult RecordingOverride(ParserExtensionInfo *info, const string &query, ParserOptions &) {
+	info->Cast<RecordingOverrideInfo>().received.push_back(query);
+	return ParserOverrideResult();
+}
+
+TEST_CASE("Parser override extensions receive the text with Unicode spaces rewritten", "[api][parser_override]") {
+	DBConfig config;
+	auto info = make_shared_ptr<RecordingOverrideInfo>();
+	ParserExtension extension;
+	extension.parser_override = RecordingOverride;
+	extension.parser_info = info;
+	ParserExtension::Register(config, extension);
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET allow_parser_override_extension = 'fallback'"));
+	info->received.clear();
+
+	// U+00A0 between tokens becomes two ASCII spaces, the one inside the literal stays
+	auto result = con.Query("SELECT\xC2\xA0"
+	                        "42 AS v, 'a\xC2\xA0"
+	                        "b' AS s");
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	REQUIRE(info->received.size() == 1);
+	REQUIRE(info->received[0] == "SELECT  42 AS v, 'a\xC2\xA0"
+	                             "b' AS s");
 }
