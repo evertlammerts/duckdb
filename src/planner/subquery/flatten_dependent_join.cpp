@@ -96,11 +96,49 @@ void FlattenDependentJoins::InvalidateAccessCache() {
 	access_cache.clear();
 }
 
-FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetSubtreeAccess(LogicalOperator &op) const {
-	auto entry = access_cache.find(op);
-	if (entry != access_cache.end()) {
-		return entry->second;
+static bool IsWrite(LogicalOperatorType type) {
+	switch (type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_UPDATE:
+	case LogicalOperatorType::LOGICAL_DELETE:
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		return true;
+	default:
+		return false;
 	}
+}
+
+// A write together with its own WITH clause and RETURNING list.
+static bool IsWriteStatement(const LogicalOperator &op) {
+	if (IsWrite(op.type)) {
+		return true;
+	}
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return IsWriteStatement(*op.children[0]);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return IsWriteStatement(*op.children[1]);
+	default:
+		return false;
+	}
+}
+
+static bool ReadsCTEOutsideWrites(const LogicalOperator &op, const unordered_set<TableIndex> &cte_indexes) {
+	if (cte_indexes.empty() || IsWrite(op.type)) {
+		return false;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		return cte_indexes.find(op.Cast<LogicalCTERef>().cte_index) != cte_indexes.end();
+	}
+	for (auto &child : op.children) {
+		if (ReadsCTEOutsideWrites(*child, cte_indexes)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetOperatorAccess(LogicalOperator &op) const {
 	SubtreeAccess result;
 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &dependent_join = op.Cast<LogicalDependentJoin>();
@@ -138,11 +176,55 @@ FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetSubtreeAccess(Log
 			                         correlated_aliases.find(bound_colref.Binding()) != correlated_aliases.end();
 		    });
 	});
+	return result;
+}
+
+FlattenDependentJoins::SubtreeAccess FlattenDependentJoins::GetSubtreeAccess(LogicalOperator &op) const {
+	auto entry = access_cache.find(op);
+	if (entry != access_cache.end()) {
+		return entry->second;
+	}
+	auto result = GetOperatorAccess(op);
 	for (auto &child : op.children) {
 		result.Merge(GetSubtreeAccess(*child));
 	}
+	if (IsWriteStatement(op)) {
+		// A write statement that reads no outer row runs once, so a volatile part of it does not tie it to one.
+		result.volatile_expression = false;
+	}
 	access_cache.emplace(op, result);
 	return result;
+}
+
+bool FlattenDependentJoins::ReturnsUncorrelatedRows(LogicalOperator &op,
+                                                    const unordered_set<TableIndex> &correlated_ctes) const {
+	// The readers of a CTE nested in op are patched only when its definition is pushed down, so until then a read of
+	// a CTE whose definition needs the domain is found by its index.
+	if (!RequiresDomain(op) && !ReadsCTEOutsideWrites(op, correlated_ctes)) {
+		return true;
+	}
+	auto access = GetOperatorAccess(op);
+	if (IsWrite(op.type)) {
+		return !access.correlated;
+	}
+	if (access.correlated || (!perform_delim && access.volatile_expression && !IsWriteStatement(op))) {
+		return false;
+	}
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return ReturnsUncorrelatedRows(*op.children[0], correlated_ctes);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+		if (ReturnsUncorrelatedRows(*op.children[0], correlated_ctes)) {
+			return ReturnsUncorrelatedRows(*op.children[1], correlated_ctes);
+		}
+		auto consumer_correlated_ctes = correlated_ctes;
+		consumer_correlated_ctes.insert(op.Cast<LogicalMaterializedCTE>().table_index);
+		return ReturnsUncorrelatedRows(*op.children[1], consumer_correlated_ctes);
+	}
+	default:
+		return false;
+	}
 }
 
 bool FlattenDependentJoins::RequiresDomain(LogicalOperator &op) const {
@@ -354,36 +436,29 @@ FlattenDependentJoins::DecorrelateSubtreeInternal(unique_ptr<LogicalOperator> &p
 				output.right_payload.erase(right_entry);
 			}
 		}
-		auto left_child_requires_domain = RequiresDomain(*plan->children[0]);
-		auto requires_full_rhs_decorrelation = left_child_requires_domain || op.join_type != JoinType::SINGLE;
-
 		// Phase 1: prepare the left side in the current flattener context.
 		auto outer_state = PrepareDependentJoinLeft(plan, propagate_null_values, std::move(state));
 		// Phase 2: push the active correlated state through the right subtree in a child flattener.
 		FlattenDependentJoins child_flatten(binder, op.correlated_columns, op.perform_delim, op.any_join, this);
 		child_flatten.AddReplacementAliases(outer_state.replacement_graph);
 
-		unique_ptr<LogicalOperator> detached_cte = nullptr;
-		if (plan->children[1]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		// Leading CTEs before the first one that needs this join's domain are evaluated once, above the join.
+		vector<unique_ptr<LogicalOperator>> detached_ctes;
+		while (plan->children[1]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 			auto &cte_ref = plan->children[1]->Cast<LogicalMaterializedCTE>();
-			if (!child_flatten.RequiresDomain(*cte_ref.children[0])) {
-				detached_cte = std::move(plan->children[1]);
-				plan->children[1] = std::move(detached_cte->children[1]);
-				// the definition is outside this join's domain, but may contain dependent joins of its own
-				auto old_definition_bindings = detached_cte->children[0]->GetColumnBindings();
-				auto definition_state = DecorrelateIndependentSubtree(detached_cte->children[0]);
-				ColumnBindingRewrite::ApplyToChild(detached_cte, 0, std::move(old_definition_bindings),
-				                                   definition_state.replacement_graph);
-				// the domain probe above cached access entries for definition operators this replaced
-				child_flatten.InvalidateAccessCache();
-				if (requires_full_rhs_decorrelation) {
-					auto result = DecorrelateSubtree(plan, propagate_null_values, std::move(outer_state.bindings));
-					result.replacement_graph.Merge(outer_state.replacement_graph);
-					detached_cte->children[1] = std::move(plan);
-					plan = std::move(detached_cte);
-					return result;
-				}
+			if (child_flatten.RequiresDomain(*cte_ref.children[0])) {
+				break;
 			}
+			auto detached_cte = std::move(plan->children[1]);
+			plan->children[1] = std::move(detached_cte->children[1]);
+			// the definition is outside this join's domain, but may contain dependent joins of its own
+			auto old_definition_bindings = detached_cte->children[0]->GetColumnBindings();
+			auto definition_state = DecorrelateIndependentSubtree(detached_cte->children[0]);
+			ColumnBindingRewrite::ApplyToChild(detached_cte, 0, std::move(old_definition_bindings),
+			                                   definition_state.replacement_graph);
+			// the domain probe above cached access entries for definition operators this replaced
+			child_flatten.InvalidateAccessCache();
+			detached_ctes.push_back(std::move(detached_cte));
 		}
 
 		auto old_right_bindings = plan->children[1]->GetColumnBindings();
@@ -398,9 +473,9 @@ FlattenDependentJoins::DecorrelateSubtreeInternal(unique_ptr<LogicalOperator> &p
 		// Phase 3: finalize the current dependent join using the state produced on the right.
 		auto result = FinalizeDependentJoin(plan, std::move(outer_state), right_state, std::move(output));
 
-		if (detached_cte) {
-			detached_cte->children[1] = std::move(plan);
-			plan = std::move(detached_cte);
+		for (auto it = detached_ctes.rbegin(); it != detached_ctes.rend(); ++it) {
+			(*it)->children[1] = std::move(plan);
+			plan = std::move(*it);
 		}
 		return result;
 	}
@@ -1489,14 +1564,20 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownExpressionG
 	return result;
 }
 
-FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownDML(unique_ptr<LogicalOperator> &plan,
-                                                                         bool propagate_null_values,
-                                                                         vector<ColumnBinding> state) {
+FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownDMLInput(unique_ptr<LogicalOperator> &plan,
+                                                                              bool propagate_null_values,
+                                                                              vector<ColumnBinding> state) {
+	if (plan->type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		// A MERGE that reads the firing rows of a FOR EACH ROW trigger would run once per firing row, and its conflict
+		// check would not see the rows the other firings write; CREATE TRIGGER already refuses such row bodies.
+		throw NotImplementedException(
+		    "MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger");
+	}
 	auto result = PushDownChild(plan, propagate_null_values, std::move(state));
 	if (plan->type == LogicalOperatorType::LOGICAL_INSERT || plan->type == LogicalOperatorType::LOGICAL_UPDATE) {
 		// PushDownChild appended the correlated columns to the child projection.
 		// PhysicalInsert requires an exact column count and PhysicalUpdate requires the row-id last,
-		// so remove the appended columns. The DELIM_GET below re-supplies them.
+		// so remove the appended columns.
 		// DELETE is skipped because PhysicalDelete reads the row-id by a fixed index.
 		auto &child = *plan->children[0];
 		if (child.type == LogicalOperatorType::LOGICAL_PROJECTION &&
@@ -1505,6 +1586,13 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownDML(unique_
 			child.ResolveOperatorTypes();
 		}
 	}
+	return result;
+}
+
+FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownDML(unique_ptr<LogicalOperator> &plan,
+                                                                         bool propagate_null_values,
+                                                                         vector<ColumnBinding> state) {
+	auto result = PushDownDMLInput(plan, propagate_null_values, std::move(state));
 	// DML output does not carry the child columns, so re-expose the correlation keys in a separate DELIM_GET that
 	// the parent DelimJoin can reference.
 	auto expose_idx = binder.GenerateTableIndex();
@@ -1538,24 +1626,8 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownGet(unique_
 	return result;
 }
 
-FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTE(unique_ptr<LogicalOperator> &plan,
-                                                                         bool propagate_null_values,
-                                                                         vector<ColumnBinding> state) {
-#ifdef DEBUG
-	plan->children[0]->ResolveOperatorTypes();
-	plan->children[1]->ResolveOperatorTypes();
-#endif
-	if (plan->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && !RequiresDomain(*plan->children[0])) {
-		UnnestingState result(std::move(state));
-		if (RequiresDomain(*plan->children[1])) {
-			auto old_right_bindings = plan->children[1]->GetColumnBindings();
-			result = PushDownCorrelatedNode(plan->children[1], propagate_null_values, std::move(result.bindings));
-			ColumnBindingRewrite::ApplyToChild(plan, 1, std::move(old_right_bindings), result.replacement_graph);
-			DecorrelateIndependentSubtree(plan->children[0]);
-		}
-		return result;
-	}
-
+FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTEDefinition(unique_ptr<LogicalOperator> &plan,
+                                                                                   vector<ColumnBinding> state) {
 	auto old_left_bindings = plan->children[0]->GetColumnBindings();
 	// the CTE definition is scanned in contexts this chain does not see
 	auto result = PushDownCorrelatedNode(plan->children[0], false, std::move(state));
@@ -1569,18 +1641,88 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTE(unique_
 	InvalidateAccessCache();
 
 	// The CTE outputs a contiguous block of bindings. Lock this state in.
-	auto cte_state = CreateContiguousState(ColumnBinding(cte.table_index, ProjectionIndex(cte.column_count)));
+	result.bindings = CreateContiguousState(ColumnBinding(cte.table_index, ProjectionIndex(cte.column_count)));
 
 	// Recursive CTE Specific Setup
 	if (plan->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
 		auto &rec_cte = plan->Cast<LogicalRecursiveCTE>();
 		if (!rec_cte.key_targets.empty()) {
-			AppendCorrelatedColumns(rec_cte.key_targets, cte_state, false);
+			AppendCorrelatedColumns(rec_cte.key_targets, result.bindings, false);
 		}
 		for (auto &col : correlated_columns) {
 			rec_cte.internal_types.push_back(col.type);
 		}
 	}
+	return result;
+}
+
+BindingReplacementGraph FlattenDependentJoins::PushDownWriteInput(unique_ptr<LogicalOperator> &plan,
+                                                                  vector<ColumnBinding> state) {
+	if (!RequiresDomain(*plan)) {
+		return DecorrelateIndependentSubtree(plan).replacement_graph;
+	}
+	switch (plan->type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER: {
+		auto old_child_bindings = plan->children[0]->GetColumnBindings();
+		auto replacements = PushDownWriteInput(plan->children[0], std::move(state));
+		ColumnBindingRewrite::ApplyToChild(plan, 0, std::move(old_child_bindings), replacements);
+		return replacements;
+	}
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+		auto correlated_definition = !ReturnsUncorrelatedRows(*plan->children[0]);
+		BindingReplacementGraph replacements;
+		auto consumer_state = state;
+		if (correlated_definition) {
+			auto definition_state = PushDownCTEDefinition(plan, std::move(state));
+			replacements = std::move(definition_state.replacement_graph);
+			consumer_state = std::move(definition_state.bindings);
+		} else {
+			auto old_definition_bindings = plan->children[0]->GetColumnBindings();
+			replacements = PushDownWriteInput(plan->children[0], std::move(state));
+			ColumnBindingRewrite::ApplyToChild(plan, 0, std::move(old_definition_bindings), replacements);
+		}
+		auto old_consumer_bindings = plan->children[1]->GetColumnBindings();
+		auto consumer_replacements = PushDownWriteInput(plan->children[1], std::move(consumer_state));
+		ColumnBindingRewrite::ApplyToChild(plan, 1, std::move(old_consumer_bindings), consumer_replacements);
+		replacements.Merge(consumer_replacements);
+		if (correlated_definition) {
+			plan->Cast<LogicalCTE>().column_count += correlated_columns.size();
+		}
+		return replacements;
+	}
+	default:
+		if (!IsWrite(plan->type)) {
+			throw InternalException("Flatten dependent joins - %s in a subtree that returns uncorrelated rows",
+			                        LogicalOperatorToString(plan->type));
+		}
+		return PushDownDMLInput(plan, false, std::move(state)).replacement_graph;
+	}
+}
+
+FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTE(unique_ptr<LogicalOperator> &plan,
+                                                                         bool propagate_null_values,
+                                                                         vector<ColumnBinding> state) {
+#ifdef DEBUG
+	plan->children[0]->ResolveOperatorTypes();
+	plan->children[1]->ResolveOperatorTypes();
+#endif
+	if (plan->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && ReturnsUncorrelatedRows(*plan->children[0])) {
+		// The rows a write returns carry no key of the outer row that wrote them, so the readers of the CTE read
+		// each row once and only the inputs of its writes see the outer rows.
+		auto old_right_bindings = plan->children[1]->GetColumnBindings();
+		auto result = RequiresDomain(*plan->children[1])
+		                  ? PushDownCorrelatedNode(plan->children[1], propagate_null_values, state)
+		                  : AttachDomainToIndependentSubtree(plan->children[1], propagate_null_values);
+		ColumnBindingRewrite::ApplyToChild(plan, 1, std::move(old_right_bindings), result.replacement_graph);
+		auto old_definition_bindings = plan->children[0]->GetColumnBindings();
+		auto definition_replacements = PushDownWriteInput(plan->children[0], std::move(state));
+		ColumnBindingRewrite::ApplyToChild(plan, 0, std::move(old_definition_bindings), definition_replacements);
+		return result;
+	}
+
+	auto result = PushDownCTEDefinition(plan, std::move(state));
+	auto cte_state = result.bindings;
 
 	auto old_right_bindings = plan->children[1]->GetColumnBindings();
 	auto right_state = PushDownCorrelatedNode(plan->children[1], false, cte_state);
@@ -1593,7 +1735,7 @@ FlattenDependentJoins::UnnestingState FlattenDependentJoins::PushDownCTE(unique_
 	plan->children[1]->ResolveOperatorTypes();
 #endif
 
-	cte.column_count += correlated_columns.size();
+	plan->Cast<LogicalCTE>().column_count += correlated_columns.size();
 
 	result.bindings =
 	    (plan->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) ? std::move(cte_state) : right_state.bindings;
@@ -1726,14 +1868,11 @@ FlattenDependentJoins::PushDownCorrelatedNodeInternal(unique_ptr<LogicalOperator
 	}
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_UPDATE:
-	case LogicalOperatorType::LOGICAL_DELETE: {
+	case LogicalOperatorType::LOGICAL_DELETE:
+	case LogicalOperatorType::LOGICAL_MERGE_INTO: {
 		// the modified row count is a side effect
 		return PushDownDML(plan, false, std::move(state));
 	}
-	case LogicalOperatorType::LOGICAL_MERGE_INTO:
-		// Only row trigger firings reach here, and one batched MERGE cannot see the rows other firings write.
-		throw NotImplementedException(
-		    "MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger");
 	case LogicalOperatorType::LOGICAL_PIVOT:
 		throw BinderException("PIVOT is not supported in correlated subqueries yet");
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {

@@ -1,5 +1,5 @@
 # name: test/sql/trigger/trigger_row_body_upsert.test
-# description: An upsert or MERGE INTO body of a FOR EACH ROW trigger is refused at CREATE TRIGGER, and one in a statement trigger that a row body fires is refused when it fires if it reads the transition table or calls a volatile function, since all firings of a statement run against one snapshot
+# description: An upsert or MERGE INTO body of a FOR EACH ROW trigger is refused at CREATE TRIGGER, since all firings of a statement run against one snapshot; one in a statement trigger that row bodies fire runs once per firing statement, as plain SQL over the rows those bodies wrote
 # group: [trigger]
 
 require noforcestorage
@@ -253,15 +253,31 @@ SELECT * FROM s;
 statement ok
 DROP TRIGGER s_upsert ON s;
 
-# an upsert or MERGE in a statement trigger that reads the rows a row body wrote is refused when it fires
+# an upsert or MERGE in a statement trigger fired by the writes of row bodies runs once per firing statement, over all
+# the rows those bodies wrote, as the same write does in plain SQL over those rows
 statement ok
 CREATE TRIGGER s_upsert AFTER INSERT ON s REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
     INSERT INTO a SELECT id, 0 FROM nt ON CONFLICT DO UPDATE SET n = n + 1;
 
-statement error
-INSERT INTO b VALUES (6);
+statement ok
+INSERT INTO b VALUES (6), (7);
+
+query II
+SELECT * FROM a ORDER BY id;
 ----
-Not implemented Error: MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger
+2	11
+106	0
+107	0
+
+statement ok
+INSERT INTO b VALUES (6);
+
+query II
+SELECT * FROM a ORDER BY id;
+----
+2	11
+106	1
+107	0
 
 statement ok
 CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
@@ -269,27 +285,134 @@ CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s REFERENCING NEW TABLE AS nt
     WHEN MATCHED THEN UPDATE SET n = a.n + 1
     WHEN NOT MATCHED THEN INSERT VALUES (nt.id, 0);
 
-statement error
-INSERT INTO b VALUES (6);
-----
-Not implemented Error: MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger
-
-# so is one with a volatile function, which the dependent join evaluates per firing row
 statement ok
-CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s FOR EACH STATEMENT
-    INSERT INTO a VALUES (2, (random() * 0)::INTEGER) ON CONFLICT DO UPDATE SET n = n + 1;
-
-statement error
-INSERT INTO b VALUES (6);
-----
-Not implemented Error: MERGE INTO and INSERT ... ON CONFLICT are not yet supported over the rows of a FOR EACH ROW trigger
+INSERT INTO b VALUES (6), (8);
 
 query II
 SELECT * FROM a ORDER BY id;
 ----
 2	11
+106	2
+107	0
+108	0
+
+# a new key twice in the transition table makes the MERGE insert it twice, the key violation of plain SQL
+statement error
+INSERT INTO b VALUES (9), (9);
+----
+PRIMARY KEY or UNIQUE constraint violation: duplicate key "109"
+
+# a volatile upsert body without a transition table runs once per firing statement too
+statement ok
+CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s FOR EACH STATEMENT
+    INSERT INTO a VALUES (2, (random() * 0)::INTEGER) ON CONFLICT DO UPDATE SET n = n + 1;
+
+statement ok
+INSERT INTO b VALUES (10), (11);
+
+query II
+SELECT * FROM a ORDER BY id;
+----
+2	12
+106	2
+107	0
+108	0
 
 query I
-SELECT * FROM s;
+SELECT * FROM s ORDER BY ALL;
 ----
 105
+106
+106
+106
+107
+108
+110
+111
+
+# the same upsert written with its own WITH clause runs once per firing statement as well
+statement ok
+CREATE OR REPLACE TRIGGER s_upsert AFTER INSERT ON s FOR EACH STATEMENT
+    WITH x AS (SELECT 2 AS id, (random() * 0)::INTEGER AS z) INSERT INTO a SELECT id, z FROM x ON CONFLICT DO UPDATE SET n = n + 1;
+
+statement ok
+INSERT INTO b VALUES (12), (13);
+
+query II
+SELECT * FROM a ORDER BY id;
+----
+2	13
+106	2
+107	0
+108	0
+
+# an ON CONFLICT DO UPDATE body over a transition table holding one key twice gives what the same insert gives in
+# plain SQL
+statement ok
+CREATE TABLE ka(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE TABLE kp(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE TABLE ks(id INTEGER);
+
+statement ok
+CREATE TABLE kb(id INTEGER);
+
+statement ok
+CREATE TRIGGER ks_up AFTER INSERT ON ks REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
+    INSERT INTO ka SELECT id, 0 FROM nt ON CONFLICT DO UPDATE SET n = n + 1;
+
+statement ok
+CREATE TRIGGER kb_row AFTER INSERT ON kb FOR EACH ROW
+    INSERT INTO ks VALUES (NEW.id + 100);
+
+statement ok
+INSERT INTO kb VALUES (9), (9);
+
+statement ok
+INSERT INTO kp SELECT * FROM (VALUES (109, 0), (109, 0)) v(id, n) ON CONFLICT DO UPDATE SET n = n + 1;
+
+query II
+SELECT * FROM ka ORDER BY id;
+----
+109	0
+
+query II
+SELECT * FROM kp ORDER BY id;
+----
+109	0
+
+# a volatile generated column in the written table keeps each written row once in the transition table, so a MERGE
+# body matches an existing key once
+statement ok
+CREATE TABLE ga(id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+INSERT INTO ga VALUES (106, 0);
+
+statement ok
+CREATE TABLE gs(id INTEGER, stamp DOUBLE GENERATED ALWAYS AS (random()));
+
+statement ok
+CREATE TABLE gb(id INTEGER);
+
+statement ok
+CREATE TRIGGER gs_merge AFTER INSERT ON gs REFERENCING NEW TABLE AS nt FOR EACH STATEMENT
+    MERGE INTO ga USING nt ON ga.id = nt.id
+    WHEN MATCHED THEN UPDATE SET n = ga.n + 1
+    WHEN NOT MATCHED THEN INSERT VALUES (nt.id, 0);
+
+statement ok
+CREATE TRIGGER gb_row AFTER INSERT ON gb FOR EACH ROW
+    INSERT INTO gs VALUES (NEW.id + 100);
+
+statement ok
+INSERT INTO gb VALUES (6), (7);
+
+query II
+SELECT * FROM ga ORDER BY id;
+----
+106	1
+107	0

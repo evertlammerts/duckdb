@@ -10,6 +10,7 @@
 
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
@@ -71,6 +72,11 @@ private:
 	//! Checks whether a subtree must be evaluated in this flattener's active domain.
 	bool RequiresDomain(LogicalOperator &op) const;
 	SubtreeAccess GetSubtreeAccess(LogicalOperator &op) const;
+	SubtreeAccess GetOperatorAccess(LogicalOperator &op) const;
+	//! Checks whether a subtree outputs the same rows for every row of the active domain: each of its references to
+	//! the domain feeds the input of a write whose returned rows it outputs, and those rows carry no domain key.
+	//! correlated_ctes holds the indexes of the CTEs nested in op whose definitions need the domain.
+	bool ReturnsUncorrelatedRows(LogicalOperator &op, const unordered_set<TableIndex> &correlated_ctes = {}) const;
 	idx_t GetDelimKeyIndex(idx_t index) const;
 
 	//! propagate_null_values: everything above cannot distinguish one row with all-NULL original columns from
@@ -139,9 +145,16 @@ private:
 	                                vector<ColumnBinding> state);
 	UnnestingState PushDownExpressionGet(unique_ptr<LogicalOperator> &plan, bool propagate_null_values,
 	                                     vector<ColumnBinding> state);
+	UnnestingState PushDownDMLInput(unique_ptr<LogicalOperator> &plan, bool propagate_null_values,
+	                                vector<ColumnBinding> state);
 	UnnestingState PushDownDML(unique_ptr<LogicalOperator> &plan, bool propagate_null_values,
 	                           vector<ColumnBinding> state);
+	//! Pushes the domain into the write inputs of a subtree for which ReturnsUncorrelatedRows holds; its output
+	//! gains no domain columns.
+	BindingReplacementGraph PushDownWriteInput(unique_ptr<LogicalOperator> &plan, vector<ColumnBinding> state);
 	UnnestingState PushDownGet(unique_ptr<LogicalOperator> &plan, vector<ColumnBinding> state);
+	//! Pushes the domain into a CTE definition and patches its readers; returns the domain bindings they read.
+	UnnestingState PushDownCTEDefinition(unique_ptr<LogicalOperator> &plan, vector<ColumnBinding> state);
 	UnnestingState PushDownCTE(unique_ptr<LogicalOperator> &plan, bool propagate_null_values,
 	                           vector<ColumnBinding> state);
 	UnnestingState PushDownCTERef(unique_ptr<LogicalOperator> &plan);

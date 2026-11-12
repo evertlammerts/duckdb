@@ -781,6 +781,8 @@ BoundStatement Binder::ExpandRowTriggers(QueryNode &node, vector<unique_ptr<Pars
 	}
 	row_scope->PopScope();
 
+	// Every firing of the statement runs in this one plan against one snapshot, so the statement triggers that the
+	// bodies' writes reach fire once for the firing statement, over all the rows those bodies wrote.
 	Identifier trigger_cte_name(string(TRIGGER_BODY_CTE_PREFIX) + "row_" + uuid_suffix);
 	auto trigger_cte_idx = GenerateTableIndex();
 	auto outer_query = std::move(bound.plan->children[1]);
