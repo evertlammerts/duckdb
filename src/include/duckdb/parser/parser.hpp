@@ -23,6 +23,7 @@ class ClientContext;
 struct CompiledGrammar;
 struct MatcherToken;
 class TokenIterator;
+class Tokenizer;
 class GroupByNode;
 struct UnicodeSpace {
 	UnicodeSpace(idx_t pos, idx_t bytes) : pos(pos), bytes(bytes) {
@@ -106,11 +107,13 @@ public:
 	ColumnList ParseColumnList(const string &column_list);
 	ColumnDefinition ParseColumnDefinition(const string &column_definition);
 
-	static bool StripUnicodeSpaces(const string &query_str, string &new_query);
+	//! Set `new_query` to `query_str` with the Unicode spaces between the tokens `tokenizer` finds made ASCII, if any
+	static bool StripUnicodeSpaces(const string &query_str, string &new_query, const Tokenizer &tokenizer);
 
-	//! Normalize a query string before parsing: validate UTF-8 (throws on invalid), then strip
-	//! non-ASCII Unicode spaces
-	static string NormalizeSQLString(const string &query);
+	//! Throw a ParserException when `query` is not valid UTF-8, else return whether it is ASCII
+	static bool IsASCIIAfterValidatingUTF8(const string &query);
+	//! Validate UTF-8 (throws on invalid), then rewrite the Unicode spaces between the tokens `tokenizer` finds
+	static string NormalizeSQLString(const string &query, const Tokenizer &tokenizer);
 
 	void ThrowParserOverrideError(ParserOverrideResult &result);
 

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
@@ -16,6 +17,7 @@
 namespace duckdb {
 class ClientContext;
 class ClientContextLock;
+struct CompiledGrammar;
 class ErrorData;
 class SQLStatement;
 class TokenIterator;
@@ -71,13 +73,17 @@ public:
 private:
 	bool PeekInternal();
 	void ApplyInvalidationPolicy(const ErrorData &error);
-	//! Tokenize the full input once (grammar-free); no-op if already tokenized.
+	//! Tokenize the full input once with the grammar of `EnsureGrammar`; no-op if already tokenized.
 	void EnsureTokenized();
+	//! Keep the session grammar on first use, `session_grammar` when given, and rewrite `sql` with its tokenizer
+	const CompiledGrammar &EnsureGrammar(shared_ptr<CompiledGrammar> session_grammar);
 
 private:
 	//! The bound context, used for parser options / metrics / override extensions.
 	ClientContext &context;
 	string sql;
+	bool sql_is_ascii = true;
+	shared_ptr<CompiledGrammar> grammar;
 	bool apply_invalidation_policy;
 	optional_ptr<ClientContextLock> held_lock;
 	//! Tokenized view of `sql` and its current position. Populated once on the first Peek.
