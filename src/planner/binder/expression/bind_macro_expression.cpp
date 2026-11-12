@@ -225,7 +225,8 @@ static void EnumerateScopedRefExpressions(TableRef &ref, const identifier_set_t 
 		break;
 	}
 	case TableReferenceType::SUBQUERY:
-		EnumerateScopedNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, declared_above, callback);
+		// a derived table sees its FROM siblings, with or without LATERAL
+		EnumerateScopedNodeExpressions(*ref.Cast<SubqueryRef>().subquery->node, declared, callback);
 		break;
 	default:
 		ParsedExpressionIterator::EnumerateTableRefChildren(ref, visit);
@@ -233,8 +234,7 @@ static void EnumerateScopedRefExpressions(TableRef &ref, const identifier_set_t 
 	}
 }
 
-// Each select node's expressions see the tables of its own FROM clause and of the query levels around it, not those
-// inside its derived tables, its CTE bodies or other set operation branches.
+// A select node sees its FROM clause and the levels around it, not its CTE bodies or other set operation branches.
 static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set_t &declared_above,
                                            const scoped_expression_callback_t &callback) {
 	switch (node.type) {
@@ -292,29 +292,40 @@ static void EnumerateScopedNodeExpressions(QueryNode &node, const identifier_set
 }
 
 // The qualifier resolves the receiver of a dot call x.f() or x.v.f() against the tables before lambda parameters.
-static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name) {
+static bool HasQualifiedReference(ParsedExpression &expr, const Identifier &name, bool in_subquery = false) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &column_ref = expr.Cast<ColumnRefExpression>();
-		return column_ref.IsQualified() && column_ref.ColumnNames()[0] == name;
+		return !in_subquery && column_ref.IsQualified() && column_ref.ColumnNames()[0] == name;
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &path = expr.Cast<FunctionExpression>().GetQualifiedName().Path();
-		if (path.size() >= 2 && path[0] == name) {
+		if (!in_subquery && path.size() >= 2 && path[0] == name) {
 			return true;
 		}
 	}
-	bool found = false;
-	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		// x.v where a select node of the subquery declares a table x reads that table
-		EnumerateScopedNodeExpressions(*expr.Cast<SubqueryExpression>().Subquery()->node, identifier_set_t(),
-		                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
-			                               if (!declared.count(name)) {
-				                               found = found || HasQualifiedReference(*child, name);
-			                               }
-		                               });
+	if (expr.GetExpressionClass() == ExpressionClass::LAMBDA && in_subquery) {
+		// a lambda in a subquery that declares the name is renamed with it, so its own reads count again
+		auto &lambda_expr = expr.Cast<LambdaExpression>();
+		vector<reference<ColumnRefExpression>> parameters;
+		if (GetLambdaParameters(lambda_expr, parameters)) {
+			for (auto &parameter : parameters) {
+				if (parameter.get().GetColumnName() == name) {
+					return HasQualifiedReference(*lambda_expr.RightMutable(), name);
+				}
+			}
+		}
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](unique_ptr<ParsedExpression> &child) { found = found || HasQualifiedReference(*child, name); });
+	bool found = false;
+	auto visit = [&](unique_ptr<ParsedExpression> &child) {
+		found = found || HasQualifiedReference(*child, name, in_subquery);
+	};
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		// the rename leaves the references of a subquery alone
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    *expr.Cast<SubqueryExpression>().Subquery()->node,
+		    [&](unique_ptr<ParsedExpression> &child) { found = found || HasQualifiedReference(*child, name, true); });
+	}
+	ParsedExpressionIterator::EnumerateChildren(expr, visit);
 	return found;
 }
 
@@ -652,14 +663,24 @@ private:
 	// The binder names a parameter by its alias, so a declaration takes none; an inner one keeps shadowing.
 	void RenameDeclaration(LambdaExpression &lambda_expr, vector<reference<ColumnRefExpression>> &parameters,
 	                       const identifier_map_t<Identifier> &renames) {
+		identifier_map_t<Identifier> own;
 		for (auto &parameter : parameters) {
 			auto &name = parameter.get().ColumnNamesMutable()[0];
 			auto entry = renames.find(name);
 			if (entry != renames.end()) {
+				own.emplace(name, entry->second);
 				name = entry->second;
 			}
 		}
-		RenameReferences(lambda_expr.RightMutable(), renames);
+		if (subquery_depth == 0) {
+			RenameReferences(lambda_expr.RightMutable(), renames);
+			return;
+		}
+		// in a subquery only this lambda's own parameters are renamed in its body
+		auto depth = subquery_depth;
+		subquery_depth = 0;
+		RenameReferences(lambda_expr.RightMutable(), own);
+		subquery_depth = depth;
 	}
 
 	void RenameReferences(unique_ptr<ParsedExpression> &expr, const identifier_map_t<Identifier> &renames) {
@@ -668,7 +689,8 @@ private:
 			auto &column_ref = expr->Cast<ColumnRefExpression>();
 			auto &leading_name = column_ref.ColumnNamesMutable()[0];
 			auto entry = renames.find(leading_name);
-			if (entry == renames.end()) {
+			// a reference in a subquery inside a lambda never binds that lambda's parameter
+			if (entry == renames.end() || subquery_depth > 0) {
 				return;
 			}
 			// struct_pack(x) names its field after the reference
@@ -691,7 +713,8 @@ private:
 		case ExpressionClass::FUNCTION: {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto &path = function.GetQualifiedName().Path();
-			if (path.size() >= 2 && renames.find(path[0]) != renames.end() && IsDotCall(function, QualifyingBinder())) {
+			if (subquery_depth == 0 && path.size() >= 2 && renames.find(path[0]) != renames.end() &&
+			    IsDotCall(function, QualifyingBinder())) {
 				// rewritten as the qualifier would, so that the receiver is a reference renamed below with its alias
 				auto qualified_name = function.GetQualifiedName();
 				auto receiver = qualified_name.Catalog().empty()
@@ -713,20 +736,14 @@ private:
 			return;
 		}
 		case ExpressionClass::SUBQUERY: {
-			// a subquery in an aggregate argument binds, and there its own tables win over the parameter
+			// no reference in a subquery inside a lambda binds its parameter, so only lambdas declared there move
 			auto &sq = expr->Cast<SubqueryExpression>().Subquery();
 			auto outer_body_is_qualified = body_is_qualified;
 			body_is_qualified = false;
-			EnumerateScopedNodeExpressions(*sq->node, identifier_set_t(),
-			                               [&](unique_ptr<ParsedExpression> &child, const identifier_set_t &declared) {
-				                               identifier_map_t<Identifier> scope_renames;
-				                               for (auto &entry : renames) {
-					                               if (declared.find(entry.first) == declared.end()) {
-						                               scope_renames.emplace(entry.first, entry.second);
-					                               }
-				                               }
-				                               RenameReferences(child, scope_renames);
-			                               });
+			subquery_depth++;
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    *sq->node, [&](unique_ptr<ParsedExpression> &child) { RenameReferences(child, renames); });
+			subquery_depth--;
 			body_is_qualified = outer_body_is_qualified;
 			break;
 		}
@@ -772,6 +789,7 @@ private:
 	optional_ptr<ParsedExpression> caller_window;
 	optional_ptr<QueryNode> body_node;
 	vector<LambdaScope> scopes;
+	idx_t subquery_depth = 0;
 	unordered_map<column_t, identifier_set_t> argument_names;
 	unique_ptr<identifier_set_t> caller_window_names;
 	unique_ptr<identifier_set_t> used_names;

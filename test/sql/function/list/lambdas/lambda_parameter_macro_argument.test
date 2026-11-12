@@ -1034,3 +1034,96 @@ query II
 SELECT x, aggregate_of_argument((SELECT x + 0)) FROM (SELECT 5 AS x) t GROUP BY x;
 ----
 5	[5]
+
+# a reference inside a subquery in a lambda never binds that lambda's parameter, so the rename leaves it alone
+
+statement ok
+CREATE MACRO lateral_source(a) AS list_transform([1], lambda x: first((SELECT y.v FROM (VALUES (50)) AS x(v), LATERAL (SELECT x.v) AS y)) + a);
+
+query I
+SELECT lateral_source(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+statement ok
+CREATE MACRO derived_source(a) AS list_transform([1], lambda x: first((SELECT y.v FROM (VALUES (50)) AS x(v), (SELECT x.v) AS y)) + a);
+
+query I
+SELECT derived_source(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+statement ok
+CREATE MACRO ordered_union(a) AS list_transform([1], lambda x: first((SELECT x.v FROM (VALUES (50)) AS x(v) UNION ALL SELECT 60 ORDER BY x.v LIMIT 1)) + a);
+
+query I
+SELECT ordered_union(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+statement ok
+CREATE MACRO pivot_source(a) AS list_transform([1], lambda x: first((SELECT k FROM (PIVOT (SELECT x.v, 'k' AS category FROM (VALUES (50)) AS x(v)) ON category IN ('k') USING sum(v)) AS p)) + a);
+
+query I
+SELECT pivot_source(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+statement ok
+CREATE MACRO local_column(a) AS list_transform([1], lambda x: first((SELECT x FROM (VALUES (50)) AS t(x))) + a);
+
+query I
+SELECT local_column(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+query II
+SELECT 3 AS x, local_column(x);
+----
+3	[53]
+
+statement ok
+CREATE MACRO lateral_table(a) AS TABLE SELECT list_transform([1], lambda x: x + a + first((SELECT l.r FROM (SELECT 60 AS d) x, LATERAL (SELECT x.d + 0 AS r) l))) AS r;
+
+query II
+SELECT * FROM (SELECT 5 AS x) t, lateral_table(x);
+----
+5	[66]
+
+# a dotted name inside a subquery in the lambda reads the body table, not the parameter, so the parameter is renamed
+
+statement ok
+CREATE MACRO correlated_body_read(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first((SELECT x.v))) AS r FROM (VALUES (50)) AS x(v);
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), correlated_body_read(x.z);
+----
+[53]
+
+# a lambda declared in such a subquery is renamed with the outer one, and its body renames only its own parameters
+
+statement ok
+CREATE MACRO inner_lambda_other_name(a) AS list_transform([1], lambda x, y: first((SELECT list_transform([1], lambda x: x + y)[1] FROM (VALUES (40)) AS t(y))) + a);
+
+query III
+SELECT 2 AS x, 3 AS y, inner_lambda_other_name(x + y);
+----
+2	3	[46]
+
+statement ok
+CREATE MACRO inner_lambda_reads_table(a) AS TABLE SELECT list_transform([1], lambda x: a + first((SELECT list_transform([1], lambda x: x.v)[1] FROM (VALUES (50)) AS x(v)))) AS r;
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), inner_lambda_reads_table(x.z);
+----
+[53]
+
+# a table of an argument's subquery binds the names that its derived tables read from it
+
+statement ok
+CREATE MACRO argument_with_lateral(a) AS TABLE SELECT list_transform([1], lambda x: x + first(a));
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM argument_with_lateral((SELECT y.v FROM (SELECT 50 AS v) AS x, LATERAL (SELECT x.v) AS y)));
+----
+list_transform(list_value(1), (lambda x: (x + "first"((SELECT y.v FROM (SELECT 50 AS v) AS x , (SELECT x.v) AS y)))))
