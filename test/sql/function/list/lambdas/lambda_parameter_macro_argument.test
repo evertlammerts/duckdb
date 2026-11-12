@@ -1153,3 +1153,79 @@ query I
 SELECT beside_table_argument(first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)));
 ----
 [61]
+
+# a lambda in a subquery beside a table of its name keeps it at the top of a scalar body too; each call gives what
+# the expression gives with the argument's value written in
+
+statement ok
+CREATE MACRO agg_sub_arg(a) AS list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)) + a);
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: x.d + first((SELECT list_transform([{'d': 2}], lambda x: x.d)[1] FROM (SELECT 60 AS d) x)) + 50);
+----
+[111]
+
+query I
+SELECT agg_sub_arg(x.d) FROM (VALUES (50)) AS x(d) GROUP BY x.d;
+----
+[111]
+
+query II
+SELECT 50 AS x, agg_sub_arg(x);
+----
+50	[111]
+
+statement ok
+CREATE MACRO sq(a) AS list_transform([1], lambda x: x + a + first((SELECT list_sum(list_transform([{'v': 100}], lambda x: x.v)) FROM (SELECT 7 AS v) AS x)));
+
+query I
+SELECT list_transform([1], lambda x: x + 10 + first((SELECT list_sum(list_transform([{'v': 100}], lambda x: x.v)) FROM (SELECT 7 AS v) AS x)));
+----
+[18]
+
+query II
+SELECT 10 AS x, sq(x);
+----
+10	[18]
+
+statement ok
+CREATE MACRO inner_table_read(a) AS list_transform([1], lambda x: a + first((SELECT list_transform([1], lambda x: x.v)[1] FROM (VALUES (50)) AS x(v))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([1], lambda x: x.v)[1] FROM (VALUES (50)) AS x(v))));
+----
+[53]
+
+query I
+SELECT inner_table_read(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[53]
+
+statement ok
+CREATE MACRO ilf(a) AS list_transform([1], lambda x: a + first((SELECT list_transform([{'v': 7}], lambda x: x.v)[1] FROM (VALUES (50)) AS x(v))));
+
+query I
+SELECT list_transform([1], lambda x: 3 + first((SELECT list_transform([{'v': 7}], lambda x: x.v)[1] FROM (VALUES (50)) AS x(v))));
+----
+[53]
+
+query II
+SELECT 3 AS x, ilf(x);
+----
+3	[53]
+
+# an inner lambda's dotted read in a subquery without a table of its name moves with the rename, so it keeps no
+# name of the outer lambda
+
+statement ok
+CREATE MACRO inner_lambda_field(a) AS TABLE SELECT list_transform([{'z': 9}], lambda x: a + first((SELECT list_transform([{'v': 7}], lambda x: x.v)[1] FROM (VALUES (50)) AS t(v)))) AS r FROM (VALUES (1)) AS x(k);
+
+query I
+SELECT list_transform([{'z': 9}], lambda x: 3 + first((SELECT list_transform([{'v': 7}], lambda x: x.v)[1] FROM (VALUES (50)) AS t(v)))) FROM (VALUES (1)) AS x(k);
+----
+[10]
+
+query I
+SELECT r FROM (VALUES (3)) AS x(z), inner_lambda_field(x.z);
+----
+[10]

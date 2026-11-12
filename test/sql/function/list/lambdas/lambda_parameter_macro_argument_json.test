@@ -187,3 +187,51 @@ query II
 SELECT 100 AS x, forwarded_arrow_scalar(x);
 ----
 100	[[2, 100]]
+
+# a JSON arrow inside a subquery of a renamed lambda reads a column there, whatever the column's table is called;
+# each call gives what the expression gives with the argument's value written in
+
+statement ok
+RESET lambda_syntax;
+
+statement ok
+CREATE MACRO json_subquery(a) AS list_transform([1], lambda x: first((SELECT CAST(x -> 'k' AS INTEGER) FROM (VALUES ('{"k":5}'::JSON)) AS x(x))) + a);
+
+query I
+SELECT list_transform([1], lambda x: first((SELECT CAST(x -> 'k' AS INTEGER) FROM (VALUES ('{"k":5}'::JSON)) AS x(x))) + 3);
+----
+[8]
+
+query I
+SELECT json_subquery(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[8]
+
+statement ok
+CREATE MACRO json_column(a) AS list_transform([1], lambda x: first((SELECT CAST(x -> 'k' AS INTEGER) FROM (VALUES ('{"k":5}'::JSON)) AS t(x))) + a);
+
+query I
+SELECT list_transform([1], lambda x: first((SELECT CAST(x -> 'k' AS INTEGER) FROM (VALUES ('{"k":5}'::JSON)) AS t(x))) + 3);
+----
+[8]
+
+query I
+SELECT json_column(x.z) FROM (VALUES (3)) AS x(z) GROUP BY x.z;
+----
+[8]
+
+statement ok
+CREATE TABLE json_docs AS SELECT '{"k":5}'::JSON AS x;
+
+statement ok
+CREATE MACRO json_table_column(a) AS list_transform([1], lambda x: first((SELECT (x -> '$.k')::INT FROM json_docs)) + a);
+
+query I
+SELECT list_transform([1], lambda x: first((SELECT (x -> '$.k')::INT FROM json_docs)) + 10);
+----
+[15]
+
+query II
+SELECT 10 AS x, json_table_column(x);
+----
+10	[15]
