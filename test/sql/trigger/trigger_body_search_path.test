@@ -1,0 +1,1183 @@
+# name: test/sql/trigger/trigger_body_search_path.test
+# description: A trigger body resolves its names in the trigger's schema, whatever the search path of the session that fires it
+# group: [trigger]
+
+require noforcestorage
+
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE main.log(v VARCHAR);
+
+statement ok
+CREATE TABLE s.log(v VARCHAR);
+
+# Statement triggers created under the search path s, fired from the default path and from s
+statement ok
+CREATE TABLE s.t1(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t1_after AFTER INSERT ON t1 FOR EACH STATEMENT INSERT INTO log VALUES ('t1 after');
+
+statement ok
+CREATE TRIGGER t1_before BEFORE INSERT ON t1 FOR EACH STATEMENT INSERT INTO log VALUES ('t1 before');
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t1 VALUES (1);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+INSERT INTO t1 VALUES (2);
+
+statement ok
+RESET search_path;
+
+query T
+SELECT v FROM s.log ORDER BY v;
+----
+t1 after
+t1 after
+t1 before
+t1 before
+
+query I
+SELECT count(*) FROM main.log;
+----
+0
+
+# The written table exists only in s
+statement ok
+CREATE TABLE s.only_s(v VARCHAR);
+
+statement ok
+CREATE TABLE s.t2(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t2_after AFTER INSERT ON t2 FOR EACH STATEMENT INSERT INTO only_s VALUES ('t2 after');
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t2 VALUES (1);
+
+query T
+SELECT v FROM s.only_s;
+----
+t2 after
+
+# Row triggers created under the search path s, INSERT with NEW and DELETE with OLD
+statement ok
+DELETE FROM s.log;
+
+statement ok
+CREATE TABLE s.r1(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER r1_insert AFTER INSERT ON r1 FOR EACH ROW INSERT INTO log VALUES ('r1 insert ' || NEW.id);
+
+statement ok
+CREATE TRIGGER r1_delete AFTER DELETE ON r1 FOR EACH ROW INSERT INTO log VALUES ('r1 delete ' || OLD.id);
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.r1 VALUES (1), (2);
+
+statement ok
+DELETE FROM s.r1 WHERE id = 1;
+
+query T
+SELECT v FROM s.log ORDER BY v;
+----
+r1 delete 1
+r1 insert 1
+r1 insert 2
+
+query I
+SELECT count(*) FROM main.log;
+----
+0
+
+# A view, a scalar macro, a table macro and a sequence by bare name, each present in both schemas
+statement ok
+DELETE FROM s.log;
+
+statement ok
+CREATE TABLE main.src(v VARCHAR);
+
+statement ok
+INSERT INTO main.src VALUES ('main.src');
+
+statement ok
+CREATE TABLE s.src(v VARCHAR);
+
+statement ok
+INSERT INTO s.src VALUES ('s.src');
+
+statement ok
+CREATE VIEW main.vw AS SELECT 'main.vw' AS v;
+
+statement ok
+CREATE VIEW s.vw AS SELECT 's.vw' AS v;
+
+statement ok
+CREATE MACRO main.mac() AS 'main.mac';
+
+statement ok
+CREATE MACRO s.mac() AS 's.mac';
+
+statement ok
+CREATE MACRO main.tmac() AS TABLE SELECT 'main.tmac' AS v;
+
+statement ok
+CREATE MACRO s.tmac() AS TABLE SELECT 's.tmac' AS v;
+
+statement ok
+CREATE SEQUENCE main.seq START 100;
+
+statement ok
+CREATE SEQUENCE s.seq START 1;
+
+statement ok
+CREATE TABLE s.t3(id INTEGER);
+
+statement ok
+CREATE TABLE s.r3(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t3_names AFTER INSERT ON t3 FOR EACH STATEMENT
+INSERT INTO log
+SELECT v FROM src
+UNION ALL SELECT v FROM vw
+UNION ALL SELECT mac()
+UNION ALL SELECT v FROM tmac()
+UNION ALL SELECT 'seq ' || nextval('seq');
+
+statement ok
+CREATE TRIGGER r3_names AFTER INSERT ON r3 FOR EACH ROW
+INSERT INTO log SELECT vw.v || ' ' || mac() || ' ' || NEW.id FROM vw;
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t3 VALUES (1);
+
+statement ok
+INSERT INTO s.r3 VALUES (7);
+
+query T
+SELECT v FROM s.log ORDER BY v;
+----
+s.mac
+s.src
+s.tmac
+s.vw
+s.vw s.mac 7
+seq 1
+
+query I
+SELECT count(*) FROM main.log;
+----
+0
+
+query I
+SELECT nextval('main.seq');
+----
+100
+
+# The firing statement's own parts keep the session's search path
+statement ok
+DELETE FROM s.log;
+
+statement ok
+INSERT INTO s.t1 SELECT 10 FROM src WHERE v = 'main.src';
+
+query T
+INSERT INTO s.t1 VALUES (11) RETURNING mac();
+----
+main.mac
+
+query IT
+WITH c AS (SELECT v FROM src) INSERT INTO s.t1 SELECT 12 FROM c WHERE v = 'main.src' RETURNING id, mac();
+----
+12	main.mac
+
+statement ok
+INSERT INTO s.r1 SELECT 13 FROM src WHERE v = 'main.src';
+
+query I
+SELECT id FROM s.t1 WHERE id >= 10 ORDER BY id;
+----
+10
+11
+12
+
+query T
+SELECT v FROM s.log WHERE v LIKE 'r1%' ORDER BY v;
+----
+r1 insert 13
+
+query I
+SELECT count(*) FROM s.log WHERE v = 't1 after';
+----
+3
+
+query I
+SELECT count(*) FROM main.log;
+----
+0
+
+query T
+SELECT v FROM src;
+----
+main.src
+
+# A trigger created in main fired from a session on s
+statement ok
+CREATE TABLE main.t4(id INTEGER);
+
+statement ok
+CREATE TRIGGER t4_after AFTER INSERT ON t4 FOR EACH STATEMENT INSERT INTO log VALUES ('t4 main');
+
+statement ok
+CREATE TABLE main.r4(id INTEGER);
+
+statement ok
+CREATE TRIGGER r4_insert AFTER INSERT ON r4 FOR EACH ROW INSERT INTO log VALUES ('r4 main ' || NEW.id);
+
+statement ok
+DELETE FROM s.log;
+
+statement ok
+SET search_path = 's';
+
+statement ok
+INSERT INTO main.t4 VALUES (1);
+
+statement ok
+INSERT INTO main.r4 VALUES (1);
+
+statement ok
+RESET search_path;
+
+query T
+SELECT v FROM main.log ORDER BY v;
+----
+r4 main 1
+t4 main
+
+query I
+SELECT count(*) FROM s.log;
+----
+0
+
+# A trigger on s.t5 created from the default path binds its body in s, at CREATE and when fired, as CREATE VIEW binds a view's body
+statement ok
+DELETE FROM main.log;
+
+statement ok
+CREATE TABLE main.log5(v VARCHAR);
+
+statement ok
+CREATE TABLE s.log5(v VARCHAR);
+
+statement ok
+CREATE TABLE main.t5(id INTEGER);
+
+statement ok
+INSERT INTO main.t5 VALUES (20);
+
+statement ok
+CREATE TABLE s.t5(id INTEGER);
+
+statement ok
+INSERT INTO s.t5 VALUES (10);
+
+statement ok
+CREATE TABLE main.only_main(v VARCHAR);
+
+statement ok
+INSERT INTO main.only_main VALUES ('main.only_main');
+
+statement ok
+CREATE TRIGGER t5_after AFTER INSERT ON s.t5 FOR EACH STATEMENT
+INSERT INTO log5 SELECT 't5 min ' || min(id) FROM t5 UNION ALL SELECT v FROM only_main;
+
+statement ok
+CREATE TABLE s.r5(id INTEGER);
+
+statement ok
+CREATE TRIGGER r5_insert AFTER INSERT ON s.r5 FOR EACH ROW INSERT INTO log5 VALUES ('r5 ' || NEW.id);
+
+statement ok
+INSERT INTO s.t5 VALUES (50);
+
+statement ok
+INSERT INTO s.r5 VALUES (3);
+
+query T
+SELECT v FROM s.log5 ORDER BY v;
+----
+main.only_main
+r5 3
+t5 min 10
+
+query I
+SELECT count(*) FROM main.log5;
+----
+0
+
+# The body depends on the tables it resolved in s, and on the table it found only in main
+statement error
+DROP TABLE s.log5;
+----
+depends on table "log5"
+
+statement error
+DROP TABLE main.only_main;
+----
+trigger "t5_after" on table "t5" depends on table "only_main"
+
+statement ok
+DROP TABLE main.log5;
+
+statement ok
+DROP TABLE main.t5;
+
+# A schema qualified body in the default catalog is unchanged from either path
+statement ok
+CREATE TABLE s.t6(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t6_after AFTER INSERT ON t6 FOR EACH STATEMENT INSERT INTO main.log VALUES ('t6 qualified');
+
+statement ok
+INSERT INTO t6 VALUES (1);
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t6 VALUES (2);
+
+query T
+SELECT v FROM main.log;
+----
+t6 qualified
+t6 qualified
+
+# A trigger reached from another trigger's body resolves in its own schema
+statement ok
+DELETE FROM main.log;
+
+statement ok
+DELETE FROM s.log;
+
+statement ok
+CREATE TABLE main.hop(id INTEGER);
+
+statement ok
+CREATE TRIGGER hop_after AFTER INSERT ON hop FOR EACH STATEMENT INSERT INTO log VALUES ('hop main');
+
+statement ok
+CREATE TABLE main.rhop(id INTEGER);
+
+statement ok
+CREATE TRIGGER rhop_insert AFTER INSERT ON rhop FOR EACH ROW INSERT INTO log VALUES ('rhop main ' || NEW.id);
+
+statement ok
+CREATE TABLE s.t7(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t7_after AFTER INSERT ON t7 FOR EACH STATEMENT
+INSERT INTO main.hop SELECT 1 FROM src WHERE v = 's.src';
+
+statement ok
+CREATE TRIGGER t7_before BEFORE INSERT ON t7 FOR EACH STATEMENT
+INSERT INTO main.rhop SELECT 2 FROM src WHERE v = 's.src';
+
+statement ok
+INSERT INTO t7 VALUES (1);
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t7 VALUES (2);
+
+query T
+SELECT v FROM main.log ORDER BY v;
+----
+hop main
+hop main
+rhop main 2
+rhop main 2
+
+query I
+SELECT count(*) FROM s.log;
+----
+0
+
+# A trigger in an attached database created under USE fires into that database from another USE
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.t8(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t8_after AFTER INSERT ON t8 FOR EACH STATEMENT INSERT INTO log VALUES ('db2 t8');
+
+statement ok
+USE memory;
+
+statement ok
+INSERT INTO db2.main.t8 VALUES (1);
+
+query T
+SELECT v FROM db2.main.log;
+----
+db2 t8
+
+query I
+SELECT count(*) FROM memory.main.log WHERE v = 'db2 t8';
+----
+0
+
+# Created from USE memory on a table of db2, the body binds in db2 instead of being refused as another catalog's
+statement ok
+CREATE TABLE db2.main.t9(id INTEGER);
+
+statement ok
+CREATE TRIGGER t9_after AFTER INSERT ON db2.main.t9 FOR EACH STATEMENT INSERT INTO log VALUES ('db2 t9');
+
+statement ok
+INSERT INTO db2.main.t9 VALUES (1);
+
+query T
+SELECT v FROM db2.main.log ORDER BY v;
+----
+db2 t8
+db2 t9
+
+# Inside db2 a schema qualified name means db2's schema, as in a view of db2
+statement ok
+CREATE TABLE db2.main.t15(id INTEGER);
+
+statement ok
+CREATE TRIGGER t15_after AFTER INSERT ON db2.main.t15 FOR EACH STATEMENT INSERT INTO main.log VALUES ('db2 t15');
+
+statement ok
+INSERT INTO db2.main.t15 VALUES (1);
+
+query II
+SELECT (SELECT count(*) FROM db2.main.log WHERE v = 'db2 t15'), (SELECT count(*) FROM memory.main.log WHERE v = 'db2 t15');
+----
+1	0
+
+# A trigger of memory fired under USE db2 writes memory's table
+statement ok
+USE db2;
+
+statement ok
+INSERT INTO memory.main.t4 VALUES (2);
+
+statement ok
+USE memory;
+
+query II
+SELECT (SELECT count(*) FROM memory.main.log WHERE v = 't4 main'), (SELECT count(*) FROM db2.main.log WHERE v = 't4 main');
+----
+1	0
+
+# In a schema of db2 other than main, a name found only in db2's main resolves there, not in the session database's main
+statement ok
+CREATE SCHEMA db2.s;
+
+statement ok
+CREATE TABLE db2.main.src(v VARCHAR);
+
+statement ok
+INSERT INTO db2.main.src VALUES ('db2.main.src');
+
+statement ok
+CREATE TABLE db2.s.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.log2(v VARCHAR);
+
+statement ok
+CREATE TABLE memory.main.log2(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.s.t18(id INTEGER);
+
+statement ok
+CREATE TABLE db2.s.r18(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t18_read AFTER INSERT ON s.t18 FOR EACH STATEMENT INSERT INTO log SELECT 'read ' || v FROM src;
+
+statement ok
+CREATE TRIGGER r18_write AFTER INSERT ON s.r18 FOR EACH ROW INSERT INTO log2 VALUES ('r18 row ' || NEW.id);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TRIGGER t18_created AFTER INSERT ON db2.s.t18 FOR EACH STATEMENT INSERT INTO log SELECT 'created ' || v FROM src;
+
+statement ok
+INSERT INTO db2.s.t18 VALUES (1);
+
+statement ok
+INSERT INTO db2.s.r18 VALUES (1);
+
+query T
+SELECT v FROM db2.s.log ORDER BY v;
+----
+created db2.main.src
+read db2.main.src
+
+query II
+SELECT (SELECT count(*) FROM db2.main.log2), (SELECT count(*) FROM memory.main.log2);
+----
+1	0
+
+# An INSERT target qualified with a nested schema picks its catalog under the body's search path
+statement ok
+CREATE SCHEMA db2.s.inner;
+
+statement ok
+CREATE TABLE db2.s.inner.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.t19(id INTEGER);
+
+statement ok
+CREATE TABLE db2.main.r19(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t19_statement AFTER INSERT ON t19 FOR EACH STATEMENT INSERT INTO s.inner.log VALUES ('t19 statement');
+
+statement ok
+CREATE TRIGGER r19_row AFTER INSERT ON r19 FOR EACH ROW INSERT INTO s.inner.log VALUES ('r19 row ' || NEW.id);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TRIGGER t19_created AFTER INSERT ON db2.main.t19 FOR EACH STATEMENT INSERT INTO s.inner.log VALUES ('t19 created');
+
+statement ok
+INSERT INTO db2.main.t19 VALUES (1);
+
+statement ok
+INSERT INTO db2.main.r19 VALUES (1);
+
+query T
+SELECT v FROM db2.s.inner.log ORDER BY v;
+----
+r19 row 1
+t19 created
+t19 statement
+
+# An INSERT target whose lone qualifier is a schema of db2 and later also an attached database is ambiguous, as in a
+# view of db2, instead of writing into that database
+statement ok
+CREATE SCHEMA db2.x;
+
+statement ok
+CREATE TABLE db2.x.log(v VARCHAR);
+
+statement ok
+CREATE TABLE db2.main.t20(id INTEGER);
+
+statement ok
+USE db2;
+
+statement ok
+CREATE TRIGGER t20_after AFTER INSERT ON t20 FOR EACH STATEMENT INSERT INTO x.log VALUES ('t20');
+
+statement ok
+CREATE VIEW v20 AS SELECT count(*) AS n FROM x.log;
+
+statement ok
+USE memory;
+
+statement ok
+INSERT INTO db2.main.t20 VALUES (1);
+
+statement ok
+ATTACH ':memory:' AS x;
+
+statement ok
+CREATE TABLE x.main.log(v VARCHAR);
+
+statement error
+INSERT INTO db2.main.t20 VALUES (2);
+----
+Ambiguous reference to catalog or schema "x"
+
+statement error
+SELECT n FROM db2.v20;
+----
+Ambiguous reference to catalog or schema "x"
+
+statement ok
+DETACH x;
+
+query T
+SELECT v FROM db2.x.log;
+----
+t20
+
+statement ok
+DETACH db2;
+
+# A trigger in a nested schema binds its body there
+statement ok
+CREATE SCHEMA s.inner;
+
+statement ok
+CREATE TABLE s.inner.t13(id INTEGER);
+
+statement ok
+CREATE TABLE s.inner.log(v VARCHAR);
+
+statement ok
+CREATE TRIGGER t13_after AFTER INSERT ON s.inner.t13 FOR EACH STATEMENT INSERT INTO log VALUES ('nested t13');
+
+statement ok
+INSERT INTO s.inner.t13 VALUES (1);
+
+query T
+SELECT v FROM s.inner.log;
+----
+nested t13
+
+query I
+SELECT count(*) FROM main.log WHERE v = 'nested t13';
+----
+0
+
+# A schema whose name contains a dot is not the nested schema of that path
+statement ok
+CREATE SCHEMA "s.inner";
+
+statement ok
+CREATE TABLE "s.inner".t16(id INTEGER);
+
+statement ok
+CREATE TABLE "s.inner".log(v VARCHAR);
+
+statement ok
+CREATE TRIGGER t16_after AFTER INSERT ON "s.inner".t16 FOR EACH STATEMENT INSERT INTO log VALUES ('dotted t16');
+
+statement ok
+INSERT INTO "s.inner".t16 VALUES (1);
+
+query II
+SELECT (SELECT count(*) FROM "s.inner".log WHERE v = 'dotted t16'), (SELECT count(*) FROM s.inner.log WHERE v = 'dotted t16');
+----
+1	0
+
+# A trigger on a temporary table, whose catalog takes no search path override, binds its body as before
+statement ok
+CREATE TEMP TABLE tt(id INTEGER);
+
+statement ok
+CREATE TEMP TABLE tlog(v VARCHAR);
+
+statement ok
+CREATE TRIGGER tt_after AFTER INSERT ON tt FOR EACH STATEMENT INSERT INTO tlog VALUES ('temp');
+
+statement ok
+SET search_path = 's';
+
+statement ok
+INSERT INTO tt VALUES (1);
+
+statement ok
+RESET search_path;
+
+query T
+SELECT v FROM tlog;
+----
+temp
+
+# Transition tables, and the OLD image recomputing a generated column
+statement ok
+DELETE FROM s.log;
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TABLE t10(id INTEGER, g INTEGER GENERATED ALWAYS AS (id * 10));
+
+statement ok
+CREATE TRIGGER t10_update AFTER UPDATE ON t10 REFERENCING OLD TABLE AS o NEW TABLE AS n FOR EACH STATEMENT
+INSERT INTO log SELECT 'old ' || o.g || ' new ' || n.g FROM o, n;
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t10 VALUES (1);
+
+statement ok
+UPDATE s.t10 SET id = 2;
+
+query T
+SELECT v FROM s.log;
+----
+old 10 new 20
+
+query I
+SELECT count(*) FROM main.log WHERE v LIKE 'old%';
+----
+0
+
+# A temporary table of the firing session shadows the trigger's schema: the same rule as a view's body
+statement ok
+CREATE TABLE s.shadow(v VARCHAR);
+
+statement ok
+CREATE TABLE s.t11(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t11_after AFTER INSERT ON t11 FOR EACH STATEMENT INSERT INTO shadow VALUES ('t11');
+
+statement ok
+CREATE VIEW v11 AS SELECT count(*) AS n FROM shadow;
+
+statement ok
+RESET search_path;
+
+statement ok
+CREATE TEMP TABLE shadow(v VARCHAR);
+
+statement ok
+INSERT INTO s.t11 VALUES (1);
+
+query III
+SELECT (SELECT count(*) FROM temp.main.shadow), (SELECT count(*) FROM s.shadow), (SELECT n FROM s.v11);
+----
+1	0	1
+
+# A name in neither the trigger's schema nor the default schema is looked up through the firing session's search
+# path: the same rule as a view's body
+statement ok
+CREATE SCHEMA s2;
+
+statement ok
+CREATE TABLE s2.only_s2(v VARCHAR);
+
+statement ok
+CREATE TABLE s.t12(id INTEGER);
+
+statement ok
+SET search_path = 's,s2';
+
+statement ok
+CREATE TRIGGER t12_after AFTER INSERT ON t12 FOR EACH STATEMENT INSERT INTO only_s2 VALUES ('t12');
+
+statement ok
+CREATE VIEW v12 AS SELECT count(*) AS n FROM only_s2;
+
+statement ok
+SET search_path = 's2';
+
+statement ok
+INSERT INTO s.t12 VALUES (1);
+
+query II
+SELECT (SELECT count(*) FROM s2.only_s2), (SELECT n FROM s.v12);
+----
+1	1
+
+statement ok
+RESET search_path;
+
+statement error
+INSERT INTO s.t12 VALUES (2);
+----
+Table with name only_s2 does not exist
+
+statement error
+SELECT n FROM s.v12;
+----
+Table with name only_s2 does not exist
+
+# A name in the catalog's default schema and in the firing session's path, but not in the trigger's schema, resolves
+# in the default schema, for a macro as in a view's body, and for a table read and a table written
+statement ok
+CREATE SCHEMA s3;
+
+statement ok
+CREATE TABLE s3.log(v VARCHAR);
+
+statement ok
+CREATE TABLE s3.t17(id INTEGER);
+
+statement ok
+CREATE TABLE s3.r17(id INTEGER);
+
+statement ok
+CREATE MACRO s2.mac() AS 's2.mac';
+
+statement ok
+CREATE TABLE main.pick(v VARCHAR);
+
+statement ok
+INSERT INTO main.pick VALUES ('main.pick');
+
+statement ok
+CREATE TABLE s2.pick(v VARCHAR);
+
+statement ok
+INSERT INTO s2.pick VALUES ('s2.pick');
+
+statement ok
+CREATE TABLE main.dest(v VARCHAR);
+
+statement ok
+CREATE TABLE s2.dest(v VARCHAR);
+
+statement ok
+CREATE TRIGGER t17_after AFTER INSERT ON s3.t17 FOR EACH STATEMENT
+INSERT INTO log SELECT 'trigger ' || mac() UNION ALL SELECT 'trigger ' || v FROM pick;
+
+statement ok
+CREATE TRIGGER r17_row AFTER INSERT ON s3.r17 FOR EACH ROW INSERT INTO dest VALUES ('r17 row ' || NEW.id);
+
+statement ok
+CREATE VIEW s3.v17 AS SELECT 'view ' || mac() AS v;
+
+statement ok
+SET search_path = 's2';
+
+statement ok
+INSERT INTO s3.t17 VALUES (1);
+
+statement ok
+INSERT INTO s3.r17 VALUES (1);
+
+query T
+SELECT v FROM s3.log UNION ALL SELECT v FROM s3.v17 ORDER BY v;
+----
+trigger main.mac
+trigger main.pick
+view main.mac
+
+statement ok
+RESET search_path;
+
+query II
+SELECT (SELECT count(*) FROM main.dest), (SELECT count(*) FROM s2.dest);
+----
+1	0
+
+# A name in neither the trigger's schema nor its catalog's default schema follows each firing session's search path,
+# into another database too, as a view's body does, while CREATE recorded the entry the creator's path resolved
+statement ok
+ATTACH ':memory:' AS dbf;
+
+statement ok
+CREATE SCHEMA dbf.s;
+
+statement ok
+CREATE SCHEMA dbf.support;
+
+statement ok
+CREATE TABLE dbf.s.t23(id INTEGER);
+
+statement ok
+CREATE TABLE dbf.s.audit(v VARCHAR);
+
+statement ok
+CREATE TABLE dbf.support.fsrc(v VARCHAR);
+
+statement ok
+INSERT INTO dbf.support.fsrc VALUES ('owner');
+
+statement ok
+SET search_path = 'dbf.s,dbf.support';
+
+statement ok
+CREATE TRIGGER t23_after AFTER INSERT ON dbf.s.t23 FOR EACH STATEMENT INSERT INTO audit SELECT 'trigger ' || v FROM fsrc;
+
+statement ok
+CREATE VIEW dbf.s.v23 AS SELECT 'view ' || v AS v FROM fsrc;
+
+statement ok
+INSERT INTO dbf.s.t23 VALUES (0);
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TABLE memory.main.fsrc(v VARCHAR);
+
+statement ok
+INSERT INTO memory.main.fsrc VALUES ('caller');
+
+statement ok
+INSERT INTO dbf.s.t23 VALUES (1);
+
+query T
+SELECT v FROM dbf.s.audit UNION ALL SELECT v FROM dbf.s.v23 ORDER BY v;
+----
+trigger caller
+trigger owner
+view caller
+
+statement error
+DROP TABLE dbf.support.fsrc;
+----
+trigger "t23_after" on table "t23" depends on table "fsrc"
+
+statement error
+CREATE TRIGGER t23_from_memory AFTER INSERT ON dbf.s.t23 FOR EACH STATEMENT INSERT INTO audit SELECT v FROM fsrc;
+----
+cannot reference "fsrc" from a different catalog
+
+statement ok
+DETACH dbf;
+
+# Within one database the trigger depends on the creator's table but reads the firing session's, as the view does
+statement ok
+CREATE TABLE s.t21(id INTEGER);
+
+statement ok
+CREATE TABLE s.log21(v VARCHAR);
+
+statement ok
+CREATE TABLE s2.cc(v VARCHAR);
+
+statement ok
+INSERT INTO s2.cc VALUES ('s2.cc');
+
+statement ok
+CREATE TABLE s3.cc(v VARCHAR);
+
+statement ok
+INSERT INTO s3.cc VALUES ('s3.cc');
+
+statement ok
+SET search_path = 's,s2';
+
+statement ok
+CREATE TRIGGER t21_after AFTER INSERT ON t21 FOR EACH STATEMENT INSERT INTO log21 SELECT 'trigger ' || v FROM cc;
+
+statement ok
+CREATE VIEW v21 AS SELECT 'view ' || v AS v FROM cc;
+
+statement ok
+SET search_path = 's3';
+
+statement ok
+INSERT INTO s.t21 VALUES (1);
+
+query T
+SELECT v FROM s.log21 UNION ALL SELECT v FROM s.v21;
+----
+trigger s3.cc
+view s3.cc
+
+statement ok
+RESET search_path;
+
+statement ok
+DROP VIEW s.v21;
+
+statement error
+DROP TABLE s2.cc;
+----
+trigger "t21_after" on table "t21" depends on table "cc"
+
+statement ok
+DROP TABLE s3.cc;
+
+# A table created in the trigger's schema after CREATE takes over a name the body found in the default schema, and
+# can be dropped again, as for a view
+statement ok
+CREATE TABLE s.t22(id INTEGER);
+
+statement ok
+CREATE TABLE main.out22(v VARCHAR);
+
+statement ok
+CREATE TABLE main.src22(v VARCHAR);
+
+statement ok
+INSERT INTO main.src22 VALUES ('main.src22');
+
+statement ok
+CREATE TRIGGER t22_after AFTER INSERT ON s.t22 FOR EACH STATEMENT INSERT INTO main.out22 SELECT v FROM src22;
+
+statement ok
+CREATE VIEW s.v22 AS SELECT v FROM src22;
+
+statement ok
+INSERT INTO s.t22 VALUES (1);
+
+statement ok
+CREATE TABLE s.src22(v VARCHAR);
+
+statement ok
+INSERT INTO s.src22 VALUES ('s.src22');
+
+statement ok
+INSERT INTO s.t22 VALUES (2);
+
+query T
+SELECT v FROM main.out22 ORDER BY v;
+----
+main.src22
+s.src22
+
+query T
+SELECT v FROM s.v22;
+----
+s.src22
+
+statement ok
+DROP TABLE s.src22;
+
+statement ok
+INSERT INTO s.t22 VALUES (3);
+
+query T
+SELECT v FROM main.out22 ORDER BY v;
+----
+main.src22
+main.src22
+s.src22
+
+query T
+SELECT v FROM s.v22;
+----
+main.src22
+
+# UPDATE and DELETE bodies, a type and a table function naming a table by string, each present in both schemas
+statement ok
+DELETE FROM s.log;
+
+statement ok
+CREATE TABLE main.cnt(n INTEGER);
+
+statement ok
+INSERT INTO main.cnt VALUES (0);
+
+statement ok
+CREATE TABLE s.cnt(n INTEGER);
+
+statement ok
+INSERT INTO s.cnt VALUES (0);
+
+statement ok
+CREATE TABLE main.del(id INTEGER);
+
+statement ok
+INSERT INTO main.del VALUES (1);
+
+statement ok
+CREATE TABLE s.del(id INTEGER);
+
+statement ok
+INSERT INTO s.del VALUES (1);
+
+statement ok
+CREATE TYPE main.mood AS ENUM ('main.mood');
+
+statement ok
+CREATE TYPE s.mood AS ENUM ('s.mood');
+
+statement ok
+CREATE TABLE s.t14(id INTEGER);
+
+statement ok
+SET search_path = 's';
+
+statement ok
+CREATE TRIGGER t14_before BEFORE INSERT ON t14 FOR EACH STATEMENT UPDATE cnt SET n = n + 1;
+
+statement ok
+CREATE TRIGGER t14_after AFTER INSERT ON t14 FOR EACH STATEMENT DELETE FROM del;
+
+statement ok
+CREATE TRIGGER t14_names AFTER INSERT ON t14 FOR EACH STATEMENT
+INSERT INTO log SELECT enum_range(NULL::mood)[1]::VARCHAR UNION ALL SELECT v FROM query_table('src');
+
+statement ok
+RESET search_path;
+
+statement ok
+INSERT INTO s.t14 VALUES (1);
+
+query IIII
+SELECT (SELECT n FROM s.cnt), (SELECT n FROM main.cnt), (SELECT count(*) FROM s.del), (SELECT count(*) FROM main.del);
+----
+1	0	0	1
+
+query T
+SELECT v FROM s.log ORDER BY v;
+----
+s.mood
+s.src
+
+# CREATE OR REPLACE from the default path keeps binding in the trigger's schema
+statement ok
+CREATE OR REPLACE TRIGGER t14_before BEFORE INSERT ON s.t14 FOR EACH STATEMENT UPDATE cnt SET n = n + 10;
+
+statement ok
+INSERT INTO s.t14 VALUES (2);
+
+query II
+SELECT (SELECT n FROM s.cnt), (SELECT n FROM main.cnt);
+----
+11	0

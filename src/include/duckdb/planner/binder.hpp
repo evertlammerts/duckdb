@@ -229,9 +229,9 @@ struct GlobalBinderState {
 	//! table order, under which the captured OLD image is exposed via SQL aliases. Only populated for capture
 	//! requests presented through a CTE; a consumer that reads the OLD image directly leaves it absent.
 	reference_map_t<QueryNode, vector<Identifier>> trigger_old_capture_cte_names;
-	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity. A trigger being created
-	//! does not depend on what those bodies resolve.
-	reference_set_t<QueryNode> trigger_body_ctes;
+	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the schema of that
+	//! trigger, in which the body binds. A trigger being created does not depend on what those bodies resolve.
+	reference_map_t<QueryNode, reference<const SchemaCatalogEntry>> trigger_body_ctes;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
@@ -309,6 +309,11 @@ public:
 	BoundStatement BindAlterAddIndex(BoundStatement &result, CatalogEntry &entry, unique_ptr<AlterInfo> alter_info);
 
 	void SetCatalogLookupCallback(catalog_entry_callback_t callback);
+	//! Resolves names in the session's temporary schema, the schema of a trigger and its catalog's default schema,
+	//! then through the session's search path
+	void SetTriggerBodySearchPath(const SchemaCatalogEntry &trigger_schema);
+	//! Binds as a fired trigger's body: in the trigger's schema, recording nothing for a trigger being created
+	void PrepareFiredTriggerBody(const SchemaCatalogEntry &trigger_schema);
 	void BindCreateViewInfo(CreateViewInfo &base);
 	static void BindView(ClientContext &context, const SelectStatement &stmt, const Identifier &catalog_name,
 	                     const vector<Identifier> &schema_path, optional_ptr<LogicalDependencyList> dependencies,

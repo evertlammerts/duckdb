@@ -129,9 +129,8 @@ void CTEBindState::Bind(CTEBinding &binding) {
 	// we need to bind it as if we were binding it during PrepareCTE
 	query_binder = Binder::CreateBinder(parent_binder.context, parent_binder);
 	query_binder->SetCanContainNulls(true);
-	if (is_trigger_body) {
-		// what a fired trigger's body references is a dependency of that trigger, not of a trigger being created
-		query_binder->SetCatalogLookupCallback(nullptr);
+	if (trigger_body_schema) {
+		query_binder->PrepareFiredTriggerBody(*trigger_body_schema);
 	}
 
 	// we clear any expression binders that were added in the mean-time, to ensure we are not binding to any newly added
@@ -178,7 +177,10 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 	// instead of eagerly binding the CTE here we add the CTE bind state to the list of CTE bindings
 	// the CTE is bound lazily - when referenced for the first time we perform the binding
 	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases);
-	result.cte_bind_state->is_trigger_body = global_binder_state->trigger_body_ctes.count(*statement.query_node) > 0;
+	auto trigger_body = global_binder_state->trigger_body_ctes.find(*statement.query_node);
+	if (trigger_body != global_binder_state->trigger_body_ctes.end()) {
+		result.cte_bind_state->trigger_body_schema = &trigger_body->second.get();
+	}
 
 	result.child_binder = Binder::CreateBinder(context, this);
 
