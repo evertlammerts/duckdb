@@ -241,10 +241,29 @@ struct GlobalBinderState {
 	//! Generated CTE nodes that hold the body of a fired trigger, keyed by node identity, with the scope the body
 	//! binds in. A trigger being created does not depend on what those bodies resolve.
 	reference_map_t<QueryNode, TriggerBodyCTE> trigger_body_ctes;
+	//! Generated DML nodes whose RETURNING list the trigger expansion added to read back the changed rows, keyed by
+	//! node identity. That list is not the user's, so it records no catalog lookups.
+	reference_set_t<QueryNode> trigger_generated_returning;
 	//! Set during CREATE TRIGGER body validation to detect self-recursive writes
 	optional_ptr<TableCatalogEntry> trigger_creation_table;
 	//! Name of the trigger being created (for error messages)
 	Identifier trigger_creation_name;
+};
+
+//! Registers a generated DML node in GlobalBinderState::trigger_generated_returning while it binds, and removes it
+//! however the bind ends, because the registered node is destroyed after its bind.
+class TriggerGeneratedReturningScope {
+public:
+	TriggerGeneratedReturningScope(GlobalBinderState &state, QueryNode &node) : state(state), node(node) {
+		state.trigger_generated_returning.insert(node);
+	}
+	~TriggerGeneratedReturningScope() {
+		state.trigger_generated_returning.erase(node);
+	}
+
+private:
+	GlobalBinderState &state;
+	QueryNode &node;
 };
 
 //! Bind the parsed query tree to the actual columns present in the catalog.
@@ -439,6 +458,9 @@ public:
 		return entry_retriever;
 	}
 	optional_ptr<BoundParameterMap> GetParameters();
+	bool BindsFiredTriggerBody() const {
+		return binds_fired_trigger_body;
+	}
 	void SetParameters(BoundParameterMap &parameters);
 	void SetStatementParameters(const identifier_map_t<idx_t> &statement_parameters);
 	//! Whether the statement text declares a parameter with this identifier
@@ -482,6 +504,8 @@ private:
 	BinderType binder_type = BinderType::REGULAR_BINDER;
 	//! For a trigger body scope, the one CTE of the firing statement it can see, if any
 	BindingAlias trigger_transition_source;
+	//! Whether this binder binds a fired trigger's body, set on its scope and inherited by every binder below it
+	bool binds_fired_trigger_body = false;
 	//! Global binder state
 	shared_ptr<GlobalBinderState> global_binder_state;
 	//! Active binders
@@ -593,10 +617,13 @@ private:
 	void BindDeleteIndexColumns(TableCatalogEntry &table, LogicalGet &get, vector<idx_t> &return_columns,
 	                            vector<unique_ptr<Expression>> &projection_expressions,
 	                            LogicalOperator &target_binding);
-	BoundStatement BindReturning(vector<unique_ptr<ParsedExpression>> returning_list, TableCatalogEntry &table,
-	                             const Identifier &alias, TableIndex update_table_index,
+	BoundStatement BindReturning(vector<unique_ptr<ParsedExpression>> returning_list, bool trigger_generated,
+	                             TableCatalogEntry &table, const Identifier &alias, TableIndex update_table_index,
 	                             unique_ptr<LogicalOperator> child_operator,
 	                             virtual_column_map_t virtual_columns = virtual_column_map_t());
+	//! A child binder for a user's RETURNING list, a binder without parent for the list the trigger expansion adds
+	shared_ptr<Binder> CreateReturningBinder(bool trigger_generated);
+	bool IsTriggerGeneratedReturning(QueryNode &node) const;
 
 	unique_ptr<QueryNode> BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry &macro_func, idx_t depth);
 
