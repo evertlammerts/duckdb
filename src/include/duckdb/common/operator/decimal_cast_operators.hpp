@@ -543,8 +543,7 @@ struct DecimalCastOperation {
 	template <class T, bool NEGATIVE>
 	static bool Finalize(T &state) {
 		using STORE_TYPE = typename T::StoreType;
-		using POWERS_OF_TEN_CLASS = typename DecimalCastTraits<STORE_TYPE>::POWERS_OF_TEN_CLASS;
-		if (state.result == 0) {
+		if (state.digit_count == 0) {
 			return true;
 		}
 		const int64_t shift = state.exponent + int64_t(state.scale);
@@ -553,8 +552,9 @@ struct DecimalCastOperation {
 			if (int64_t(state.digit_count) + shift > int64_t(state.width)) {
 				return false;
 			}
-			state.result *= UnsafeNumericCast<STORE_TYPE>(POWERS_OF_TEN_CLASS::POWERS_OF_TEN[shift]);
-			// a dropped digit passes the width check only at shift zero, where it is the first digit past the scale
+			// a dropped digit means digit_count is the storage maximum, so only shift zero passes the width check
+			D_ASSERT(!state.has_dropped_digit || shift == 0);
+			ScaleUp(state.result, shift);
 			round_up = state.round_dropped_digit;
 		} else {
 			const auto removed = uint64_t(-shift);
@@ -562,12 +562,7 @@ struct DecimalCastOperation {
 				state.result = 0;
 				return true;
 			}
-			const auto divisor = UnsafeNumericCast<STORE_TYPE>(POWERS_OF_TEN_CLASS::POWERS_OF_TEN[removed]);
-			const auto quotient = state.result / divisor;
-			const auto remainder = state.result - quotient * divisor;
-			state.result = quotient;
-			// compares twice the remainder with the divisor without forming it, which overflows at 38 digits
-			round_up = NEGATIVE ? remainder <= -divisor - remainder : remainder >= divisor - remainder;
+			round_up = ScaleDown(state.result, removed, NEGATIVE);
 		}
 		// added as a value because a branch on the removed digit is mispredicted half the time
 		if (NEGATIVE) {
@@ -583,10 +578,44 @@ struct DecimalCastOperation {
 	}
 
 private:
+	// Native integers scale faster by constant tens, a hugeint by one power of ten from its table.
+	template <class STORE_TYPE>
+	static void ScaleUp(STORE_TYPE &value, int64_t shift) {
+		for (int64_t i = 0; i < shift; i++) {
+			value *= 10;
+		}
+	}
+
+	static void ScaleUp(hugeint_t &value, int64_t shift) {
+		if (shift > 0) {
+			value *= Hugeint::POWERS_OF_TEN[shift];
+		}
+	}
+
+	//! Both overloads remove the last digits and round half away from zero on the first one removed
+	template <class STORE_TYPE>
+	static bool ScaleDown(STORE_TYPE &value, uint64_t removed, bool negative) {
+		for (uint64_t i = 1; i < removed; i++) {
+			value /= 10;
+		}
+		const auto first_removed = value % 10;
+		value /= 10;
+		return negative ? first_removed <= -5 : first_removed >= 5;
+	}
+
+	static bool ScaleDown(hugeint_t &value, uint64_t removed, bool negative) {
+		const auto divisor = Hugeint::POWERS_OF_TEN[removed];
+		const auto quotient = value / divisor;
+		const auto remainder = value - quotient * divisor;
+		value = quotient;
+		// compares twice the remainder with the divisor without forming it, which overflows at 38 digits
+		return negative ? remainder <= -divisor - remainder : remainder >= divisor - remainder;
+	}
+
 	//! Returns false for a significant digit that does not fit in result; a leading zero is not stored
 	template <class T, bool NEGATIVE>
 	static bool AddDigit(T &state, uint8_t digit) {
-		if (state.result == 0 && digit == 0) {
+		if (state.digit_count == 0 && digit == 0) {
 			return true;
 		}
 		if (state.digit_count == DecimalWidth<typename T::StoreType>::max) {
