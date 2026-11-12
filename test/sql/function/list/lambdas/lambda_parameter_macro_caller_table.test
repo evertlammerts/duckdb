@@ -406,14 +406,124 @@ statement ok
 CREATE MACRO inner_type() AS list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1]))));
 
 query I
-SELECT inner_type() FROM (SELECT 'v' AS e) x;
+SELECT inner_type() FROM (SELECT 50 AS d, 'v' AS e) x;
 ----
 ['1:INTEGER']
 
 query I
-SELECT list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1])))) FROM (SELECT 'v' AS e) q;
+SELECT list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1])))) FROM (SELECT 50 AS d, 'v' AS e) q;
 ----
 ['1:INTEGER']
+
+# a subquery anywhere in the argument of typeof binds in the lambda's scope when it has no table of its own
+
+statement ok
+CREATE MACRO wrapped_type() AS list_transform([{'d': 1, 'z': 2}], lambda x: typeof(x.d) || ':' || typeof((SELECT x).z));
+
+query I
+SELECT wrapped_type() FROM x;
+----
+['INTEGER:INTEGER']
+
+query I
+SELECT list_transform([{'d': 1, 'z': 2}], lambda x: typeof(x.d) || ':' || typeof((SELECT x).z)) FROM x AS q;
+----
+['INTEGER:INTEGER']
+
+statement ok
+CREATE MACRO nested_type() AS list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof([(SELECT x)]));
+
+query I
+SELECT nested_type() FROM x;
+----
+['INTEGER:STRUCT(d INTEGER)[]']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof([(SELECT x)])) FROM x AS q;
+----
+['INTEGER:STRUCT(d INTEGER)[]']
+
+statement ok
+CREATE MACRO coalesced_type() AS list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof(coalesce((SELECT x), x)));
+
+query I
+SELECT coalesced_type() FROM x;
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof(coalesce((SELECT x), x))) FROM x AS q;
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+# a subquery with a table of its own reads its own column x, and other functions do not fold their subquery
+
+statement ok
+CREATE MACRO local_column_type() AS list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x FROM (SELECT 'inner' AS x) t)));
+
+query I
+SELECT local_column_type() FROM x;
+----
+['INTEGER:VARCHAR']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x FROM (SELECT 'inner' AS x) t))) FROM x AS q;
+----
+['INTEGER:VARCHAR']
+
+statement ok
+CREATE MACRO cast_sub() AS list_transform([{'d': 1}], lambda x: x.d + first(cast_to_type((SELECT x FROM (VALUES (7)) AS t(x)), 0)));
+
+query I
+SELECT cast_sub() FROM x;
+----
+[8]
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: x.d + first(cast_to_type((SELECT x FROM (VALUES (7)) AS t(x)), 0))) FROM x AS q;
+----
+[8]
+
+statement ok
+CREATE MACRO map_sub() AS list_transform([{'d': 1}], lambda x: x.d + first(map_contains((SELECT MAP {'k': x} FROM (VALUES (1)) AS t(x)), 'k')::INTEGER));
+
+query I
+SELECT map_sub() FROM x;
+----
+[2]
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: x.d + first(map_contains((SELECT MAP {'k': x} FROM (VALUES (1)) AS t(x)), 'k')::INTEGER)) FROM x AS q;
+----
+[2]
+
+# the caller scope is asked about a dotted read inside a folded subquery too
+
+statement ok
+CREATE MACRO folded_read() AS list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d)));
+
+query I
+SELECT folded_read() FROM x;
+----
+[VARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof((SELECT x.d))) FROM x AS q;
+----
+[VARCHAR]
+
+statement ok
+CREATE MACRO folded_beside() AS list_transform([{'d': 'a'}], lambda x: typeof(x) || typeof((SELECT x.d)));
+
+query I
+SELECT folded_beside() FROM x;
+----
+['STRUCT(d VARCHAR)VARCHAR']
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: typeof(x) || typeof((SELECT x.d))) FROM x AS q;
+----
+['STRUCT(d VARCHAR)VARCHAR']
 
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
