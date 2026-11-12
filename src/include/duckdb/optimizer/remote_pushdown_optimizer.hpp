@@ -90,15 +90,15 @@ public:
 
 	void Rewrite(unique_ptr<SQLStatement> &statement);
 
-	//! Drop the given catalog qualifier from every name in the tree. A two-part name (e.g. "db1.t") parses as
-	//! schema.name, so the catalog can sit in either slot
+	//! Drop the given catalog qualifier from the names in the tree. A two-part name (e.g. "db1.t") parses as
+	//! schema.name, so the catalog can sit in either slot. A column reference loses a leading name spelled like the
+	//! catalog only where the binder would read it as the catalog, judged from the tables of the tree in scope
 	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
 	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
 	static void StripCatalogName(TableRef &ref, const Identifier &catalog_name);
 	static void StripCatalogName(CreateInfo &info, const Identifier &catalog_name);
 	static void StripCatalogName(AlterInfo &info, const Identifier &catalog_name);
-	//! Strip catalog prefix from expression column refs. When strip_subquery_bodies=false, leaves subquery
-	//! bodies untouched (used for partial pushdown where inner subqueries are not being pushed).
+	//! An expression stripped on its own has no table in scope, so it keeps a catalog led column reference
 	static void StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name);
 
 private:

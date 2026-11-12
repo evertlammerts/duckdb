@@ -440,6 +440,28 @@ CREATE TRIGGER spelled_table AFTER INSERT ON spelled FOR EACH STATEMENT INSERT I
 statement ok
 CREATE TRIGGER spelled_struct AFTER DELETE ON spelled FOR EACH STATEMENT INSERT INTO log SELECT 'struct ' || src.a.v FROM payload;
 
+# a table in scope that has the column wins over a binding spelled like the catalog, at one level and across a subquery
+statement ok
+CREATE TABLE tt(c INTEGER);
+
+statement ok
+INSERT INTO tt VALUES (1);
+
+statement ok
+CREATE TABLE rows_like(tt STRUCT(c INTEGER));
+
+statement ok
+INSERT INTO rows_like VALUES ({'c': 2});
+
+statement ok
+CREATE TABLE bound(id INTEGER);
+
+statement ok
+CREATE TRIGGER bound_level AFTER INSERT ON bound FOR EACH STATEMENT INSERT INTO log SELECT 'level ' || src.tt.c FROM tt, rows_like AS src;
+
+statement ok
+CREATE TRIGGER bound_outer AFTER DELETE ON bound FOR EACH STATEMENT INSERT INTO log SELECT 'outer ' || (SELECT src.tt.c FROM tt) FROM rows_like AS src;
+
 # fired once in the source, so the exported log holds the rows the source writes
 statement ok
 INSERT INTO shaped VALUES (1);
@@ -456,10 +478,18 @@ INSERT INTO spelled VALUES (1);
 statement ok
 DELETE FROM spelled;
 
+statement ok
+INSERT INTO bound VALUES (1);
+
+statement ok
+DELETE FROM bound;
+
 query T rowsort
 SELECT msg FROM src.log;
 ----
+level 1
 match 2
+outer 1
 pivot 12
 struct 1
 table 1
@@ -472,6 +502,8 @@ EXPORT DATABASE src TO '{TEST_DIR}/export_triggers_catalog';
 query T
 SELECT line FROM (SELECT unnest(string_split(content, chr(10))) AS line FROM read_text('{TEST_DIR}/export_triggers_catalog/load.sql')) WHERE line LIKE 'CREATE TRIGGER%' ORDER BY line;
 ----
+CREATE TRIGGER bound_level AFTER INSERT ON bound FOR EACH STATEMENT INSERT INTO log SELECT ('level ' || tt.c) FROM tt , rows_like AS src;
+CREATE TRIGGER bound_outer AFTER DELETE ON bound FOR EACH STATEMENT INSERT INTO log SELECT ('outer ' || (SELECT tt.c FROM tt)) FROM rows_like AS src;
 CREATE TRIGGER own_delete AFTER DELETE ON own FOR EACH ROW INSERT INTO log SELECT ((('deleted ' || "OLD".id) || ' beside ') || main.other.id) FROM other;
 CREATE TRIGGER own_insert AFTER INSERT ON own FOR EACH STATEMENT INSERT INTO main.log SELECT ('own ' || count_star()) FROM main.other;
 CREATE TRIGGER same_name AFTER INSERT ON base FOR EACH STATEMENT INSERT INTO log (VALUES ('base'));
@@ -518,14 +550,24 @@ INSERT INTO spelled VALUES (1);
 statement ok
 DELETE FROM spelled;
 
+statement ok
+INSERT INTO bound VALUES (1);
+
+statement ok
+DELETE FROM bound;
+
 query T rowsort
 SELECT msg FROM dst.log;
 ----
 base
 deleted 3 beside 2
+level 1
+level 1
 match 2
 match 2
 other
+outer 1
+outer 1
 own 1
 pivot 12
 pivot 12

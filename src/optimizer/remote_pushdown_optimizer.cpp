@@ -1304,13 +1304,18 @@ unique_ptr<TableRef> RemotePushdownOptimizer::CreateRemoteFunctionRef(CatalogPus
 
 namespace {
 
-//! The bindings of one query node that the strip has visited so far
+//! The bindings of one query level that the strip has visited so far
 struct CatalogStripScope {
 	//! tables read without an alias, so a column reference can name them as catalog.table.column
 	identifier_set_t table_names;
 	identifier_set_t cte_names;
 	//! a column reference whose first name is the catalog's may then start with this binding instead
 	bool binding_named_like_catalog = false;
+
+	void Merge(const CatalogStripScope &other) {
+		table_names.insert(other.table_names.begin(), other.table_names.end());
+		binding_named_like_catalog = binding_named_like_catalog || other.binding_named_like_catalog;
+	}
 };
 
 struct CatalogStripContext {
@@ -1318,8 +1323,10 @@ struct CatalogStripContext {
 	}
 
 	const Identifier &catalog_name;
-	//! the scopes a column reference sees: its own query node's and those of the nodes around it
+	//! the levels a column reference sees: its own query node's and those of the nodes around it
 	vector<CatalogStripScope> scopes;
+	//! the level of the query node walked last, for a set operation whose modifiers see its children's tables
+	CatalogStripScope last_scope;
 
 	void AddBinding(const Identifier &alias) {
 		if (alias == catalog_name) {
@@ -1337,24 +1344,26 @@ struct CatalogStripContext {
 		for (auto &scope : scopes) {
 			is_cte = is_cte || scope.cte_names.count(name.Name()) > 0;
 		}
-		if (name.Catalog().empty() && (!is_cte || !name.Schema().empty())) {
+		if (!is_cte || !name.Schema().empty()) {
 			scopes.back().table_names.insert(name.Name());
 		}
 	}
 
-	//! The binder reads a leading name as the catalog only when no binding in scope carries that name and a later
-	//! name is a table in scope; otherwise the leading name is a table or a struct column spelled like the catalog
+	//! Follows the binder's order (ColumnQualifier::QualifyColumnNameWithManyDotsInternal): it resolves a reference
+	//! in its own query level before the outer ones, and within a level reads a later name as a catalog qualified
+	//! table first, then the leading name as a binding, then the whole reference as a catalog qualified table's row
 	bool ReadsAsCatalog(const vector<Identifier> &names) const {
-		for (auto &scope : scopes) {
-			if (scope.binding_named_like_catalog) {
-				return false;
-			}
-		}
-		for (idx_t table_index = 1; table_index + 1 < names.size(); table_index++) {
-			for (auto &scope : scopes) {
-				if (scope.table_names.count(names[table_index]) > 0) {
+		for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
+			for (idx_t table_index = names.size() - 2; table_index >= 1; table_index--) {
+				if (scope->table_names.count(names[table_index]) > 0) {
 					return true;
 				}
+			}
+			if (scope->binding_named_like_catalog) {
+				return false;
+			}
+			if (scope->table_names.count(names.back()) > 0) {
+				return true;
 			}
 		}
 		return false;
@@ -1363,13 +1372,11 @@ struct CatalogStripContext {
 
 class CatalogStripScopeGuard {
 public:
-	CatalogStripScopeGuard(CatalogStripContext &context, const CommonTableExpressionMap &cte_map) : context(context) {
+	explicit CatalogStripScopeGuard(CatalogStripContext &context) : context(context) {
 		context.scopes.emplace_back();
-		for (auto &cte : cte_map.map) {
-			context.scopes.back().cte_names.insert(cte.first);
-		}
 	}
 	~CatalogStripScopeGuard() {
+		context.last_scope = std::move(context.scopes.back());
 		context.scopes.pop_back();
 	}
 
@@ -1439,7 +1446,7 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	case TableReferenceType::PIVOT: {
 		auto &pivot = ref.Cast<PivotRef>();
 		// the bindings of the source are not visible outside the pivot
-		CatalogStripScopeGuard source_scope(context, CommonTableExpressionMap());
+		CatalogStripScopeGuard source_scope(context);
 		StripCatalog(*pivot.source, context);
 		for (auto &aggregate : pivot.aggregates) {
 			StripCatalog(*aggregate, context);
@@ -1462,7 +1469,7 @@ static void StripCatalog(TableRef &ref, CatalogStripContext &context) {
 	case TableReferenceType::MATCH_RECOGNIZE: {
 		auto &match = ref.Cast<MatchRecognizeRef>();
 		// the bindings of the input are not visible outside the match
-		CatalogStripScopeGuard input_scope(context, CommonTableExpressionMap());
+		CatalogStripScopeGuard input_scope(context);
 		if (match.input) {
 			StripCatalog(*match.input, context);
 		}
@@ -1555,20 +1562,31 @@ static void StripCatalog(ParsedExpression &expr, CatalogStripContext &context) {
 	ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { StripCatalog(child, context); });
 }
 
+static void StripCatalog(CommonTableExpressionMap &cte_map, CatalogStripContext &context) {
+	for (auto &cte_pair : cte_map.map) {
+		auto &cte = *cte_pair.second;
+		// a CTE's own definition reads the table of that name unless the CTE is recursive
+		bool recursive = cte.query_node && cte.query_node->type == QueryNodeType::RECURSIVE_CTE_NODE;
+		if (recursive) {
+			context.scopes.back().cte_names.insert(cte_pair.first);
+		}
+		if (cte.query_node) {
+			StripCatalog(*cte.query_node, context);
+		}
+		for (auto &key : cte.key_targets) {
+			StripCatalog(*key, context);
+		}
+		context.scopes.back().cte_names.insert(cte_pair.first);
+	}
+}
+
 static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
-	CatalogStripScopeGuard scope(context, node.cte_map);
+	CatalogStripScopeGuard scope(context);
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
 		auto &select = node.Cast<SelectNode>();
 		// Strip within CTE definitions so the remote receives catalog-free SQL
-		for (auto &cte_pair : select.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(select.cte_map, context);
 		if (select.from_table) {
 			StripCatalog(*select.from_table, context);
 		}
@@ -1621,14 +1639,7 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::INSERT_QUERY_NODE: {
 		auto &insert = node.Cast<InsertQueryNode>();
-		for (auto &cte_pair : insert.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(insert.cte_map, context);
 		// Strip from the target table's catalog/schema fields (these are what ToString() serializes)
 		StripCatalogFromName(insert.qualified_name, context.catalog_name);
 		if (insert.select_statement) {
@@ -1656,14 +1667,7 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::DELETE_QUERY_NODE: {
 		auto &del = node.Cast<DeleteQueryNode>();
-		for (auto &cte_pair : del.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(del.cte_map, context);
 		if (del.table) {
 			StripCatalog(*del.table, context);
 		}
@@ -1680,14 +1684,7 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::UPDATE_QUERY_NODE: {
 		auto &upd = node.Cast<UpdateQueryNode>();
-		for (auto &cte_pair : upd.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(upd.cte_map, context);
 		if (upd.table) {
 			StripCatalog(*upd.table, context);
 		}
@@ -1709,14 +1706,7 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::MERGE_QUERY_NODE: {
 		auto &merge = node.Cast<MergeQueryNode>();
-		for (auto &cte_pair : merge.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(merge.cte_map, context);
 		if (merge.target) {
 			StripCatalog(*merge.target, context);
 		}
@@ -1751,16 +1741,11 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::SET_OPERATION_NODE: {
 		auto &setop = node.Cast<SetOperationNode>();
-		for (auto &cte_pair : setop.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
-		}
+		StripCatalog(setop.cte_map, context);
 		for (auto &child : setop.children) {
 			StripCatalog(*child, context);
+			// the binder resolves the ORDER BY of a set operation against the tables of its children
+			context.scopes.back().Merge(context.last_scope);
 		}
 		for (auto &modifier : setop.modifiers) {
 			switch (modifier->type) {
@@ -1796,13 +1781,14 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 	}
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &rec = node.Cast<RecursiveCTENode>();
-		for (auto &cte_pair : rec.cte_map.map) {
-			if (cte_pair.second->query_node) {
-				StripCatalog(*cte_pair.second->query_node, context);
-			}
-			for (auto &key : cte_pair.second->key_targets) {
-				StripCatalog(*key, context);
-			}
+		StripCatalog(rec.cte_map, context);
+		if (rec.left) {
+			StripCatalog(*rec.left, context);
+			context.scopes.back().Merge(context.last_scope);
+		}
+		if (rec.right) {
+			StripCatalog(*rec.right, context);
+			context.scopes.back().Merge(context.last_scope);
 		}
 		for (auto &key : rec.key_targets) {
 			StripCatalog(*key, context);
@@ -1836,12 +1822,6 @@ static void StripCatalog(QueryNode &node, CatalogStripContext &context) {
 			default:
 				break;
 			}
-		}
-		if (rec.left) {
-			StripCatalog(*rec.left, context);
-		}
-		if (rec.right) {
-			StripCatalog(*rec.right, context);
 		}
 		break;
 	}
