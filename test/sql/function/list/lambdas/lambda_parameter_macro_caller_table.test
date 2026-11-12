@@ -374,6 +374,47 @@ SELECT agg_sub_arg(x.d) FROM x;
 ----
 [111]
 
+# a subquery that typeof folds binds in the lambda's scope, so its references take the parameter's new name
+
+statement ok
+CREATE MACRO whole_type() AS list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x)));
+
+query I
+SELECT whole_type() FROM x;
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: typeof(x.d) || ':' || typeof((SELECT x))) FROM x AS q;
+----
+['INTEGER:STRUCT(d INTEGER)']
+
+statement ok
+CREATE MACRO field_type() AS list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d)));
+
+query I
+SELECT field_type() FROM x;
+----
+[aVARCHAR]
+
+query I
+SELECT list_transform([{'d': 'a'}], lambda x: x.d || typeof((SELECT x.d))) FROM x AS q;
+----
+[aVARCHAR]
+
+statement ok
+CREATE MACRO inner_type() AS list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1]))));
+
+query I
+SELECT inner_type() FROM (SELECT 'v' AS e) x;
+----
+['1:INTEGER']
+
+query I
+SELECT list_transform([{'d': 1}], lambda x: concat(x.d, ':', first((SELECT list_transform([{'e': 2}], lambda x: typeof((SELECT x.e FROM (SELECT 60 AS d) x)))[1])))) FROM (SELECT 'v' AS e) q;
+----
+['1:INTEGER']
+
 # UPDATE, MERGE and DELETE on a table named like the parameter
 
 statement ok
