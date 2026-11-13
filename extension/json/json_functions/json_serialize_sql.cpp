@@ -3,6 +3,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "json_deserializer.hpp"
@@ -10,6 +11,12 @@
 #include "json_serializer.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/literal.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -287,7 +294,10 @@ PragmaFunctionSet JSONFunctions::GetExecuteJsonSerializedSqlPragmaFunction() {
 //----------------------------------------------------------------------
 struct ExecuteSqlTableFunction {
 	struct BindData : public TableFunctionData {
-		shared_ptr<Relation> plan;
+		unique_ptr<QueryNode> node;
+		string query;
+		vector<Identifier> names;
+		vector<LogicalType> types;
 		unique_ptr<Connection> con;
 
 		bool SupportStatementCache() const override {
@@ -321,12 +331,54 @@ struct ExecuteSqlTableFunction {
 		if (stmts.size() != 1) {
 			throw BinderException("json_execute_serialized_sql expects exactly one statement");
 		}
-		result->plan = result->con->RelationFromQuery(std::move(stmts[0]));
+		result->query = stmts[0]->ToString();
+		result->node = std::move(stmts[0]->node);
 
-		for (auto &col : result->plan->Columns()) {
-			return_types.emplace_back(col.Type());
-			names.emplace_back(col.Name());
-		}
+		auto &inner_context = *result->con->context;
+		inner_context.RunFunctionInTransaction([&]() {
+			auto bind_columns = [&](Binder &binder) {
+				unique_ptr<SQLStatement> statement = make_uniq<SelectStatement>();
+				statement->Cast<SelectStatement>().node = result->node->Copy();
+				// the statement is rewritten as it will be when it runs, so the columns bound here are the ones it
+				// returns
+				Optimizer(binder, inner_context).OptimizeStatement(statement);
+				auto bound = binder.Bind(*statement);
+				result->names = std::move(bound.names);
+				result->types = std::move(bound.types);
+			};
+			auto binder = Binder::CreateBinder(inner_context);
+			binder->SetBindingMode(BindingMode::EXTRACT_REPLACEMENT_SCANS);
+			bind_columns(*binder);
+			// An object a replacement scan found outside the catalog is pinned as a CTE, so every execution reads the
+			// object this bind found
+			bool pinned_any = false;
+			for (auto &replacement : binder->GetReplacementScans()) {
+				if (!replacement.second->external_dependency) {
+					continue;
+				}
+				pinned_any = true;
+				auto pinned = make_uniq<SelectNode>();
+				pinned->select_list.push_back(make_uniq<StarExpression>());
+				pinned->from_table = std::move(replacement.second);
+				auto cte_info = make_uniq<CommonTableExpressionInfo>();
+				cte_info->query_node = std::move(pinned);
+
+				auto outer = make_uniq<SelectNode>();
+				outer->select_list.push_back(make_uniq<StarExpression>());
+				auto inner = make_uniq<SelectStatement>();
+				inner->node = std::move(result->node);
+				outer->from_table = make_uniq<SubqueryRef>(std::move(inner), "query_relation");
+				outer->cte_map.map[replacement.first] = std::move(cte_info);
+				result->node = std::move(outer);
+			}
+			// the remote rewrite can push a pinned object down with the rest of the statement, where its unresolved
+			// name kept the statement local, so the columns come from the statement that runs
+			if (pinned_any && DatabaseManager::Get(inner_context).GetRemoteCatalogCount() > 0) {
+				bind_columns(*Binder::CreateBinder(inner_context));
+			}
+		});
+		return_types = result->types;
+		names = result->names;
 		return std::move(result);
 	}
 
@@ -334,7 +386,26 @@ struct ExecuteSqlTableFunction {
 		auto &data = data_p.bind_data->Cast<BindData>();
 		auto &state = data_p.global_state->Cast<State>();
 		if (!state.result) {
-			state.result = data.plan->ExecuteOrThrow();
+			auto statement = make_uniq<SelectStatement>();
+			statement->node = data.node->Copy();
+			statement->query = data.query;
+			auto result = data.con->context->RunInternalStatement(std::move(statement), QueryParameters());
+			result->ThrowIfError();
+			if (result->GetTypes() != data.types || result->GetNames() != data.names) {
+				string error = "Result mismatch in query!\nExpected the following columns: [";
+				for (idx_t i = 0; i < data.types.size(); i++) {
+					error += i == 0 ? "" : ", ";
+					error += data.names[i] + " " + data.types[i].ToString();
+				}
+				error += "]\nBut result contained the following: ";
+				for (idx_t i = 0; i < result->GetTypes().size(); i++) {
+					error += i == 0 ? "[" : ", ";
+					error += result->ColumnName(i) + " " + result->GetTypes()[i].ToString();
+				}
+				error += "]";
+				ErrorData(error).Throw();
+			}
+			state.result = std::move(result);
 		}
 		auto result_chunk = state.result->Fetch();
 		if (!result_chunk) {
