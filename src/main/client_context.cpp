@@ -623,7 +623,7 @@ unique_ptr<PreparedStatement> ClientContext::Prepare(unique_ptr<SQLStatement> st
 StatementSignature ClientContext::BindStatement(unique_ptr<SQLStatement> statement) {
 	auto lock = LockContext();
 	StatementSignature signature;
-	ErrorData bind_error;
+	std::exception_ptr bind_error;
 	RunFunctionInTransactionInternal(
 	    *lock,
 	    [&]() {
@@ -666,19 +666,18 @@ StatementSignature ClientContext::BindStatement(unique_ptr<SQLStatement> stateme
 				    signature.parameters.push_back({entry.first, entry.second, std::move(type)});
 			    }
 		    } catch (const std::exception &ex) {
-			    ErrorData error(ex);
 			    // Binding is read-only: a recoverable bind error changed nothing, so leave
 			    // the caller's transaction intact (rethrow after the wrapper). A database-
 			    // fatal error still propagates so invalidation runs as usual.
-			    if (Exception::InvalidatesDatabase(error.Type())) {
+			    if (Exception::InvalidatesDatabase(ErrorData(ex).Type())) {
 				    throw;
 			    }
-			    bind_error = std::move(error);
+			    bind_error = std::current_exception();
 		    }
 	    },
 	    false);
-	if (bind_error.HasError()) {
-		bind_error.Throw();
+	if (bind_error) {
+		std::rethrow_exception(bind_error);
 	}
 	return signature;
 }

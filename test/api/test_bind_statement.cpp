@@ -7,6 +7,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/main/config.hpp"
 #include <atomic>
 
 using namespace duckdb;
@@ -393,4 +395,40 @@ TEST_CASE("BindStatement describes a statement that only the planning after the 
 		REQUIRE_NO_FAIL(con.Query("INSERT INTO t VALUES (3, 4)"));
 		REQUIRE(CountRows(con, "SELECT count(*) FROM t") == 2);
 	}
+}
+
+struct ClientCallbackError : public std::runtime_error {
+	using std::runtime_error::runtime_error;
+};
+
+static unique_ptr<TableRef> ThrowingReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                                                    optional_ptr<ReplacementScanData> data) {
+	if (input.table_name == "client_frame") {
+		throw ClientCallbackError("lookup failed in the client");
+	}
+	return nullptr;
+}
+
+TEST_CASE("A client's own exception from a bind callback leaves BindStatement as the same object",
+          "[api][bind_statement]") {
+	DuckDB db(nullptr);
+	DBConfig::GetConfig(*db.instance).replacement_scans.emplace_back(ThrowingReplacementScan);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t(a INTEGER)"));
+
+	// Autocommit: the bind's own transaction ends and the connection stays usable.
+	REQUIRE_THROWS_AS(BindOne(con, "SELECT * FROM client_frame"), ClientCallbackError);
+	REQUIRE_THROWS_WITH(BindOne(con, "SELECT * FROM client_frame"), Catch::Equals("lookup failed in the client"));
+	REQUIRE(!con.context->transaction.HasActiveTransaction());
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t VALUES (1)"));
+
+	// Explicit transaction: as for an engine bind error, the transaction stays usable and commits its work.
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t VALUES (2)"));
+	REQUIRE_THROWS_AS(BindOne(con, "SELECT * FROM client_frame"), ClientCallbackError);
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+	REQUIRE(CountRows(con, "SELECT count(*) FROM t") == 2);
+
+	// An engine error leaves as the exception the bind raised, not as a copy rebuilt as a base Exception.
+	REQUIRE_THROWS_AS(BindOne(con, "PIVOT t ON a USING sum(a + $1)"), InvalidInputException);
 }
