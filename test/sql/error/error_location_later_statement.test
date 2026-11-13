@@ -1,0 +1,161 @@
+# name: test/sql/error/error_location_later_statement.test
+# description: An error in a statement that does not start the query string points into that statement's own text
+# group: [error]
+
+statement ok
+CREATE TABLE t (a INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'abc');
+
+statement error
+SELECT missing_col FROM range(1)
+----
+LINE 1: SELECT missing_col FROM range(1)
+               ^^^^^^^^^^^
+
+statement error
+SELECT 1; SELECT missing_col FROM range(1)
+----
+LINE 1:  SELECT missing_col FROM range(1)
+                ^^^^^^^^^^^
+
+statement error
+SELECT 1; SELECT 2; SELECT 3, missing_col FROM range(1)
+----
+LINE 1:  SELECT 3, missing_col FROM range(1)
+                   ^^^^^^^^^^^
+
+statement error
+SELECT 1; -- a comment
+    /* a block comment */   SELECT 1 AS one, missing_col FROM range(1)
+----
+LINE 2:     /* a block comment */   SELECT 1 AS one, missing_col FROM range(1)
+                                                     ^^^^^^^^^^^
+
+statement error
+-- a comment before the only statement
+SELECT 1 AS one, missing_col FROM range(1)
+----
+LINE 2: SELECT 1 AS one, missing_col FROM range(1)
+                         ^^^^^^^^^^^
+
+statement error
+SELECT 1;
+SELECT a,
+missing_col FROM t
+----
+LINE 3: missing_col FROM t
+        ^^^^^^^^^^^
+
+statement error
+SELECT 1; SELECT * FROM missing_table
+----
+LINE 1:  SELECT * FROM missing_table
+                       ^^^^^^^^^^^^^
+
+statement error
+SELECT 1; SELECT CAST(s AS INTEGER) FROM t
+----
+LINE 1:  SELECT CAST(s AS INTEGER) FROM t
+                ^^^^^^^^^^^^^^^^^^
+
+statement error
+SELECT 1; EXPLAIN SELECT missing_col FROM range(1)
+----
+LINE 1:  EXPLAIN SELECT missing_col FROM range(1)
+                        ^^^^^^^^^^^
+
+statement error
+SELECT 1; PREPARE p AS SELECT missing_col FROM range(1)
+----
+LINE 1:  PREPARE p AS SELECT missing_col FROM range(1)
+                             ^^^^^^^^^^^
+
+statement error
+SELECT 1; CREATE VIEW v AS SELECT missing_col FROM range(1)
+----
+LINE 1:  CREATE VIEW v AS SELECT missing_col FROM range(1)
+                                 ^^^^^^^^^^^
+
+statement error
+SELECT 1; INSERT INTO t SELECT missing_col, 'x'
+----
+LINE 1:  INSERT INTO t SELECT missing_col, 'x'
+                              ^^^^^^^^^^^
+
+statement error
+SELECT 1; UPDATE t SET a = missing_col
+----
+LINE 1:  UPDATE t SET a = missing_col
+                          ^^^^^^^^^^^
+
+# errors raised while parsing are reported against the whole string
+statement error
+SELECT 1; SELEC missing
+----
+LINE 1: SELECT 1; SELEC missing
+                  ^^^^^
+
+statement error
+SELECT 1; FROM range(3) r PIVOT (count(*) FOR range IN (r.x))
+----
+LINE 1: SELECT 1; FROM range(3) r PIVOT (count(*) FOR range IN (r.x))
+                                                                ^^^
+
+statement error
+SELECT 1; PIVOT range(3) ON 42 USING count(*)
+----
+LINE 1: SELECT 1; PIVOT range(3) ON 42 USING count(*)
+                                    ^^
+
+statement error
+-- a comment before the only statement
+FROM range(3) r PIVOT (count(*) FOR range IN (r.x))
+----
+LINE 2: FROM range(3) r PIVOT (count(*) FOR range IN (r.x))
+                                                      ^^^
+
+# a parse error is raised before the statement's text is cut out of the string, so its position counts from the start
+# of the whole string; an error raised while the statement is bound or run counts from the start of its own text
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT 1; SELECT missing_col FROM range(1)
+----
+"location":"[8,11]"
+
+statement error
+SELECT 1; SELEC missing
+----
+"location":"[10,5]"
+
+statement error
+SELECT 1; FROM range(3) r PIVOT (count(*) FOR range IN (r.x))
+----
+"location":"[56,3]"
+
+# a view or macro created in a later statement stores offsets into its own text, the text it is persisted with
+load {TEST_DIR}/error_location_later_statement.db
+
+statement ok
+CREATE TABLE tt (x INTEGER, y INTEGER); SELECT 1; CREATE VIEW vv AS SELECT x, y FROM tt; CREATE MACRO mm(a) AS CAST(a AS INTEGER) + 1
+
+statement ok
+ALTER TABLE tt DROP COLUMN y
+
+restart
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT * FROM vv
+----
+"location":"[29,1]"
+
+statement error
+SELECT mm('abc')
+----
+"location":"[23,18]"

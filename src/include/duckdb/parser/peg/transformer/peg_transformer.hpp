@@ -535,9 +535,9 @@ private:
 class PEGTransformer {
 public:
 	PEGTransformer(ArenaAllocator &allocator, TokenIterator &token_iterator, ParserOptions &options_p,
-	               const CompiledGrammar &grammar_p)
+	               const CompiledGrammar &grammar_p, idx_t statement_offset_p = 0)
 	    : allocator(allocator), token_iterator(token_iterator), options(options_p), grammar(grammar_p),
-	      process_allocator(allocator.GetUnderlyingAllocator()) {
+	      statement_offset(statement_offset_p), process_allocator(allocator.GetUnderlyingAllocator()) {
 	}
 
 	const CompiledGrammarRule &GetRule(const string &rule_name) const;
@@ -621,8 +621,9 @@ public:
 	void ExtractCTEsRecursive(CommonTableExpressionMap &cte_map);
 	bool IsWindowFrameDefault(WindowBoundary start, WindowBoundary end);
 	unique_ptr<WindowExpression> GetWindowClause(const Identifier &window_name);
-	void SetQueryLocation(ParsedExpression &expr, QueryLocation query_location);
-	void SetQueryLocation(TableRef &ref, QueryLocation query_location);
+	//! Sets a node's location from an offset into the parser's input
+	void SetQueryLocation(ParsedExpression &expr, QueryLocation input_location);
+	void SetQueryLocation(TableRef &ref, QueryLocation input_location);
 
 private:
 	arena_ptr<TransformResultValue> TransformInternal(ParseResult &parse_result);
@@ -687,7 +688,11 @@ public:
 	const CompiledGrammar &grammar;
 
 private:
+	//! Where the statement's text (SQLStatement::query), which node locations count from, starts in the input
+	const idx_t statement_offset;
 	ArenaAllocator process_allocator;
+
+	QueryLocation StatementLocation(QueryLocation input_location) const;
 
 private:
 	friend class GeneratedTransformProcess;

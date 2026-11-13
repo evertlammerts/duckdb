@@ -504,12 +504,20 @@ unique_ptr<WindowExpression> PEGTransformer::GetWindowClause(const Identifier &w
 	return unique_ptr_cast<ParsedExpression, WindowExpression>(it->second->Copy());
 }
 
-void PEGTransformer::SetQueryLocation(ParsedExpression &expr, QueryLocation query_location) {
-	expr.SetQueryLocation(query_location);
+QueryLocation PEGTransformer::StatementLocation(QueryLocation input_location) const {
+	if (!input_location.IsValid()) {
+		return input_location;
+	}
+	D_ASSERT(input_location.offset >= statement_offset);
+	return QueryLocation(input_location.offset - statement_offset, input_location.length);
 }
 
-void PEGTransformer::SetQueryLocation(TableRef &ref, QueryLocation query_location) {
-	ref.query_location = query_location;
+void PEGTransformer::SetQueryLocation(ParsedExpression &expr, QueryLocation input_location) {
+	expr.SetQueryLocation(StatementLocation(input_location));
+}
+
+void PEGTransformer::SetQueryLocation(TableRef &ref, QueryLocation input_location) {
+	ref.query_location = StatementLocation(input_location);
 }
 
 } // namespace duckdb

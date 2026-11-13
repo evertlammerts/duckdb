@@ -89,6 +89,35 @@ TEST_CASE("Test invalid PRAGMA in C API", "[capi]") {
 	duckdb_close(&db);
 }
 
+TEST_CASE("Test an error points into the statement's own text when it does not start the string in C API", "[capi]") {
+	CAPITester tester;
+	duckdb_extracted_statements stmts = nullptr;
+
+	REQUIRE(tester.OpenDatabase(nullptr));
+
+	idx_t size = duckdb_extract_statements(tester.connection,
+	                                       "SELECT 1;\n\n-- a comment\nSELECT missing_col FROM range(1)", &stmts);
+	REQUIRE(size == 2);
+	auto wrapper = (ExtractStatementsWrapper *)stmts;
+	REQUIRE(wrapper->statements[1]->query == "\n\n-- a comment\nSELECT missing_col FROM range(1)");
+
+	duckdb_prepared_statement prepared = nullptr;
+	REQUIRE(duckdb_prepare_extracted_statement(tester.connection, stmts, 1, &prepared) == DuckDBError);
+	auto err_msg = duckdb_prepare_error(prepared);
+	REQUIRE(err_msg != nullptr);
+	REQUIRE(StringUtil::Contains(err_msg, "LINE 4: SELECT missing_col FROM range(1)\n               ^^^^^^^^^^^"));
+
+	duckdb_destroy_prepare(&prepared);
+	duckdb_destroy_extracted(&stmts);
+
+	REQUIRE(duckdb_prepare(tester.connection, "-- a comment\nSELECT missing_col FROM range(1)", &prepared) ==
+	        DuckDBError);
+	err_msg = duckdb_prepare_error(prepared);
+	REQUIRE(err_msg != nullptr);
+	REQUIRE(StringUtil::Contains(err_msg, "LINE 2: SELECT missing_col FROM range(1)\n               ^^^^^^^^^^^"));
+	duckdb_destroy_prepare(&prepared);
+}
+
 TEST_CASE("Test extract statements for 'ALTER TABLE ... ADD COLUMN ... DEFAULT' in C API", "[capi]") {
 	CAPITester tester;
 	duckdb_extracted_statements stmts = nullptr;
