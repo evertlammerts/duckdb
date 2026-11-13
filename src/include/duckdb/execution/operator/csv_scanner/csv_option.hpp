@@ -57,7 +57,7 @@ public:
 		}
 	}
 
-	// this is due to a hacky implementation in the read csv relation
+	//! Marks the current value as set by the user without changing it
 	void ChangeSetByUserTrue() {
 		set_by_user = true;
 	}

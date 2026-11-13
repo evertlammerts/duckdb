@@ -61,7 +61,6 @@ set(TEST_API_OBJECTS
     test_expanding_statements.cpp
     test_retained_result_collection.cpp
     test_plan_serialization.cpp
-    test_relation_api.cpp
     test_persisted_view_over_rows.cpp
     test_stream_result_buffer.cpp
     test_operator_memory_limit.cpp
@@ -108,10 +107,8 @@ endif()
 
 if(DUCKDB_EXTENSION_TPCH_SHOULD_LINK)
   include_directories(../../extension/tpch/include)
-  set(TEST_API_OBJECTS
-      ${TEST_API_OBJECTS} test_tpch_with_relations.cpp
-      test_tpch_with_streaming.cpp
-      serialized_plans/test_plan_serialization_bwc.cpp)
+  set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_tpch_with_streaming.cpp
+                       serialized_plans/test_plan_serialization_bwc.cpp)
 endif()
 
 if(DUCKDB_EXTENSION_TPCDS_SHOULD_LINK)
