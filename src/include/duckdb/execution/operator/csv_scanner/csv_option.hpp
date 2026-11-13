@@ -57,7 +57,6 @@ public:
 		}
 	}
 
-	//! Marks the current value as set by the user without changing it
 	void ChangeSetByUserTrue() {
 		set_by_user = true;
 	}
