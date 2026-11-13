@@ -247,7 +247,8 @@ public:
 	DUCKDB_API void RemovePreparedStatement(const string &name);
 	//! Bind a statement and return its signature, without building a PreparedStatement, optimizing, or
 	//! executing. Read-only: binding touches no in-flight query state, so a live result survives. Throws the
-	//! exception the bind raised, as the object thrown, so a client callback's own exception reaches the caller.
+	//! exception that reaches it from the bind, as the object thrown, so a replacement scan's own exception reaches
+	//! the caller; a table function's bind has its exception rebuilt as an engine error by the binder first.
 	//! A statement that expands into several reports metadata_deferred with a placeholder column
 	DUCKDB_API StatementSignature BindStatement(unique_ptr<SQLStatement> statement);
 	//! Throws the error a new statement gets while a result that no call ended holds the connection
