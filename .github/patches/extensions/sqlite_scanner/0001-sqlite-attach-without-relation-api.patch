@@ -58,7 +58,7 @@ index 6c40ad3..e192000 100644
  	{
 diff --git a/test/sql/scanner/attach_bind_error.test b/test/sql/scanner/attach_bind_error.test
 new file mode 100644
-index 0000000..89e6d13
+index 0000000..59957f4
 --- /dev/null
 +++ b/test/sql/scanner/attach_bind_error.test
 @@ -0,0 +1,25 @@
@@ -69,7 +69,7 @@ index 0000000..89e6d13
 +require sqlite_scanner
 +
 +statement ok
-+ATTACH '__TEST_DIR__/attach_bind_error.db' AS s (TYPE SQLITE);
++ATTACH '{TEST_DIR}/attach_bind_error.db' AS s (TYPE SQLITE);
 +
 +# SQLite accepts this default, but the parser of DuckDB rejects it when the scan reads the columns of the table
 +statement ok
@@ -79,7 +79,7 @@ index 0000000..89e6d13
 +DETACH s;
 +
 +statement error
-+CALL sqlite_attach('__TEST_DIR__/attach_bind_error.db');
++CALL sqlite_attach('{TEST_DIR}/attach_bind_error.db');
 +----
 +<REGEX>:Parser Error: Failed to create view 'b_bad': .*
 +
@@ -177,3 +177,87 @@ index 0000000..8b83e53
 +----
 +empty_tbl	main	false	NULL
 +mysql_databases	main	false	NULL
+diff --git a/test/sql/scanner/attach_quoted_names.test b/test/sql/scanner/attach_quoted_names.test
+new file mode 100644
+index 0000000..dd6d921
+--- /dev/null
++++ b/test/sql/scanner/attach_quoted_names.test
+@@ -0,0 +1,78 @@
++# name: test/sql/scanner/attach_quoted_names.test
++# description: Test sqlite_attach on tables and a file whose names need quoting
++# group: [scanner]
++
++require sqlite_scanner
++
++statement ok
++ATTACH '{TEST_DIR}/it''s quoted.db' AS s (TYPE SQLITE);
++
++statement ok
++CALL sqlite_query('s', 'CREATE TABLE "we""ird"(i INTEGER)');
++
++statement ok
++CALL sqlite_query('s', 'INSERT INTO "we""ird" VALUES (1)');
++
++statement ok
++CALL sqlite_query('s', 'CREATE TABLE "it''s"(i INTEGER)');
++
++statement ok
++CALL sqlite_query('s', 'INSERT INTO "it''s" VALUES (2)');
++
++statement ok
++CALL sqlite_query('s', 'CREATE TABLE "Mixed Case"(i INTEGER)');
++
++statement ok
++CALL sqlite_query('s', 'INSERT INTO "Mixed Case" VALUES (3)');
++
++statement ok
++CALL sqlite_query('s', 'CREATE TABLE "select"(i INTEGER)');
++
++statement ok
++CALL sqlite_query('s', 'INSERT INTO "select" VALUES (4)');
++
++statement ok
++CALL sqlite_query('s', 'CREATE TABLE "a.b"(i INTEGER)');
++
++statement ok
++CALL sqlite_query('s', 'INSERT INTO "a.b" VALUES (5)');
++
++statement ok
++DETACH s;
++
++statement ok
++CALL sqlite_attach('{TEST_DIR}/it''s quoted.db');
++
++query TTT
++SELECT view_name, schema_name, temporary FROM duckdb_views() WHERE NOT internal ORDER BY view_name;
++----
++Mixed Case	main	false
++a.b	main	false
++it's	main	false
++select	main	false
++we"ird	main	false
++
++query I
++SELECT i FROM "we""ird";
++----
++1
++
++query I
++SELECT i FROM "it's";
++----
++2
++
++query I
++SELECT i FROM "Mixed Case";
++----
++3
++
++query I
++SELECT i FROM "select";
++----
++4
++
++query I
++SELECT i FROM "a.b";
++----
++5
