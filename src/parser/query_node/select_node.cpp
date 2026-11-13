@@ -118,7 +118,7 @@ bool SelectNode::Equals(const QueryNode *other_p) const {
 	auto &other = other_p->Cast<SelectNode>();
 
 	// SELECT
-	if (!ExpressionUtil::ListEquals(select_list, other.select_list)) {
+	if (!ExpressionUtil::ListEqualsWithAliases(select_list, other.select_list)) {
 		return false;
 	}
 	// FROM
@@ -134,6 +134,9 @@ bool SelectNode::Equals(const QueryNode *other_p) const {
 		return false;
 	}
 	if (groups.grouping_sets != other.groups.grouping_sets) {
+		return false;
+	}
+	if (aggregate_handling != other.aggregate_handling) {
 		return false;
 	}
 	if (!SampleOptions::Equals(sample.get(), other.sample.get())) {
