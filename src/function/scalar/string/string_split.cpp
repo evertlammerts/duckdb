@@ -63,28 +63,31 @@ struct StringSplitter {
 		}
 		idx_t list_idx = 0;
 		idx_t start = 0;
-		while (start < input_size) {
+		idx_t search = 0;
+		idx_t previous_match_end = 0;
+		while (search < input_size) {
 			idx_t match_size = 0;
-			auto pos = OP::Find(input_data, input_size, start, delim_data, delim_size, match_size, data);
+			auto pos = OP::Find(input_data, input_size, search, delim_data, delim_size, match_size, data);
 			if (pos > input_size) {
 				break;
 			}
-			if (match_size == 0 && pos == start) {
-				// special case: 0 length match at the start
-				// move to the next character
-				for (pos++; pos < input_size; pos++) {
-					if (IsCharacter(input_data[pos])) {
+			D_ASSERT(input_size >= pos + match_size);
+			auto match_end = pos + match_size;
+			// PostgreSQL ignores a zero length match at the start, at the end or right after the previous match
+			if (pos < input_size && match_end > previous_match_end) {
+				emit(input_data + start, pos - start);
+				list_idx++;
+				start = match_end;
+			}
+			previous_match_end = match_end;
+			search = match_end;
+			if (match_size == 0) {
+				for (search++; search < input_size; search++) {
+					if (IsCharacter(input_data[search])) {
 						break;
 					}
 				}
-				if (pos == input_size) {
-					break;
-				}
 			}
-			D_ASSERT(input_size >= pos + match_size);
-			emit(input_data + start, pos - start);
-			list_idx++;
-			start = pos + match_size;
 		}
 		emit(input_data + start, input_size - start);
 		list_idx++;

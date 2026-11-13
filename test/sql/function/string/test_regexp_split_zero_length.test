@@ -1,0 +1,107 @@
+# name: test/sql/function/string/test_regexp_split_zero_length.test
+# description: A regex split ignores a zero length match at the start, at the end or right after a previous match, as PostgreSQL does
+# group: [string]
+
+# earlier versions gave [a, b, '', d]
+query I
+SELECT regexp_split_to_array('abxd', 'x*')
+----
+[a, b, d]
+
+# earlier versions gave [a, '', b]
+query I
+SELECT regexp_split_to_array('axb', 'x*')
+----
+[a, b]
+
+query I
+SELECT regexp_split_to_array('abc', '')
+----
+[a, b, c]
+
+# earlier versions gave ['', a, '', '']
+query I
+SELECT regexp_split_to_array('xxaxx', 'x*')
+----
+['', a, '']
+
+# a non empty match at either end still splits off an empty element
+query III
+SELECT regexp_split_to_array('xab', 'x'), regexp_split_to_array('abx', 'x'), regexp_split_to_array('x', 'x*')
+----
+['', ab]	[ab, '']	['', '']
+
+# earlier versions gave [a, bc]
+query I
+SELECT regexp_split_to_array('abc', '^')
+----
+[abc]
+
+# earlier versions gave [abc, '']
+query I
+SELECT regexp_split_to_array('abc', '$')
+----
+[abc]
+
+# earlier versions gave [a, '', ''] and ['', b, '']
+query II
+SELECT regexp_split_to_array('ab', '^|b'), regexp_split_to_array('ab', 'a|$')
+----
+[a, '']	['', b]
+
+# earlier versions gave [a, b, ' ', c, d, '']
+query I
+SELECT regexp_split_to_array('ab cd', '\b')
+----
+[ab, ' ', cd]
+
+# the example of the PostgreSQL documentation; earlier versions gave an empty element at each space
+query I
+SELECT regexp_split_to_table('the quick brown fox', '\s*')
+----
+t
+h
+e
+q
+u
+i
+c
+k
+b
+r
+o
+w
+n
+f
+o
+x
+
+# earlier versions gave [a, ü, '', ü, d], [🦆, '', 🦆] and the same third result
+query III
+SELECT regexp_split_to_array('aüxüd', 'x*'), regexp_split_to_array('🦆x🦆', 'x*'), regexp_split_to_array('a🦆b', '\b')
+----
+[a, ü, ü, d]	[🦆, 🦆]	[a, 🦆, b]
+
+query IIII
+SELECT regexp_split_to_array(NULL, 'x*'), regexp_split_to_array('abxd', NULL), regexp_split_to_array('', 'x*'), regexp_split_to_array('', '')
+----
+NULL	[abxd]	['']	[]
+
+# earlier versions gave [a, b, '', d] for both aliases and [a, '', b] with the case insensitive option
+query III
+SELECT string_split_regex('abxd', 'x*'), str_split_regex('abxd', 'x*'), string_split_regex('aXb', 'x*', 'i')
+----
+[a, b, d]	[a, b, d]	[a, b]
+
+# patterns that are not constant are compiled per row; earlier versions gave [a, b, '', d], [a, bc] and [abc, '']
+statement ok
+CREATE TABLE split_inputs AS SELECT * FROM (VALUES (1, 'abxd', 'x*'), (2, 'abc', '^'), (3, 'abc', '$'), (4, 'a,b', ','), (5, NULL, 'x*')) t(id, s, p)
+
+query II
+SELECT id, string_split_regex(s, p) FROM split_inputs ORDER BY id
+----
+1	[a, b, d]
+2	[abc]
+3	[abc]
+4	[a, b]
+5	NULL
