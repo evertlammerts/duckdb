@@ -350,7 +350,6 @@ TEST_CASE("A client's own exception from a bind callback leaves BindStatement as
 	REQUIRE_NO_FAIL(con.Query("COMMIT"));
 	REQUIRE(CountRows(con, "SELECT count(*) FROM t") == 2);
 
-	// An engine bind error still leaves as the engine's exception.
-	REQUIRE_THROWS_AS(BindOne(con, "SELECT * FROM no_such_table"), Exception);
-	REQUIRE_THROWS_WITH(BindOne(con, "SELECT * FROM no_such_table"), Catch::Contains("\"exception_type\":\"Catalog\""));
+	// An engine error leaves as the exception the bind raised, not as a copy rebuilt as a base Exception.
+	REQUIRE_THROWS_AS(BindOne(con, "PIVOT t ON a USING sum(a + $1)"), InvalidInputException);
 }
