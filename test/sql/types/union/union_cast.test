@@ -179,9 +179,9 @@ query III
 SELECT union_tag(u), union_tag(u::UNION(i SMALLINT, b INT)), u::UNION(i SMALLINT, b INT) FROM tbl4 ORDER BY ALL;;
 ----
 NULL	NULL	NULL
+NULL	NULL	NULL
 i		i		1
 i		i		3
-b		b		NULL
 b		b		NULL
 b		b		NULL
 
