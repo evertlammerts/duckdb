@@ -534,8 +534,6 @@ enum class RecursiveProbeSidePreference : uint8_t;
 
 enum class RegexMatchOperatorSemantics : uint8_t;
 
-enum class RelationType : uint8_t;
-
 enum class RemoteCapability : uint8_t;
 
 enum class RemoveUnusedColumnsMode : uint8_t;
@@ -1473,9 +1471,6 @@ const char* EnumUtil::ToChars<RecursiveProbeSidePreference>(RecursiveProbeSidePr
 
 template<>
 const char* EnumUtil::ToChars<RegexMatchOperatorSemantics>(RegexMatchOperatorSemantics value);
-
-template<>
-const char* EnumUtil::ToChars<RelationType>(RelationType value);
 
 template<>
 const char* EnumUtil::ToChars<RemoteCapability>(RemoteCapability value);
@@ -2506,9 +2501,6 @@ RecursiveProbeSidePreference EnumUtil::FromString<RecursiveProbeSidePreference>(
 
 template<>
 RegexMatchOperatorSemantics EnumUtil::FromString<RegexMatchOperatorSemantics>(const char *value);
-
-template<>
-RelationType EnumUtil::FromString<RelationType>(const char *value);
 
 template<>
 RemoteCapability EnumUtil::FromString<RemoteCapability>(const char *value);
